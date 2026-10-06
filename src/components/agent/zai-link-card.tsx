@@ -5,6 +5,7 @@ import { Loader2, ShieldCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ZaiAuthCaptcha } from './zai-captcha'
+import { BookmarkletLink } from './bookmarklet'
 
 /**
  * "Подключить аккаунт Z.ai" card (v5).
@@ -251,10 +252,14 @@ export function ZaiLinkCard({
         {bridgeOpen && (
           <>
             <p className="text-[11px] leading-relaxed text-zinc-500">
-              Открой настоящий Google-вход chat.z.ai (кнопка ниже), войди, затем скопируй адрес из
-              адресной строки (<code className="text-[10px]">chat.z.ai/auth#token=…</code>) и
-              вставь сюда — подключим автоматически.
+              Быстро (<span className="text-zinc-300">автокопирование</span>): один раз перетащи
+              кнопку ниже на панель закладок, войди в Z.ai через Google, затем нажми закладку прямо
+              на вкладке chat.z.ai — токен подключится автоматически. Либо вставь адрес
+              (<code className="text-[10px]">chat.z.ai/auth#token=…</code>) в поле ниже.
             </p>
+            <div className="rounded-lg border border-dashed border-emerald-900/70 bg-emerald-950/20 p-2.5">
+              <BookmarkletLink className="inline-block cursor-grab rounded-md border border-emerald-800/60 bg-zinc-950 px-2.5 py-1 text-[11px] font-semibold text-emerald-300 hover:border-emerald-500" />
+            </div>
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"

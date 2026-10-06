@@ -5,9 +5,10 @@ import { Loader2, ShieldAlert, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ZaiAuthCaptcha, preloadZaiCaptcha } from './zai-captcha'
+import { BookmarkletLink } from './bookmarklet'
 
 /**
- * Landing / auth gate (v5).
+ * Landing / auth gate (v6).
  *
  * REGISTRATION is instant and unconditional: the local account is created
  * immediately — nothing Z.ai-side can block it. The Z.ai captcha widget is
@@ -19,12 +20,15 @@ import { ZaiAuthCaptcha, preloadZaiCaptcha } from './zai-captcha'
  * LOGIN needs no captcha at all: local password first, stored Z.ai session
  * refreshes silently, and a dead session is re-linked inside the app.
  *
- * GOOGLE: byte-level research proved chat.z.ai returns its Google-login
- * session only to its own whitelisted domains (the OAuth redirect_uri is
- * fixed and the token lands in THEIR page hash), so a fully seamless proxy
- * is technically impossible. The honest bridge: the user opens Z.ai's REAL
- * Google login (popup), logs in, then pastes the address of that page —
- * the JWT travels in its #hash — and we validate + link it server-side.
+ * GOOGLE (v6 — token AUTO-COPY): byte-level research proved chat.z.ai only
+ * returns its Google-login session to its own whitelisted domains (the
+ * sso_redirect whitelist is exact-hostname and we are not on it), so no 100%
+ * seamless redirect exists. The v6 bridge: our button opens Z.ai's REAL
+ * Google login (popup) and the "⚡ Vebai — забрать токен" bookmarklet — one
+ * click on the logged-in chat.z.ai tab — navigates the browser to
+ * /auth/google/catch#token=… (plain navigation: no CSP/CORS can block it);
+ * the catch page claims the token server-side and this screen auto-enters
+ * the app via the /api/auth/me poll. Manual paste stays as the fallback.
  */
 export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('register')
@@ -52,6 +56,20 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   useEffect(() => {
     // warm the SDK so the first verification starts instantly
     preloadZaiCaptcha()
+  }, [])
+
+  // v6: the Google bridge finishes in ANOTHER tab/popup (bookmarklet →
+  // /auth/google/catch → claim sets the session cookie). Poll /api/auth/me
+  // so THIS screen auto-enters the app the moment that happens.
+  useEffect(() => {
+    const t = setInterval(async () => {
+      try {
+        const res = await fetch('/api/auth/me', { cache: 'no-store' })
+        if (res.ok) onAuthed()
+      } catch { /* offline — keep polling */ }
+    }, 2500)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const submit = async () => {
@@ -345,19 +363,30 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
 
         {/* Google bridge — honest proxying of Z.ai's own Google auth */}
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-2.5">
-          <p className="text-[13px] font-semibold text-zinc-200">Вход через Google</p>
+          <p className="text-[13px] font-semibold text-zinc-200">Вход через Google — с автокопированием токена</p>
           <ol className="list-decimal space-y-0.5 pl-4 text-[11px] leading-relaxed text-zinc-500">
             <li>
-              Нажми кнопку — откроется <span className="text-zinc-400">настоящий Google-вход
-              chat.z.ai</span> (их страница, твой Google-аккаунт).
+              <span className="text-zinc-400">Один раз</span>: перетащи кнопку «⚡ Vebai — забрать
+              токен» ниже на панель закладок браузера.
             </li>
-            <li>Войди там через Google — попадёшь в чат Z.ai.</li>
             <li>
-              Скопируй адрес из адресной строки (он вида{' '}
-              <code className="text-[10px] text-zinc-400">chat.z.ai/auth#token=…</code>) и вставь
-              сюда.
+              Нажми «Google-вход chat.z.ai» — откроется настоящий Google-вход chat.z.ai (страница
+              выбора аккаунта Google, твой Google-аккаунт, их OAuth).
             </li>
+            <li>
+              После входа нажми закладку <span className="text-zinc-400">⚡ Vebai</span> прямо на
+              вкладке chat.z.ai — токен перебросится нам <span className="text-zinc-400">автоматически</span>,
+              эта страница сама войдёт в приложение.
+            </li>
+            <li>Не хочешь закладку — просто вставь адрес из адресной строки chat.z.ai в поле ниже.</li>
           </ol>
+          <div className="rounded-lg border border-dashed border-emerald-900/70 bg-emerald-950/20 p-2.5">
+            <BookmarkletLink className="inline-block cursor-grab rounded-md border border-emerald-800/60 bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-emerald-300 hover:border-emerald-500" />
+            <p className="mt-1 text-[10px] leading-relaxed text-zinc-600">
+              Перетащи кнопку на панель закладок (клик — скопирует код закладки). Работает один раз
+              на каждый вход в Z.ai — дальше в один клик.
+            </p>
+          </div>
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
@@ -425,9 +454,10 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             Войти через Z.ai-аккаунт Google
           </Button>
           <p className="text-[11px] leading-relaxed text-zinc-600">
-            Почему так: Z.ai отдаёт токен Google-входа только своим доменам (это зашито у них в
-            коде и в настройках OAuth у Google) — автоматически перехватить его чужой сайт не
-            может. Токен уже есть у тебя в адресной строке — вставка занимает секунду.
+            Почему так: Z.ai отдаёт токен Google-входа только своим доменам (whitelist зашит у них
+            в коде и в настройках OAuth у Google — проверено по байтам их фронтенда), поэтому
+            полностью бесшовный перехват невозможен. Букмарклет сокращает ручной шаг до одного
+            клика: он сам читает токен и перебрасывает нас.
           </p>
         </div>
       </div>
