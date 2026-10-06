@@ -113,6 +113,7 @@ REST-клиент Kaggle API (без Python/CLI) + LLM через **прокси
 > | Git-интеграция | `FreedoomForm/Vebai` → main; каждый пуш = автодеплой |
 > | Deployment Protection | отключена (сайт публичный) |
 > | Режим чата | **Агент-режим Z.ai** (`type: general_agent`, модель `x-preview-l`/GLM-5.3-Flash): веб-поиск, генерация изображений, работа с файлами и кодом — внутри квоты аккаунта Z.ai, без отдельных API-ключей |
+| Google-вход (v6) | Настоящий Google-OAuth chat.z.ai (`/oauth/google/login?t=2` → `accounts.google.com`, client_id `800424391928-…`) + **автокопирование токена** букмарклетом «⚡ Vebai — забрать токен» → `/auth/google/catch#token=…` → `/api/auth/google/claim` (live-валидация на chat.z.ai). Бесшовный `sso_redirect` закрыт их whitelist'ом (`zread.ai / test.cgx.dev / z.ai / www.chatglm.site` — проверено по байтам фронтенда `prod-fe-1.1.98`), один клик букмарклета — минимальный честный шаг |
 >
 > Дальнейшие изменения деплоятся автоматически при пуше в `main`.
 
