@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// One video-generation request fed to the Kaggle H3 pipeline.
+// status: queued | generating | complete | failed
+model Job {
+  id             String   @id @default(cuid())
+  prompt         String
+  seconds        Int      @default(5)
+  frameOrigData  Bytes? // original uploaded first-frame image (for reference/re-prep)
+  framePrepped   Bytes? // 864x480 canvas version actually shipped to Kaggle
+  status         String   @default("queued")
+  batchId        String? // Kaggle kernel session that processes this job
+  shotNum        Int? // shot_NN index inside the batch
+  videoData      Bytes? // finished mp4 delivered from Kaggle (served via /api/video)
+  error          String?
+  testMode       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([status])
+  @@index([batchId])
+}
+
+// A chat thread with the persistent AI architect (Manus-style agent)
+model Conversation {
+  id        String      @id @default(cuid())
+  title     String      @default("Новый диалог")
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  messages  Message[]
+  tasks     AgentTask[]
+
+  @@index([updatedAt])
+}
+
+// One chat message. kind: text | task_result
+// meta (JSON string): { tools: [{name,args,status,result}], plan: {steps:[{title,status}]}, artifacts: [{kind,url,title}] }
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String // user | assistant
+  kind           String       @default("text")
+  content        String
+  meta           String?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+// A background job the agent launched (image gen, video batch, research...)
+// status: queued | running | completed | failed
+model AgentTask {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  type           String // image | video
+  title          String
+  status         String       @default("queued")
+  progress       String? // human-readable live step ("Кадр 2/6: генерация")
+  payload        String? // JSON: {shots:[{title,h3_prompt,seconds,firstFrameTaskId?}], testMode, size...}
+  result         String? // JSON: {artifacts:[{kind,url,title}], summary}
+  error          String?
+  jobIds         String? // JSON: [Job.id, ...] created for video tasks
+  imageData      Bytes? // generated PNG for image tasks (served via /api/image)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([conversationId])
+  @@index([status])
+}
+
+// Key/value store replacing the old studio-state.json file
+// (Vercel lambdas have an ephemeral filesystem).
+model StudioState {
+  key       String   @id
+  data      String // JSON of StudioState shape
+  updatedAt DateTime @updatedAt
+}
