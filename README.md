@@ -5,7 +5,40 @@
 работает 24/7, результаты приходят в чат, даже если браузер закрыт.
 
 Стек: Next.js 16 + TypeScript + Tailwind + shadcn/ui + Prisma (PostgreSQL) +
-REST-клиент Kaggle API (без Python/CLI) + Z.ai LLM (OpenAI-совместимый).
+REST-клиент Kaggle API (без Python/CLI) + LLM через **прокси chat.z.ai**.
+
+## ⚠️ Прозрачный прокси к Z.ai
+
+Сайт — **неофициальный клиент chat.z.ai**, не аффилированный с Z.ai:
+
+- Регистрация проходит **здесь** (email + пароль хранятся локально в БД сайта).
+- Все запросы к ИИ выполняются через платформу **chat.z.ai (Z.ai)** и расходуют
+  **её квоту**: либо квоту аккаунта владельца (`ZAI_JWT`), либо квоту
+  собственного аккаунта Z.ai пользователя (если он укажет свой токен).
+- Автоматически создавать аккаунты на chat.z.ai нельзя (капча), поэтому
+  «регистрация там» не выполняется программно — вместо этого пользователь сайта
+  может прикрепить свой токен chat.z.ai (`POST /api/auth/token`), а по умолчанию
+  используется токен владельца.
+- Предупреждение об этом показывается на начальной странице и в шапке
+  приложения.
+
+### Как задать токен владельца (ZAI_JWT)
+
+1. Войди на https://chat.z.ai в браузере.
+2. DevTools (F12) → Application → Local Storage → `https://chat.z.ai`.
+3. Скопируй значение ключа **`token`**.
+4. Вставь его в переменную окружения `ZAI_JWT` (Vercel → Settings →
+   Environment Variables) и сделай Redeploy.
+
+Без `ZAI_JWT` сайт работает на анонимных гостевых сессиях chat.z.ai — они
+ограничены капчей и уровнем моделей, поэтому для стабильной работы задай
+`ZAI_JWT`.
+
+Модели прокси (переменная `ZAI_CHATWEB_MODEL`, по умолчанию `glm-4.7`):
+`glm-5.3` · `glm-5.2` · `GLM-5-Turbo` · `x-preview-l` (GLM-5.3-Flash) ·
+`glm-4.7` · `0727-360B-API` (GLM-4.5, агентская) · `0727-106B-API`
+(GLM-4.5-Air) · `deep-research` · `zero`. Доступность зависит от уровня
+аккаунта Z.ai.
 
 ## Что адаптировано под Vercel
 
@@ -19,14 +52,19 @@ REST-клиент Kaggle API (без Python/CLI) + Z.ai LLM (OpenAI-совмес
 | Воркер `setInterval` в instrumentation | `/api/agent/tick` (cron) + тики от опросов UI     |
 | socket.io релей на :3003            | HTTP-поллинг `/api/agent/state` (socket опционален) |
 | Скилл/ноутбуки с диска              | Вшиты в бандл (`h3-content.ts`, `kernels.ts`)       |
+| z-ai-web-dev-sdk (песочный)         | Прокси chat.z.ai (`src/lib/chatweb.ts`)             |
+| Без авторизации                     | Регистрация/вход, диалоги привязаны к аккаунту      |
 
 ## Безопасность
 
 - `kernels/*.ipynb` содержат `KAGGLE_API_TOKEN` — ноутбуку он нужен для
   страхочного пуша результатов изнутри Kaggle. Держи репозиторий **приватным**
   или отзови токен (kaggle.com → Settings → API) и вшей новый при утечке.
-- Все остальные секреты (DATABASE_URL, ZAI_*) живут только в переменных
-  окружения Vercel — в коде их нет.
+- `ZAI_JWT` даёт полный доступ к твоему аккаунту chat.z.ai — храни его только
+  в переменных окружения Vercel, не в коде. Квота аккаунта расходуется всеми
+  пользователями сайта, у которых нет собственного токена.
+- Пароли хранятся как scrypt-хэши; сессии — подписанные HttpOnly cookie
+  (`APP_SECRET` или, по умолчанию, хэш `DATABASE_URL`).
 
 ## Деплой на Vercel
 
@@ -40,8 +78,9 @@ REST-клиент Kaggle API (без Python/CLI) + Z.ai LLM (OpenAI-совмес
    DATABASE_URL      = postgresql://...?sslmode=require
    KAGGLE_API_TOKEN  = KGAT_...                (kaggle.com → Settings → API)
    KAGGLE_ACCOUNT    = freedomform
-   ZAI_BASE_URL      = https://api.z.ai/api/paas/v4
-   ZAI_API_KEY       = ...
+   ZAI_JWT           = (токен chat.z.ai — см. раздел выше)
+   ZAI_CHATWEB_MODEL = glm-4.7
+   APP_SECRET        = (случайная строка, опционально)
    CRON_SECRET       = (опционально)
    ```
 
@@ -52,7 +91,28 @@ REST-клиент Kaggle API (без Python/CLI) + Z.ai LLM (OpenAI-совмес
    npx prisma db push
    ```
 
-5. Deploy. Готово — сайт отвечает, агент обрабатывает задачи.
+5. Deploy. Готово: открой сайт, зарегистрируйся и работай с агентом.
+
+### Деплой полностью через API (без dashboard)
+
+Нужен Vercel API token (https://vercel.com/account/tokens → Create Token):
+
+```bash
+# проект
+curl -s -X POST https://api.vercel.com/v10/projects -H "Authorization: Bearer $VERCEL_TOKEN" \
+  -d '{"name":"vebai","framework":"nextjs"}'
+
+# переменные окружения
+curl -s -X POST https://api.vercel.com/v10/projects/vebai/env -H "Authorization: Bearer $VERCEL_TOKEN" \
+  -d '{"key":"DATABASE_URL","value":"postgresql://...","type":"encrypted","target":["production","preview","development"]}'
+# ... повторить для KAGGLE_API_TOKEN, ZAI_JWT и остальных
+
+# деплой из git
+curl -s -X POST https://api.vercel.com/v13/deployments -H "Authorization: Bearer $VERCEL_TOKEN" \
+  -d '{"name":"vebai","gitSource":{"type":"github","repo":"FreedoomForm/Vebai","ref":"main","repoId":"<repoId>"}}'
+```
+
+И проще: `npx vercel --prod` с токеном в `VERCEL_TOKEN`.
 
 ## Режим «агент работает 24/7»
 

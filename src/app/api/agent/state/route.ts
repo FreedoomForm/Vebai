@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth'
 import { messageToDTO, taskToDTO } from '@/lib/agent/tools'
 import { agentTick } from '@/lib/agent/worker'
 
@@ -9,6 +10,9 @@ export const dynamic = 'force-dynamic'
  * Also opportunistically drives the background worker: with no always-on
  * process on Vercel, every open client doubles as a heartbeat. */
 export async function GET(req: NextRequest) {
+  const { user, unauthorized } = await requireAuth(req)
+  if (unauthorized) return unauthorized
+
   const conversationId = req.nextUrl.searchParams.get('conversationId') || ''
 
   const [activeTasks, queued, running] = await Promise.all([
@@ -29,12 +33,14 @@ export async function GET(req: NextRequest) {
 
   if (!conversationId) return NextResponse.json({ worker })
 
-  const [conv, messages, tasks] = await Promise.all([
-    db.conversation.findUnique({ where: { id: conversationId } }),
+  const conv = await db.conversation.findUnique({ where: { id: conversationId } })
+  if (!conv || (user && conv.userId && conv.userId !== user.id))
+    return NextResponse.json({ worker, missing: true })
+
+  const [messages, tasks] = await Promise.all([
     db.message.findMany({ where: { conversationId }, orderBy: { createdAt: 'asc' } }),
     db.agentTask.findMany({ where: { conversationId }, orderBy: { createdAt: 'asc' } }),
   ])
-  if (!conv) return NextResponse.json({ worker, missing: true })
 
   return NextResponse.json({
     worker,

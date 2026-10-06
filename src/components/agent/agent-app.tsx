@@ -12,7 +12,16 @@ import { useAgentSocket, type AgentStatePayload } from '@/hooks/use-agent-socket
 import { MessageItem } from './message-item'
 import { ActivityPanel } from './activity-panel'
 import { Composer } from './composer'
+import { AuthScreen } from './auth-screen'
+import { WarningBanner } from './warning-banner'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
+
+interface SessionUser {
+  id: string
+  email: string
+  name: string
+  hasZaiToken?: boolean
+}
 
 interface ConvSummary extends ConversationDTO {
   messageCount: number
@@ -32,6 +41,7 @@ const SUGGESTIONS = [
 ]
 
 export function AgentApp() {
+  const [session, setSession] = useState<{ user: SessionUser | null; checked: boolean }>({ user: null, checked: false })
   const [conversations, setConversations] = useState<ConvSummary[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<MessageDTO[]>([])
@@ -180,23 +190,49 @@ export function AgentApp() {
     if (activeId) subscribe(activeId)
   }, [activeId, subscribe, unsubscribe])
 
-  /* --------------------------------------------------------- initial load */
+  /* --------------------------------------------------------- auth check */
+
+  const checkSession = useCallback(async () => {
+    try {
+      const res = await fetch('/api/auth/me', { cache: 'no-store' })
+      if (res.status === 401) {
+        setSession({ user: null, checked: true })
+        return
+      }
+      const data = (await res.json()) as { user: SessionUser | null; authRequired: boolean }
+      setSession({ user: data.user, checked: true })
+    } catch {
+      setSession({ user: null, checked: true })
+    }
+  }, [])
 
   useEffect(() => {
-    void (async () => {
-      try {
-        const res = await fetch('/api/conversations', { cache: 'no-store' })
-        const data = await res.json()
-        const list: ConvSummary[] = data.conversations || []
-        setConversations(list)
-        if (list.length > 0) {
-          setActiveId(list[0].id)
-          activeIdRef.current = list[0].id
-          await fetchState(list[0].id)
-        }
-      } catch { /* offline */ }
-    })()
+    void checkSession()
+  }, [checkSession])
+
+  /* --------------------------------------------------------- initial load */
+
+  const loadInitial = useCallback(async () => {
+    try {
+      const res = await fetch('/api/conversations', { cache: 'no-store' })
+      if (res.status === 401) {
+        setSession({ user: null, checked: true })
+        return
+      }
+      const data = await res.json()
+      const list: ConvSummary[] = data.conversations || []
+      setConversations(list)
+      if (list.length > 0) {
+        setActiveId(list[0].id)
+        activeIdRef.current = list[0].id
+        await fetchState(list[0].id)
+      }
+    } catch { /* offline */ }
   }, [fetchState])
+
+  useEffect(() => {
+    if (session.user) void loadInitial()
+  }, [session.user, loadInitial])
 
   /* -------------------------------------------------------------- sending */
 
@@ -299,6 +335,16 @@ export function AgentApp() {
     [loadConversations, newChat],
   )
 
+  const logout = useCallback(async () => {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {})
+    setConversations([])
+    setMessages([])
+    setTasks([])
+    setActiveId(null)
+    activeIdRef.current = null
+    setSession({ user: null, checked: true })
+  }, [])
+
   /* --------------------------------------------------------------- scroll */
 
   useEffect(() => {
@@ -314,6 +360,21 @@ export function AgentApp() {
   }, [])
 
   /* ---------------------------------------------------------------- render */
+
+  // auth gate: while the session check runs show a quiet splash
+  if (!session.checked) {
+    return (
+      <div className="flex h-dvh items-center justify-center bg-zinc-950">
+        <div className="flex items-center gap-3 text-zinc-500">
+          <Loader2 className="h-5 w-5 animate-spin text-emerald-400" />
+          <span className="text-sm">Загрузка…</span>
+        </div>
+      </div>
+    )
+  }
+  if (session.checked && !session.user) {
+    return <AuthScreen onAuthed={() => void checkSession().then(() => void loadInitial())} />
+  }
 
   const sidebar = (
     <div className="flex h-full flex-col bg-zinc-950">
@@ -375,6 +436,20 @@ export function AgentApp() {
             <span className="ml-auto text-emerald-400">{worker.activeTasks} в фоне</span>
           )}
         </div>
+        <div className="mt-2 flex items-center gap-2">
+          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-[10px] font-semibold text-zinc-300">
+            {(session.user?.name || session.user?.email || '?').slice(0, 1).toUpperCase()}
+          </div>
+          <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-400" title={session.user?.email}>
+            {session.user?.name || session.user?.email}
+          </span>
+          <button
+            onClick={() => void logout()}
+            className="rounded px-2 py-1 text-[11px] text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300"
+          >
+            Выйти
+          </button>
+        </div>
       </div>
     </div>
   )
@@ -398,6 +473,7 @@ export function AgentApp() {
 
       {/* center chat column */}
       <main className="flex min-w-0 flex-1 flex-col">
+        <WarningBanner />
         <header className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-2.5 sm:px-4">
           <Button
             variant="ghost"

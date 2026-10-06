@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { runAgentTurn } from '@/lib/agent/loop'
+import { requireAuth } from '@/lib/auth'
 import type { AgentEvent } from '@/lib/agent/types'
 
 export const dynamic = 'force-dynamic'
@@ -8,6 +9,9 @@ export const maxDuration = 800
 
 /** POST /api/chat — runs one agent turn and streams AgentEvents as SSE */
 export async function POST(req: NextRequest) {
+  const { user, unauthorized } = await requireAuth(req)
+  if (unauthorized) return unauthorized
+
   let conversationId = ''
   let content = ''
   try {
@@ -21,10 +25,15 @@ export async function POST(req: NextRequest) {
       })
     if (conversationId) {
       const exists = await db.conversation.findUnique({ where: { id: conversationId } })
-      if (!exists) conversationId = ''
+      // scope: a conversation belongs to its creator
+      if (!exists || (user && exists.userId && exists.userId !== user.id)) conversationId = ''
+      else if (user && !exists.userId) {
+        // adopt legacy/anonymous conversations created before auth
+        await db.conversation.update({ where: { id: exists.id }, data: { userId: user.id } })
+      }
     }
     if (!conversationId) {
-      const conv = await db.conversation.create({ data: {} })
+      const conv = await db.conversation.create({ data: { userId: user?.id ?? null } })
       conversationId = conv.id
     }
   } catch {
@@ -35,6 +44,7 @@ export async function POST(req: NextRequest) {
   }
 
   const cid = conversationId
+  const zaiToken = user?.zaiToken || null
   const encoder = new TextEncoder()
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -55,7 +65,7 @@ export async function POST(req: NextRequest) {
       const hb = setInterval(() => safeEnqueue(': hb\n\n'), 15_000)
 
       try {
-        await runAgentTurn(cid, content, emit)
+        await runAgentTurn(cid, content, emit, zaiToken)
       } catch (e) {
         emit({
           type: 'error',

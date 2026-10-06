@@ -28,9 +28,24 @@ model Job {
   @@index([batchId])
 }
 
+// Site user. Registration happens locally; AI requests are proxied through
+// chat.z.ai (see src/lib/chatweb.ts) — either with the user's own z.ai token
+// (zaiToken) or with the owner's ZAI_JWT / a guest session.
+model User {
+  id           String         @id @default(cuid())
+  email        String         @unique
+  passwordHash String
+  name         String         @default("")
+  zaiToken     String? // user's own chat.z.ai JWT (BYO mode, optional)
+  createdAt    DateTime       @default(now())
+  conversations Conversation[]
+}
+
 // A chat thread with the persistent AI architect (Manus-style agent)
 model Conversation {
   id        String      @id @default(cuid())
+  userId    String?
+  user      User?       @relation(fields: [userId], references: [id], onDelete: Cascade)
   title     String      @default("Новый диалог")
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
@@ -38,6 +53,7 @@ model Conversation {
   tasks     AgentTask[]
 
   @@index([updatedAt])
+  @@index([userId])
 }
 
 // One chat message. kind: text | task_result

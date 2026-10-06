@@ -17,13 +17,16 @@ interface LLMMessage {
 /* ------------------------------------------------------- LLM stream utils */
 
 /** parse the Z.ai OpenAI-compatible SSE stream into content deltas */
-async function* streamLLM(messages: LLMMessage[]): AsyncGenerator<string> {
-  const body = await zai.streamChat({
-    messages,
-    stream: true,
-    thinking: { type: 'disabled' },
-    temperature: 0.5,
-  })
+async function* streamLLM(messages: LLMMessage[], userToken?: string | null): AsyncGenerator<string> {
+  const body = await zai.streamChat(
+    {
+      messages,
+      stream: true,
+      thinking: { type: 'disabled' },
+      temperature: 0.5,
+    },
+    { userToken },
+  )
   if (!body || typeof body.getReader !== 'function')
     throw new Error('LLM вернул нестриминговый ответ')
 
@@ -205,6 +208,7 @@ export async function runAgentTurn(
   conversationId: string,
   userContent: string,
   emit: Emit,
+  userToken?: string | null,
 ): Promise<void> {
   // 1. persist + emit the user message
   const userMsg = await db.message.create({
@@ -236,7 +240,7 @@ export async function runAgentTurn(
       // 2. stream the model reply, hiding the tool block from the user
       let full = ''
       let emitted = 0
-      for await (const delta of streamLLM(llmMessages)) {
+      for await (const delta of streamLLM(llmMessages, userToken)) {
         full += delta
         const idx = full.toLowerCase().indexOf('```tool')
         const visible = idx >= 0 ? full.slice(0, idx).replace(/\s+$/, '') : full

@@ -1,17 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth'
 import { messageToDTO, taskToDTO } from '@/lib/agent/tools'
 
 export const dynamic = 'force-dynamic'
 
 /** GET /api/conversations/[id] — full chat state (messages + tasks) */
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const { user, unauthorized } = await requireAuth(req)
+  if (unauthorized) return unauthorized
+
   const { id } = await params
   const conv = await db.conversation.findUnique({ where: { id } })
-  if (!conv)
+  if (!conv || (user && conv.userId && conv.userId !== user.id))
     return NextResponse.json({ error: 'conversation not found' }, { status: 404 })
 
   const [messages, tasks] = await Promise.all([
@@ -33,10 +37,15 @@ export async function GET(
 
 /** DELETE /api/conversations/[id] */
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const { user, unauthorized } = await requireAuth(req)
+  if (unauthorized) return unauthorized
+
   const { id } = await params
-  await db.conversation.deleteMany({ where: { id } })
+  await db.conversation.deleteMany({
+    where: user ? { id, userId: user.id } : { id },
+  })
   return NextResponse.json({ ok: true })
 }
