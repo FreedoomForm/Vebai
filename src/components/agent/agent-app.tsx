@@ -450,7 +450,7 @@ export function AgentApp() {
   }
 
   const sidebar = (
-    <div className="flex h-full flex-col bg-zinc-950">
+    <div className="flex h-full w-full min-w-0 flex-col bg-zinc-950">
       <div className="flex items-center gap-2.5 px-4 py-4">
         <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15 border border-emerald-800/40">
           <Sparkles className="h-4 w-4 text-emerald-400" />
