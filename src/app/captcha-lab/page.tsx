@@ -50,6 +50,7 @@ export default function CaptchaLab() {
       SceneId: SCENES[scene],
       mode: 'popup',
       element: '#lab-el',
+      button: '#lab-trig',
       region: 'sgp',
       prefix: 'no8xfe',
       language: 'en',
@@ -72,11 +73,8 @@ export default function CaptchaLab() {
       onError: (e: unknown) => setReady(`${scene} ERR ${JSON.stringify(e).slice(0, 140)}`),
     })
     setTimeout(() => {
-      const btn = el.querySelector<HTMLButtonElement>('#zai-captcha-trigger')
-      void btn
-      // popup mode needs a bound trigger; use the widget's own button if any,
-      // else the embed renders inline — click the first child
-      const trigger = document.getElementById('lab-el') as HTMLElement | null
+      // popup mode binds to the (hidden) trigger — click it once bound
+      const trigger = document.getElementById('lab-trig') as HTMLElement | null
       trigger?.click()
     }, 400)
   }
@@ -105,6 +103,17 @@ export default function CaptchaLab() {
         </button>
       </div>
       <div ref={mountRef} />
+      {/* hidden mount + trigger for the popup-mode widget (must stay rendered) */}
+      <div
+        id="lab-el"
+        style={{ position: 'fixed', left: -9999, top: -9999, width: 1, height: 1, overflow: 'hidden' }}
+      />
+      <button
+        id="lab-trig"
+        type="button"
+        aria-hidden
+        style={{ position: 'fixed', left: -9999, top: -9999, width: 1, height: 1, opacity: 0 }}
+      />
       <pre style={{ whiteSpace: 'pre-wrap', color: '#9f9', marginTop: 14, fontSize: 12 }}>{result}</pre>
     </div>
   )
