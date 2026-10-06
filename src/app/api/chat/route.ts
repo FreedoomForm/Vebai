@@ -6,7 +6,7 @@ import { getUserZaiSession } from '@/lib/zai-session'
 import type { AgentEvent } from '@/lib/agent/types'
 
 export const dynamic = 'force-dynamic'
-export const maxDuration = 800
+export const maxDuration = 300 // hobby-plan cap; SSE heartbeat keeps proxies from idling
 
 /** POST /api/chat — runs one agent turn and streams AgentEvents as SSE.
  * Body: { conversationId?, content, captchaVerifyParam?, resume? }

@@ -31,3 +31,4 @@ prisma/*.db
 # typescript
 *.tsbuildinfo
 .pgembed/
+.env*
