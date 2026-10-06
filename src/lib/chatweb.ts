@@ -75,20 +75,24 @@ export class ChatWebError extends Error {
   }
 }
 
-/** Map a signup/signin {detail} error into a typed ChatWebError. */
+/** Map a signup/signin {detail} error into a typed ChatWebError.
+ * The upstream detail is preserved verbatim — the UI shows the EXACT
+ * reason Z.ai rejected the request (no more guessing why a solved
+ * captcha was refused). */
 function mapAuthError(status: number, txt: string): ChatWebError {
   let detail = txt
   try {
     const j = JSON.parse(txt) as { detail?: unknown }
     if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
   } catch { /* raw text */ }
+  const short = detail.slice(0, 180)
   if (/captcha/i.test(detail))
-    return new ChatWebError('Капча Z.ai не прошла — реши её заново', 'captcha_failed')
+    return new ChatWebError(`Z.ai не принял проверку капчи: ${short}`, 'captcha_failed')
   if (status === 400 && /already|exists|занят/i.test(detail))
-    return new ChatWebError('Этот email уже зарегистрирован на Z.ai', 'email_taken')
+    return new ChatWebError(`Этот email уже зарегистрирован на Z.ai (${short})`, 'email_taken')
   if (status === 401 || /invalid|wrong|incorrect|credential/i.test(detail))
-    return new ChatWebError('Z.ai не принял email/пароль', 'bad_credentials')
-  return new ChatWebError(`chat.z.ai auth ${status}: ${detail.slice(0, 200)}`, 'auth_failed')
+    return new ChatWebError(`Z.ai не принял email/пароль (${short})`, 'bad_credentials')
+  return new ChatWebError(`chat.z.ai auth ${status}: ${short}`, 'auth_failed')
 }
 
 /* ------------------------------------------------------------- session */

@@ -6,15 +6,19 @@ import { zaiSignUp, resolveSession, ChatWebError } from '@/lib/chatweb'
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/auth/register — create the site account AND the user's OWN
- * REAL chat.z.ai account in one step.
+ * POST /api/auth/register — create the site account INSTANTLY (v4).
  *
- * The gate is Z.ai itself: the browser solves the auth-scene Aliyun captcha
- * (the very widget chat.z.ai embeds on its signup page); we forward the
- * one-time captcha_verify_param together with the user's chosen
- * email/password to chat.z.ai /auths/signup. If Z.ai accepts, a real
- * account exists with its own JWT and its own quota — no owner token, no
- * shared pool, no per-message captcha for this user.
+ * The local account is created first and the user is let in immediately —
+ * registration can no longer be blocked by anything Z.ai-side (the old
+ * hard captcha gate produced "green but rejected" dead ends).
+ *
+ * If the browser also relayed a solved Z.ai auth-scene captcha param, we
+ * TRY to create the user's REAL chat.z.ai account in the same breath:
+ *  - success → their own JWT is stored; their traffic consumes their own
+ *    Z.ai quota (no per-message captcha);
+ *  - failure → the account still exists and works (guest-relay chat), and
+ *    the exact upstream reason is returned so the user can retry linking
+ *    later from the in-app card.
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -43,58 +47,49 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Укажи корректный email' }, { status: 400 })
   if (password.length < 6)
     return NextResponse.json({ error: 'Пароль — минимум 6 символов' }, { status: 400 })
-  if (!zaiCaptchaParam)
-    return NextResponse.json(
-      { error: 'Пройди проверку Z.ai (капча под формой) и попробуй снова' },
-      { status: 400 },
-    )
 
   const existing = await db.user.findUnique({ where: { email } })
   if (existing)
     return NextResponse.json({ error: 'Такой email уже зарегистрирован здесь' }, { status: 409 })
 
-  // Create the REAL chat.z.ai account — Z.ai verifies the captcha param.
-  let session
-  try {
-    session = await zaiSignUp(name, email, password, zaiCaptchaParam)
-    // canonicalize the session (fresh token + stable user id)
-    session = await resolveSession(session.token)
-  } catch (e) {
-    if (e instanceof ChatWebError) {
-      if (e.code === 'captcha_failed')
-        return NextResponse.json(
-          { error: 'Проверка Z.ai не прошла — реши капчу заново и отправь форму ещё раз', code: e.code },
-          { status: 400 },
-        )
-      if (e.code === 'email_taken')
-        return NextResponse.json(
-          {
-            error: 'Такой email уже занят на Z.ai — если это твой аккаунт, просто войди',
-            code: e.code,
-          },
-          { status: 409 },
-        )
-      return NextResponse.json({ error: e.message, code: e.code }, { status: 502 })
-    }
-    return NextResponse.json(
-      { error: 'Z.ai недоступен для регистрации, попробуй чуть позже' },
-      { status: 502 },
-    )
-  }
-
+  // 1) the local account — instant, unconditional
   const user = await db.user.create({
     data: {
       email,
       passwordHash: hashPassword(password),
-      name: name || session.name || '',
-      zaiToken: session.token,
-      zaiUserId: session.userId,
-      zaiSessionAt: new Date(),
+      name,
     },
     select: { id: true, email: true, name: true },
   })
 
-  const res = NextResponse.json({ user: { id: user.id, email: user.email, name: user.name } })
+  // 2) best-effort: create the user's OWN chat.z.ai account behind the
+  //    relayed captcha param. Never blocks registration.
+  let zai: { linked: boolean; code?: string; detail?: string } = { linked: false }
+  if (zaiCaptchaParam) {
+    try {
+      const session = await zaiSignUp(name || email.split('@')[0], email, password, zaiCaptchaParam)
+      const canonical = await resolveSession(session.token)
+      await db.user.update({
+        where: { id: user.id },
+        data: {
+          zaiToken: canonical.token,
+          zaiUserId: canonical.userId,
+          zaiSessionAt: new Date(),
+        },
+      })
+      zai = { linked: true }
+    } catch (e) {
+      const detail = e instanceof ChatWebError ? e.message : 'Z.ai недоступен'
+      const code = e instanceof ChatWebError ? e.code : 'zai_unavailable'
+      console.error(`[register] z.ai link failed for ${email}: ${code} :: ${detail.slice(0, 200)}`)
+      zai = { linked: false, code, detail: detail.slice(0, 220) }
+    }
+  }
+
+  const res = NextResponse.json({
+    user: { id: user.id, email: user.email, name: user.name },
+    zai,
+  })
   res.headers.append('Set-Cookie', sessionCookieHeader(createSessionToken(user.id)))
   return res
 }

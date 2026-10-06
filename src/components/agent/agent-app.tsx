@@ -3,17 +3,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Bot, Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, Circle, ShieldAlert,
+  Loader2, Circle,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { useAgentSocket, type AgentStatePayload } from '@/hooks/use-agent-socket'
 import { MessageItem } from './message-item'
 import { ActivityPanel } from './activity-panel'
 import { Composer } from './composer'
 import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
+import { ZaiLinkCard } from './zai-link-card'
 import { solveZaiCaptcha, preloadZaiCaptcha } from './zai-captcha'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
 
@@ -51,7 +53,9 @@ export function AgentApp() {
   const [worker, setWorker] = useState({ activeTasks: 0, queued: 0, running: 0 })
   const [navOpen, setNavOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
-  const [sessionError, setSessionError] = useState('')
+  const [linkOpen, setLinkOpen] = useState(false)
+  const [linkReason, setLinkReason] = useState('')
+  const [zaiLinked, setZaiLinked] = useState(false)
 
   const sendingRef = useRef(false)
   const activeIdRef = useRef<string | null>(null)
@@ -169,6 +173,14 @@ export function AgentApp() {
         void resendRef.current?.()
         break
       }
+      case 'zai_downgraded': {
+        // the user's own Z.ai session died — the turn continues on a guest
+        // session; surface the reconnect card (non-blocking)
+        setZaiLinked(false)
+        setLinkReason(evt.message)
+        setLinkOpen(true)
+        break
+      }
       case 'done': {
         sendingRef.current = false
         setSending(false)
@@ -184,8 +196,9 @@ export function AgentApp() {
         setStream(null)
         console.error('[agent]', evt.message, evt.code || '')
         if (evt.code === 'zai_session_expired') {
-          // the user's own Z.ai JWT died — a one-time re-login restores it
-          setSessionError('Сессия Z.ai истекла — нажми «Выйти» и войди заново (капча будет один раз).')
+          setZaiLinked(false)
+          setLinkReason(evt.message)
+          setLinkOpen(true)
         }
         break
       }
@@ -211,7 +224,12 @@ export function AgentApp() {
         setSession({ user: null, checked: true })
         return
       }
-      const data = (await res.json()) as { user: SessionUser | null; authRequired: boolean }
+      const data = (await res.json()) as {
+        user: SessionUser | null
+        authRequired: boolean
+        zaiLinked?: boolean
+      }
+      setZaiLinked(Boolean(data.zaiLinked))
       setSession({ user: data.user, checked: true })
     } catch {
       setSession({ user: null, checked: true })
@@ -426,6 +444,11 @@ export function AgentApp() {
     return <AuthScreen onAuthed={() => void checkSession().then(() => void loadInitial())} />
   }
 
+  const openLinkCard = () => {
+    setLinkReason('')
+    setLinkOpen(true)
+  }
+
   const sidebar = (
     <div className="flex h-full flex-col bg-zinc-950">
       <div className="flex items-center gap-2.5 px-4 py-4">
@@ -494,6 +517,18 @@ export function AgentApp() {
             {session.user?.name || session.user?.email}
           </span>
           <button
+            onClick={openLinkCard}
+            className={cn(
+              'rounded px-2 py-1 text-[11px] border',
+              zaiLinked
+                ? 'border-emerald-900/60 text-emerald-400 hover:bg-emerald-950/40'
+                : 'border-amber-900/60 text-amber-400 hover:bg-amber-950/40',
+            )}
+            title={zaiLinked ? 'Аккаунт Z.ai подключён' : 'Аккаунт Z.ai не подключён — гостевой режим'}
+          >
+            {zaiLinked ? 'Z.ai ✓' : 'Z.ai ⚠'}
+          </button>
+          <button
             onClick={() => void logout()}
             className="rounded px-2 py-1 text-[11px] text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300"
           >
@@ -524,18 +559,6 @@ export function AgentApp() {
       {/* center chat column */}
       <main className="flex min-w-0 flex-1 flex-col">
         <WarningBanner />
-        {sessionError && (
-          <div className="flex items-center gap-2 border-b border-red-900/60 bg-red-950/40 px-4 py-2 text-[12px] text-red-300">
-            <ShieldAlert className="h-4 w-4 shrink-0" />
-            <span className="min-w-0 flex-1">{sessionError}</span>
-            <button
-              onClick={() => void logout()}
-              className="rounded-md border border-red-800 px-2 py-0.5 text-[11px] text-red-200 hover:bg-red-900/50"
-            >
-              Выйти и перелогиниться
-            </button>
-          </div>
-        )}
         <header className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-2.5 sm:px-4">
           <Button
             variant="ghost"
@@ -704,6 +727,30 @@ export function AgentApp() {
           <ActivityPanel tasks={tasks} worker={worker} />
         </SheetContent>
       </Sheet>
+
+      {/* Z.ai account link modal (connect / reconnect own chat.z.ai account) */}
+      <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
+        <DialogContent className="border-zinc-800 bg-zinc-950 text-zinc-100 max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-base">Аккаунт Z.ai</DialogTitle>
+            <DialogDescription className="text-[12px] text-zinc-500">
+              {zaiLinked
+                ? 'Подключён твой аккаунт chat.z.ai — сообщения идут на твоей личной квоте.'
+                : 'Сейчас сообщения идут в гостевом режиме на общей квоте. Подключи свой аккаунт — это твоя личная квота Z.ai.'}
+            </DialogDescription>
+          </DialogHeader>
+          <ZaiLinkCard
+            defaultEmail={session.user?.email || ''}
+            reason={linkReason}
+            onLinked={() => {
+              setZaiLinked(true)
+              setLinkOpen(false)
+              setLinkReason('')
+            }}
+            onDismiss={() => setLinkOpen(false)}
+          />
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

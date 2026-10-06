@@ -1,22 +1,22 @@
 /**
- * Per-user REAL chat.z.ai accounts.
+ * Per-user REAL chat.z.ai accounts + bulletproof guest fallback (v4).
  *
- * Registration on this site creates a REAL chat.z.ai account with the
- * email/password the user chose (behind Z.ai's own auth-scene captcha).
- * The returned JWT is stored on the User row and reused for all their AI
- * traffic — the user owns the account and consumes their OWN Z.ai quota.
- * Chat completions under a real account do NOT require the per-message
- * captcha (that gate only exists for anonymous guest sessions).
+ * A linked user owns a real chat.z.ai account: their JWT lives on the User
+ * row, their AI traffic consumes THEIR OWN Z.ai quota, and chat completions
+ * under a real account do NOT require the per-message captcha.
  *
  * resolveSession() refreshes a still-valid JWT via GET /auths/ (sliding
- * expiry). If a stored JWT dies (long inactivity), we surface a typed
- * `zai_session_expired` error so the user re-logs in — we deliberately do
- * NOT downgrade to an anonymous guest session (that would lose ownership
- * of the account and reintroduce the per-message captcha).
+ * expiry). If a stored JWT dies (long inactivity), we DO NOT block the
+ * user anymore: the request transparently continues on a fresh anonymous
+ * guest session and the stream emits a typed `zai_downgraded` event — the
+ * UI shows the "Подключить аккаунт Z.ai" card while the user keeps chatting
+ * (guest sessions face Z.ai's per-message chat-scene captcha, which works
+ * from our domain). The dead JWT is KEPT on the row: the account link (and
+ * the fact that the user owns a real account) is restored via /api/auth/link.
  */
 
 import { db } from '@/lib/db'
-import { resolveSession, ChatWebError, type ChatWebSession } from '@/lib/chatweb'
+import { resolveSession, type ChatWebSession } from '@/lib/chatweb'
 
 export interface UserZaiSession {
   token: string
@@ -24,6 +24,8 @@ export interface UserZaiSession {
   role: string
   /** true when a fresh session had to be minted during this call */
   refreshed: boolean
+  /** true when the stored real-account JWT died and a guest session took over */
+  downgraded: boolean
 }
 
 async function persist(userId: string | null, session: ChatWebSession): Promise<void> {
@@ -43,11 +45,8 @@ async function persist(userId: string | null, session: ChatWebSession): Promise<
 }
 
 /**
- * Resolve the chat.z.ai session for a site user.
- * - Real account (stored JWT): refresh via /auths/; dead JWT → typed
- *   ChatWebError('zai_session_expired') — the UI asks for a re-login.
- * - No stored JWT (legacy/anon rows): mint an anonymous guest session
- *   (legacy behaviour — those users still face Z.ai's per-message captcha).
+ * Resolve the chat.z.ai session for a site user. NEVER throws for a dead
+ * JWT — it downgrades to a guest session instead (the show goes on).
  */
 export async function getUserZaiSession(userId: string | null | undefined): Promise<UserZaiSession> {
   if (userId) {
@@ -60,18 +59,16 @@ export async function getUserZaiSession(userId: string | null | undefined): Prom
         const session = await resolveSession(user.zaiToken)
         // resolveSession may refresh the token — persist the latest
         if (session.token !== user.zaiToken) await persist(userId, session)
-        return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: false }
+        return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: false, downgraded: false }
       } catch {
-        // stored JWT is dead — do NOT silently downgrade to a guest session:
-        // the user owns a real account and must re-login to keep it.
-        throw new ChatWebError(
-          'Сессия Z.ai истекла — войди заново (капча Z.ai потребуется один раз).',
-          'zai_session_expired',
-        )
+        // stored JWT died — keep it on the row (it marks account ownership)
+        // and continue THIS request on a guest session
+        const session = await resolveSession(null)
+        return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: true, downgraded: true }
       }
     }
   }
   const session = await resolveSession(null)
   await persist(userId ?? null, session)
-  return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: true }
+  return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: true, downgraded: false }
 }

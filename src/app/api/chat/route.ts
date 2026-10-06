@@ -66,13 +66,17 @@ export async function POST(req: NextRequest) {
   const cid = conversationId
 
   // per-user REAL chat.z.ai account session (JWT stored on the User row).
-  // If the stored JWT died (long inactivity), we surface a typed event so
-  // the user re-logs in — we never silently downgrade to a guest session
-  // (that would lose account ownership and reintroduce per-message captcha).
+  // If the stored JWT died (long inactivity), the turn transparently
+  // continues on a guest session and we emit a typed `zai_downgraded`
+  // event — the UI shows the "Подключить аккаунт Z.ai" card, the user
+  // keeps chatting (guests face Z.ai's per-message chat-scene captcha).
   let zaiSessionToken: string | null = null
+  let downgraded = false
   let sessionError: { message: string; code: string } | null = null
   try {
-    zaiSessionToken = (await getUserZaiSession(user?.id ?? null)).token
+    const s = await getUserZaiSession(user?.id ?? null)
+    zaiSessionToken = s.token
+    downgraded = s.downgraded
   } catch (e) {
     zaiSessionToken = null
     sessionError = {
@@ -105,6 +109,14 @@ export async function POST(req: NextRequest) {
           emit({ type: 'error', message: sessionError.message, code: sessionError.code })
           emit({ type: 'done' })
           return
+        }
+        if (downgraded) {
+          // the user's own Z.ai session died — keep chatting as a guest,
+          // but surface the reconnect card
+          emit({
+            type: 'zai_downgraded',
+            message: 'Сессия Z.ai истекла — сообщения идут в гостевом режиме. Подключи свой аккаунт, чтобы вернуться на свою квоту.',
+          })
         }
         await runAgentTurn(cid, content, emit, {
           zaiSessionToken,
