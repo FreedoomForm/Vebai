@@ -34,16 +34,23 @@ export default function GoogleCatchPage() {
   const [phase, setPhase] = useState<Phase>('working')
   const [message, setMessage] = useState('Забираю токен из ссылки…')
   const [error, setError] = useState('')
-  const ran = useRef(false)
+  const busy = useRef(false)
 
   useEffect(() => {
-    if (ran.current) return
-    ran.current = true
-    void run()
+    const attempt = () => {
+      if (!busy.current) void run()
+    }
+    // bookmarklet may land here while the page is already open (hash-only
+    // navigation does NOT remount) — react to hashchange too
+    window.addEventListener('hashchange', attempt)
+    attempt()
+    return () => window.removeEventListener('hashchange', attempt)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const run = async () => {
+    if (busy.current) return
+    busy.current = true
     try {
       const hash = window.location.hash.replace(/^#/, '')
       const search = window.location.search.replace(/^\?/, '')
@@ -98,6 +105,8 @@ export default function GoogleCatchPage() {
     } catch {
       setError('Сеть недоступна, попробуй ещё раз')
       setPhase('error')
+    } finally {
+      busy.current = false
     }
   }
 
