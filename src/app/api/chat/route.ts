@@ -65,13 +65,20 @@ export async function POST(req: NextRequest) {
 
   const cid = conversationId
 
-  // per-user anonymous chat.z.ai session (minted on first use, stored on the
-  // User row; the user never handles any token)
+  // per-user REAL chat.z.ai account session (JWT stored on the User row).
+  // If the stored JWT died (long inactivity), we surface a typed event so
+  // the user re-logs in — we never silently downgrade to a guest session
+  // (that would lose account ownership and reintroduce per-message captcha).
   let zaiSessionToken: string | null = null
+  let sessionError: { message: string; code: string } | null = null
   try {
     zaiSessionToken = (await getUserZaiSession(user?.id ?? null)).token
-  } catch {
-    zaiSessionToken = null // fall back to chatWeb's own guest flow
+  } catch (e) {
+    zaiSessionToken = null
+    sessionError = {
+      message: e instanceof Error ? e.message.slice(0, 300) : 'сессия Z.ai недоступна',
+      code: (e as { code?: string }).code || 'zai_session_error',
+    }
   }
 
   const encoder = new TextEncoder()
@@ -94,6 +101,11 @@ export async function POST(req: NextRequest) {
       const hb = setInterval(() => safeEnqueue(': hb\n\n'), 15_000)
 
       try {
+        if (sessionError) {
+          emit({ type: 'error', message: sessionError.message, code: sessionError.code })
+          emit({ type: 'done' })
+          return
+        }
         await runAgentTurn(cid, content, emit, {
           zaiSessionToken,
           captchaVerifyParam: captchaVerifyParam || undefined,

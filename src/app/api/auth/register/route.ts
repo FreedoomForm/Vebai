@@ -1,22 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { AUTH_REQUIRED, createSessionToken, hashPassword, sessionCookieHeader } from '@/lib/auth'
-import { chatWebComplete } from '@/lib/chatweb'
-import { getUserZaiSession } from '@/lib/zai-session'
+import { zaiSignUp, resolveSession, ChatWebError } from '@/lib/chatweb'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/auth/register — create a site account, gated by Z.ai's OWN server
- * captcha (Aliyun slider relayed to the user — the same widget chat.z.ai uses).
+ * POST /api/auth/register — create the site account AND the user's OWN
+ * REAL chat.z.ai account in one step.
  *
- * How the gate works: the browser solves the widget and hands us the one-time
- * captcha_verify_param; we prove it against chat.z.ai itself by minting an
- * anonymous guest session and running a tiny "PONG" completion with the param.
- * If chat.z.ai accepts the param, the human is verified — by Z.ai, not by us.
- * The (now warm) guest session is stored on the user and reused for their AI
- * traffic; its quota is consumed by Z.ai. No tokens are collected from users
- * and the site owner's JWT is not involved.
+ * The gate is Z.ai itself: the browser solves the auth-scene Aliyun captcha
+ * (the very widget chat.z.ai embeds on its signup page); we forward the
+ * one-time captcha_verify_param together with the user's chosen
+ * email/password to chat.z.ai /auths/signup. If Z.ai accepts, a real
+ * account exists with its own JWT and its own quota — no owner token, no
+ * shared pool, no per-message captcha for this user.
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -47,32 +45,39 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Пароль — минимум 6 символов' }, { status: 400 })
   if (!zaiCaptchaParam)
     return NextResponse.json(
-      { error: 'Пройди проверку Z.ai (кнопка «Я не робот») и попробуй снова' },
+      { error: 'Пройди проверку Z.ai (капча под формой) и попробуй снова' },
       { status: 400 },
     )
 
   const existing = await db.user.findUnique({ where: { email } })
   if (existing)
-    return NextResponse.json({ error: 'Такой email уже зарегистрирован' }, { status: 409 })
+    return NextResponse.json({ error: 'Такой email уже зарегистрирован здесь' }, { status: 409 })
 
-  // Validate the relayed captcha the honest way: feed it to chat.z.ai.
-  // The probe also warms up the guest session we then attach to the user.
+  // Create the REAL chat.z.ai account — Z.ai verifies the captcha param.
   let session
   try {
-    session = await getUserZaiSession(null) // throwaway guest, persisted below
-    await chatWebComplete(
-      [{ role: 'user', content: 'Ответь одним словом: OK' }],
-      { transport: { sessionToken: session.token, captchaVerifyParam: zaiCaptchaParam } },
-    )
+    session = await zaiSignUp(name, email, password, zaiCaptchaParam)
+    // canonicalize the session (fresh token + stable user id)
+    session = await resolveSession(session.token)
   } catch (e) {
-    const code = (e as { code?: string }).code || ''
-    if (code === 'captcha_required' || code === 'captcha_failed')
-      return NextResponse.json(
-        { error: 'Проверка Z.ai не прошла — реши капчу заново и отправь форму ещё раз' },
-        { status: 400 },
-      )
+    if (e instanceof ChatWebError) {
+      if (e.code === 'captcha_failed')
+        return NextResponse.json(
+          { error: 'Проверка Z.ai не прошла — реши капчу заново и отправь форму ещё раз', code: e.code },
+          { status: 400 },
+        )
+      if (e.code === 'email_taken')
+        return NextResponse.json(
+          {
+            error: 'Такой email уже занят на Z.ai — если это твой аккаунт, просто войди',
+            code: e.code,
+          },
+          { status: 409 },
+        )
+      return NextResponse.json({ error: e.message, code: e.code }, { status: 502 })
+    }
     return NextResponse.json(
-      { error: 'Z.ai недоступен для проверки капчи, попробуй чуть позже' },
+      { error: 'Z.ai недоступен для регистрации, попробуй чуть позже' },
       { status: 502 },
     )
   }
@@ -81,9 +86,9 @@ export async function POST(req: NextRequest) {
     data: {
       email,
       passwordHash: hashPassword(password),
-      name,
+      name: name || session.name || '',
       zaiToken: session.token,
-      zaiUserId: session.zaiUserId,
+      zaiUserId: session.userId,
       zaiSessionAt: new Date(),
     },
     select: { id: true, email: true, name: true },

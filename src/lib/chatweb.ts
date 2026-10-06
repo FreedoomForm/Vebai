@@ -55,6 +55,22 @@ export class ChatWebError extends Error {
   }
 }
 
+/** Map a signup/signin {detail} error into a typed ChatWebError. */
+function mapAuthError(status: number, txt: string): ChatWebError {
+  let detail = txt
+  try {
+    const j = JSON.parse(txt) as { detail?: unknown }
+    if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+  } catch { /* raw text */ }
+  if (/captcha/i.test(detail))
+    return new ChatWebError('Капча Z.ai не прошла — реши её заново', 'captcha_failed')
+  if (status === 400 && /already|exists|занят/i.test(detail))
+    return new ChatWebError('Этот email уже зарегистрирован на Z.ai', 'email_taken')
+  if (status === 401 || /invalid|wrong|incorrect|credential/i.test(detail))
+    return new ChatWebError('Z.ai не принял email/пароль', 'bad_credentials')
+  return new ChatWebError(`chat.z.ai auth ${status}: ${detail.slice(0, 200)}`, 'auth_failed')
+}
+
 /* ------------------------------------------------------------- session */
 
 export interface ChatWebSession {
@@ -102,6 +118,70 @@ export async function resolveSession(userToken?: string | null): Promise<ChatWeb
     userId: data.id,
     name: data.name || 'User',
     email: data.email || '',
+    role: data.role || 'user',
+  }
+}
+
+/**
+ * Create a REAL chat.z.ai account (email+password the user chose) behind
+ * Z.ai's own auth-scene captcha (Aliyun rotate/inpainting puzzle — the same
+ * widget chat.z.ai embeds on its login/signup page, SceneId '36qgs6xb').
+ * The returned session is a first-class account: its own JWT, its own quota,
+ * and NO per-message captcha (that gate only applies to anonymous guests).
+ */
+export async function zaiSignUp(
+  name: string,
+  email: string,
+  password: string,
+  captchaVerifyParam: string,
+): Promise<ChatWebSession> {
+  const res = await fetch(`${BASE}/api/v1/auths/signup`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: name || email.split('@')[0],
+      email,
+      password,
+      profile_image_url: '/static/favicon.png',
+      sso_redirect: '',
+      captcha_verify_param: captchaVerifyParam,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+  const data = JSON.parse(txt) as { token?: string; id?: string; name?: string; email?: string; role?: string }
+  if (!data?.token) throw new ChatWebError('Z.ai не вернул токен аккаунта', 'auth_failed')
+  return {
+    token: data.token,
+    userId: data.id || '',
+    name: data.name || name || 'User',
+    email: data.email || email,
+    role: data.role || 'user',
+  }
+}
+
+/** Sign in to an EXISTING chat.z.ai account (also captcha-gated by Z.ai). */
+export async function zaiSignIn(
+  email: string,
+  password: string,
+  captchaVerifyParam: string,
+): Promise<ChatWebSession> {
+  const res = await fetch(`${BASE}/api/v1/auths/signin`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, captcha_verify_param: captchaVerifyParam }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+  const data = JSON.parse(txt) as { token?: string; id?: string; name?: string; email?: string; role?: string }
+  if (!data?.token) throw new ChatWebError('Z.ai не вернул токен аккаунта', 'auth_failed')
+  return {
+    token: data.token,
+    userId: data.id || '',
+    name: data.name || 'User',
+    email: data.email || email,
     role: data.role || 'user',
   }
 }
@@ -320,9 +400,11 @@ async function* upstreamEvents(
     current_user_message_id: crypto.randomUUID(),
     current_user_message_parent_id: null,
     background_tasks: { title_generation: false, tags_generation: false },
-    // one-time Aliyun captcha param relayed from the user's widget;
-    // empty string = server answers FRONTEND_CAPTCHA_REQUIRED (missing_param)
-    captcha_verify_param: captchaVerifyParam || '',
+    // one-time Aliyun captcha param relayed from the user's widget.
+    // IMPORTANT: mirror chat.z.ai's own frontend — attach the field ONLY
+    // when a param exists; sending an empty string can trip the captcha
+    // gate even for real (logged-in) accounts, which don't need it at all.
+    ...(captchaVerifyParam ? { captcha_verify_param: captchaVerifyParam } : {}),
     stream_options: { include_usage: true },
   }
 

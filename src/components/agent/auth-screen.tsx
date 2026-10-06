@@ -1,69 +1,74 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { BadgeCheck, Loader2, ShieldAlert, Sparkles } from 'lucide-react'
+import { Loader2, ShieldAlert, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { solveZaiCaptcha, preloadZaiCaptcha } from './zai-captcha'
+import { ZaiAuthCaptcha, preloadZaiCaptcha } from './zai-captcha'
 
 /**
- * Landing / auth gate. Shows the mandatory proxy warning prominently:
- * the account is created HERE behind Z.ai's own server captcha (the same
- * Aliyun widget chat.z.ai uses — relayed, solved by the user, verified by
- * chat.z.ai). AI traffic goes through chat.z.ai and consumes the Z.ai
- * quota of the user's own anonymous session. No tokens are collected.
+ * Landing / auth gate.
+ *
+ * REGISTRATION creates the user's OWN REAL chat.z.ai account (their email +
+ * password work on chat.z.ai too) behind Z.ai's own auth-scene captcha — the
+ * very Aliyun widget embedded on chat.z.ai's signup page. The resulting JWT
+ * lives on the user's row server-side; their AI traffic consumes THEIR OWN
+ * Z.ai quota, with no per-message captcha (that gate only hits guests).
+ *
+ * LOGIN needs Z.ai's captcha only when the stored session expired — the
+ * widget appears on demand (same scene as chat.z.ai's login page).
  */
 export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('register')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [name, setName] = useState('')
+  // captcha param produced by the embedded auth-scene widget (register mode)
   const [captchaParam, setCaptchaParam] = useState('')
-  const [captchaBusy, setCaptchaBusy] = useState(false)
-  const [captchaError, setCaptchaError] = useState('')
+  const [captchaToken, setCaptchaToken] = useState(0) // force widget re-init
+  const [captchaNeeded, setCaptchaNeeded] = useState(false) // login step 2
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
 
   useEffect(() => {
     // warm the SDK so the first verification starts instantly
     preloadZaiCaptcha()
   }, [])
 
-  const passCaptcha = useCallback(async () => {
-    if (captchaBusy) return
-    setCaptchaBusy(true)
-    setCaptchaError('')
-    try {
-      const param = await solveZaiCaptcha()
-      if (!param) throw new Error('пустой ответ капчи')
-      setCaptchaParam(param)
-    } catch (e) {
-      setCaptchaError(e instanceof Error ? e.message : 'Капча не прошла')
-      setCaptchaParam('')
-    } finally {
-      setCaptchaBusy(false)
-    }
-  }, [captchaBusy])
-
-  const submit = async () => {
+  const submit = async (overrideParam?: string) => {
     if (busy) return
+    const param = overrideParam ?? captchaParam
+    if (mode === 'register' && !param) {
+      setError('Сначала пройди проверку Z.ai под формой')
+      return
+    }
     setBusy(true)
     setError('')
+    setInfo('')
     try {
       const body =
         mode === 'register'
-          ? { email, password, name, zaiCaptchaParam: captchaParam }
-          : { email, password }
+          ? { email, password, name, zaiCaptchaParam: param }
+          : { email, password, zaiCaptchaParam: param || undefined }
       const res = await fetch(`/api/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const data = (await res.json().catch(() => ({}))) as { error?: string }
+      const data = (await res.json().catch(() => ({}))) as {
+        error?: string
+        code?: string
+      }
       if (!res.ok) {
         setError(data.error || `Ошибка ${res.status}`)
-        // the one-time captcha param was consumed — require a fresh one
-        if (mode === 'register') setCaptchaParam('')
+        // one-time param consumed — a fresh verification is required
+        setCaptchaParam('')
+        setCaptchaToken((t) => t + 1)
+        if (data.code === 'zai_captcha_required') {
+          setCaptchaNeeded(true)
+          setInfo('Z.ai просит подтвердить вход — пройди капчу под формой и нажми «Войти» ещё раз')
+        }
         return
       }
       onAuthed()
@@ -73,6 +78,19 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
       setBusy(false)
     }
   }
+
+  const onWidgetParam = useCallback(
+    (param: string) => {
+      setCaptchaParam(param)
+      setError('')
+      // login flow: the param arrived AFTER the first submit — finish it now
+      if (mode === 'login' && email && password && busy === false) {
+        void submit(param)
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mode, email, password, busy, captchaParam],
+  )
 
   return (
     <div className="flex min-h-dvh items-center justify-center bg-zinc-950 px-4 py-10">
@@ -97,12 +115,12 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             </p>
           </div>
           <p className="text-[12px] leading-relaxed text-amber-200/80">
-            Регистрация защищена <span className="font-medium text-amber-200">серверной капчей Z.ai</span>{' '}
-            (тот же виджет, что на chat.z.ai). Все запросы к ИИ выполняет агент платформы{' '}
-            <span className="font-medium text-amber-200">chat.z.ai (Z.ai)</span> — с её встроенным
-            поиском и инструментами — через твою собственную анонимную сессию, поэтому расходуется{' '}
-            <span className="font-medium text-amber-200">квота Z.ai</span>. Никакие токены Z.ai у
-            тебя не запрашиваются. Это неофициальный клиент, не аффилированный с Z.ai.
+            Регистрация создаёт <span className="font-medium text-amber-200">твой настоящий аккаунт chat.z.ai</span> —
+            этот email и пароль работают и на самом chat.z.ai. Капча Z.ai (тот же виджет Aliyun, что у них)
+            нужна только при регистрации и входе. Все запросы к ИИ выполняет агент chat.z.ai (Z.ai) с его
+            поиском и инструментами — <span className="font-medium text-amber-200">под твоим аккаунтом и на твою
+            личную квоту Z.ai</span>. Никакие токены у тебя не запрашиваются. Это неофициальный клиент,
+            не аффилированный с Z.ai.
           </p>
         </div>
 
@@ -112,7 +130,7 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             {(['register', 'login'] as const).map((m) => (
               <button
                 key={m}
-                onClick={() => { setMode(m); setError('') }}
+                onClick={() => { setMode(m); setError(''); setInfo(''); setCaptchaParam(''); setCaptchaNeeded(false) }}
                 className={cn(
                   'rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors',
                   mode === m ? 'bg-emerald-500/90 text-zinc-950' : 'text-zinc-400 hover:text-zinc-200',
@@ -148,50 +166,28 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
           />
 
-          {mode === 'register' && (
+          {/* Z.ai's own auth captcha — always visible on register; on demand
+              on login (when the stored Z.ai session expired) */}
+          {(mode === 'register' || captchaNeeded) && (
             <div className="space-y-1.5">
-              <button
-                type="button"
-                data-testid="zai-captcha-button"
-                onClick={() => void passCaptcha()}
-                disabled={captchaBusy}
-                className={cn(
-                  'flex w-full items-center justify-center gap-2 rounded-lg border px-3 py-2.5 text-sm transition-colors',
-                  captchaParam
-                    ? 'border-emerald-800 bg-emerald-500/10 text-emerald-300'
-                    : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:border-zinc-700',
-                  captchaBusy && 'opacity-70',
-                )}
-              >
-                {captchaBusy ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : captchaParam ? (
-                  <BadgeCheck className="h-4 w-4" />
-                ) : (
-                  <ShieldAlert className="h-4 w-4" />
-                )}
-                {captchaBusy
-                  ? 'Проверяем через Z.ai…'
-                  : captchaParam
-                    ? 'Проверка Z.ai пройдена ✓'
-                    : 'Я не робот — проверка Z.ai'}
-              </button>
               <p className="text-[11px] leading-relaxed text-zinc-600">
-                Откроется официальная капча Z.ai (Aliyun). Обычно проверка проходит мгновенно;
-                иногда нужно передвинуть ползунок. {captchaError && <span className="text-red-400">{captchaError}</span>}
+                Официальная капча Z.ai (Aliyun) — та же, что на chat.z.ai: нажми на полоску,
+                иногда нужно перетащить ползунок на картинке.
               </p>
+              <ZaiAuthCaptcha onParam={onWidgetParam} token={captchaToken} />
             </div>
           )}
 
+          {info && <p className="text-[12px] text-emerald-400">{info}</p>}
           {error && <p className="text-[12px] text-red-400">{error}</p>}
 
           <Button
-            onClick={submit}
+            onClick={() => void submit()}
             disabled={busy || !email || !password || (mode === 'register' && !captchaParam)}
             className="w-full bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
           >
             {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-            {mode === 'register' ? 'Создать аккаунт' : 'Войти'}
+            {mode === 'register' ? 'Создать аккаунт Z.ai' : 'Войти'}
           </Button>
 
           <p className="text-[11px] leading-relaxed text-zinc-600">

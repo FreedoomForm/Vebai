@@ -1,5 +1,7 @@
 'use client'
 
+import { useEffect, useRef, useState } from 'react'
+
 /**
  * Z.ai captcha relay.
  *
@@ -24,6 +26,8 @@ const SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptc
 const REGION = 'sgp'
 const PREFIX = 'no8xfe'
 const SCENE_ID = 'didk33e0'
+/** chat.z.ai's signup/login scene (embed mode, visible in-form widget) */
+export const AUTH_SCENE_ID = '36qgs6xb'
 const ELEMENT_ID = 'zai-captcha-element'
 const BUTTON_ID = 'zai-captcha-trigger'
 
@@ -50,7 +54,8 @@ interface AliyunCaptchaInit {
   SceneId: string
   mode: 'popup' | 'embed' | 'inline'
   element: string
-  button: string
+  /** popup mode binds the trigger to this button; embed mode ignores it */
+  button?: string
   captchaLogoImg?: string
   upLang?: Record<string, Record<string, string>>
   language?: string
@@ -59,6 +64,7 @@ interface AliyunCaptchaInit {
   timeout?: number
   delayBeforeSuccess?: boolean
   immediate?: boolean
+  slideStyle?: { width: number; height: number }
   success: (captchaVerifyParam: string) => void
   fail?: (e: unknown) => void
   onError?: (e: unknown) => void
@@ -227,4 +233,104 @@ export function preloadZaiCaptcha(): void {
   void ensureSdk().catch(() => {
     /* surfaced on the next solve attempt */
   })
+}
+
+/* ------------------------------------------------------------ auth scene */
+
+const AUTH_ELEMENT_PREFIX = 'zai-auth-captcha-element'
+
+/**
+ * Visible, in-form AUTH-scene widget (the exact UX of chat.z.ai's own
+ * signup/login page): embed mode, SceneId '36qgs6xb'. The user clicks the
+ * bar; trusted sessions pass instantly, others get the rotate/inpainting
+ * puzzle. Success yields a one-time captcha_verify_param that the backend
+ * forwards to /auths/signup or /auths/signin.
+ *
+ * Re-initialized for every verification (one widget life = one param).
+ * `token` (optional) forces a fresh init when it changes.
+ */
+export function ZaiAuthCaptcha({
+  onParam,
+  onError,
+  token,
+}: {
+  onParam: (param: string) => void
+  onError?: (message: string) => void
+  /** change to force a re-init (e.g. after a failed submit) */
+  token?: string | number
+}) {
+  const [state, setState] = useState<'idle' | 'busy' | 'ok' | 'error'>('idle')
+  const [msg, setMsg] = useState('')
+  const mountRef = useRef<HTMLDivElement | null>(null)
+  const idxRef = useRef(0)
+
+  useEffect(() => {
+    let cancelled = false
+    const elementId = `${AUTH_ELEMENT_PREFIX}-${idxRef.current}`
+    setState('idle')
+    setMsg('')
+
+    ensureSdk()
+      .then(() => {
+        if (cancelled) return
+        const mount = mountRef.current
+        if (!mount) return
+        // fresh mount node per init (one widget life = one param)
+        mount.innerHTML = ''
+        const el = document.createElement('div')
+        el.id = elementId
+        mount.appendChild(el)
+
+        const finishErr = (m: string) => {
+          if (cancelled) return
+          setState('error')
+          setMsg(m)
+          onError?.(m)
+        }
+        window.initAliyunCaptcha!({
+          SceneId: AUTH_SCENE_ID,
+          mode: 'embed',
+          element: `#${elementId}`,
+          region: REGION,
+          prefix: PREFIX,
+          language: 'en',
+          upLang: { en: RU_LANG },
+          slideStyle: { width: 320, height: 40 },
+          captchaLogoImg: 'https://z-cdn.chatglm.cn/z-ai/static/logo.svg',
+          success: (param) => {
+            if (cancelled) return
+            setState('ok')
+            setMsg('')
+            onParam(String(param || ''))
+          },
+          fail: (e) => finishErr(`Капча не прошла (${safeStr(e)}) — нажми проверку ещё раз`),
+          onError: (e) => finishErr(`Капча недоступна (${safeStr(e)})`),
+          onClose: () => {
+            /* user closed the puzzle — widget stays for another attempt */
+          },
+        })
+      })
+      .catch((e) => {
+        if (cancelled) return
+        const m = e instanceof Error ? e.message : 'Капча Z.ai не загрузилась'
+        setState('error')
+        setMsg(m)
+        onError?.(m)
+      })
+
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token])
+
+  return (
+    <div className="space-y-1.5">
+      <div ref={mountRef} data-testid="zai-auth-captcha" className="min-h-[46px] [&_iframe]:max-w-full" />
+      {state === 'ok' && (
+        <p className="text-[11px] text-emerald-400">Проверка Z.ai пройдена ✓</p>
+      )}
+      {msg && <p className="text-[11px] text-red-400">{msg}</p>}
+    </div>
+  )
 }

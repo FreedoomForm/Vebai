@@ -31,9 +31,8 @@ export function WarningBanner() {
       <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
       <p className="flex-1 text-[11px] leading-relaxed text-amber-200/80">
         ИИ-запросы выполняет агент <span className="font-medium text-amber-200">chat.z.ai (Z.ai)</span> со
-        встроенным поиском и расходует <span className="font-medium text-amber-200">твою анонимную квоту Z.ai</span>.
-        Защита — серверная капча Z.ai (тот же виджет, что на chat.z.ai); токены у тебя не
-        запрашиваются. Сервис неофициальный и не аффилирован с Z.ai.
+        встроенным поиском — под <span className="font-medium text-amber-200">твоим собственным аккаунтом Z.ai</span>, на твою личную квоту
+        (email/пароль работают и на chat.z.ai). Сервис неофициальный и не аффилирован с Z.ai.
       </p>
       <button
         aria-label="Скрыть предупреждение"

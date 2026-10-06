@@ -32,3 +32,4 @@ prisma/*.db
 *.tsbuildinfo
 .pgembed/
 .env*
+public/zz-captcha-bench.html

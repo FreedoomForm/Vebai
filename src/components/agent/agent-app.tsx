@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Bot, Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, Circle,
+  Loader2, Circle, ShieldAlert,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -51,6 +51,7 @@ export function AgentApp() {
   const [worker, setWorker] = useState({ activeTasks: 0, queued: 0, running: 0 })
   const [navOpen, setNavOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
+  const [sessionError, setSessionError] = useState('')
 
   const sendingRef = useRef(false)
   const activeIdRef = useRef<string | null>(null)
@@ -181,7 +182,11 @@ export function AgentApp() {
         sendingRef.current = false
         setSending(false)
         setStream(null)
-        console.error('[agent]', evt.message)
+        console.error('[agent]', evt.message, evt.code || '')
+        if (evt.code === 'zai_session_expired') {
+          // the user's own Z.ai JWT died — a one-time re-login restores it
+          setSessionError('Сессия Z.ai истекла — нажми «Выйти» и войди заново (капча будет один раз).')
+        }
         break
       }
     }
@@ -519,6 +524,18 @@ export function AgentApp() {
       {/* center chat column */}
       <main className="flex min-w-0 flex-1 flex-col">
         <WarningBanner />
+        {sessionError && (
+          <div className="flex items-center gap-2 border-b border-red-900/60 bg-red-950/40 px-4 py-2 text-[12px] text-red-300">
+            <ShieldAlert className="h-4 w-4 shrink-0" />
+            <span className="min-w-0 flex-1">{sessionError}</span>
+            <button
+              onClick={() => void logout()}
+              className="rounded-md border border-red-800 px-2 py-0.5 text-[11px] text-red-200 hover:bg-red-900/50"
+            >
+              Выйти и перелогиниться
+            </button>
+          </div>
+        )}
         <header className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-2.5 sm:px-4">
           <Button
             variant="ghost"

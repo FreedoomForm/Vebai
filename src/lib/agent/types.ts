@@ -66,4 +66,4 @@ export type AgentEvent =
   | { type: 'conversation'; conversationId: string }
   | { type: 'captcha_required' }
   | { type: 'done' }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; code?: string }

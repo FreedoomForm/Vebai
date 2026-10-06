@@ -372,6 +372,13 @@ export async function runAgentTurn(
       emit({ type: 'done' })
       return
     }
+    if (e instanceof TransportError && e.code === 'zai_session_expired') {
+      // the user's own Z.ai JWT died mid-turn — a re-login is required;
+      // surface a typed event instead of a generic error
+      emit({ type: 'error', message: e.message.slice(0, 300), code: 'zai_session_expired' })
+      emit({ type: 'done' })
+      return
+    }
     const msg = e instanceof Error ? e.message : String(e)
     emit({ type: 'error', message: msg.slice(0, 400) })
     try {
