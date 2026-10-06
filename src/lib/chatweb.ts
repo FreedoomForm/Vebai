@@ -25,9 +25,12 @@
  * it, we forward the param, chat.z.ai verifies it — no owner JWT, no homemade
  * captcha. One param = one request (reuse fails with verify_code F018).
  *
- * Agent tools: the chat.z.ai agent keeps its OWN toolbelt (z.ai web SDK —
- * web search etc.); we enable its auto web search so answers come with
- * fresh data through Z.ai's quota. Our site adds the video tool on top.
+ * Agent mode (default): chats are created with type 'general_agent' on an
+ * agent-capable model (GLM-5.x / x-preview). That mode IS the full Z.ai
+ * agent — its own toolbelt covers web search, IMAGE GENERATION, file/QA
+ * tools and code interpreter through the account's Z.ai quota (no extra
+ * API keys). The upstream stream also emits type:'status' events (agent
+ * activity) which we relay to the UI as ephemeral activity cards.
  */
 
 import crypto from 'node:crypto'
@@ -37,7 +40,24 @@ const FE_VERSION = 'prod-fe-1.0.272'
 const SIGNING_SECRET = 'key-@@@@)))()((9))-xxxx&&&%%%%%'
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
 
-export const DEFAULT_CHATWEB_MODEL = process.env.ZAI_CHATWEB_MODEL || 'glm-4.7'
+export const DEFAULT_CHATWEB_MODEL = process.env.ZAI_CHATWEB_MODEL || 'x-preview-l'
+
+/** Agent-capable models (capabilities.agent_mode on chat.z.ai:
+ * x-preview-l / glm-5.3 / glm-5.2 / GLM-5-Turbo …). For these we create
+ * 'general_agent' chats; anything else falls back to plain chat mode. */
+const AGENT_MODEL_RE = /x-preview|glm-5|GLM-5/i
+export function isAgentModel(model: string): boolean {
+  return AGENT_MODEL_RE.test(model)
+}
+
+/** Shape of the ephemeral agent-activity events relayed to the UI. */
+export interface ZaiActivity {
+  id: string
+  /** human-readable RU label, doubles as the ToolCard name fallback */
+  name: string
+  done: boolean
+  summary?: string
+}
 
 /** Transport extras threaded from /api/chat down to the completions call. */
 export interface ChatWebTransport {
@@ -277,11 +297,13 @@ export function renderPrompt(messages: PlainMessage[]): string {
 
 async function createChatRecord(session: ChatWebSession, model: string, prompt: string): Promise<string> {
   const userMessageId = crypto.randomUUID()
+  const agent = isAgentModel(model)
   const body = {
     chat: {
       id: '',
       title: 'New Chat',
       models: [model],
+      params: {},
       history: {
         currentId: userMessageId,
         messages: {
@@ -298,12 +320,19 @@ async function createChatRecord(session: ChatWebSession, model: string, prompt: 
       },
       tags: [],
       flags: [],
-      features: [],
+      // mirror chat.z.ai's own agent-mode chat record: hidden tool_selector
+      // feature flag (the agent decides its tools itself)
+      features: agent ? [{ server: 'tool_selector_h', status: 'hidden', type: 'tool_selector' }] : [],
       mcp_servers: [],
-      enable_thinking: false,
-      auto_web_search: true,
+      enable_thinking: agent,
+      ...(agent ? { reasoning_effort: 'max' } : {}),
+      auto_web_search: !agent,
       message_version: 1,
+      extra: {},
       timestamp: Date.now(),
+      // 'general_agent' = THE agent mode of chat.z.ai (web search, image
+      // generation, file tools — all inside Z.ai, no extra APIs)
+      type: agent ? 'general_agent' : 'default',
     },
   }
   const res = await fetch(`${BASE}/api/v1/chats/new`, {
@@ -361,18 +390,21 @@ interface UpstreamEventData {
   error?: { detail?: unknown; code?: unknown; error_code?: unknown }
 }
 
-/** Low-level: open the signed v2 SSE stream and yield raw upstream events. */
+/** Low-level: open the signed v2 SSE stream and yield raw upstream events.
+ * Two kinds are yielded: {data} for chat:completion (phased content) and
+ * {status} for the agent's activity updates (type:'status'). */
 async function* upstreamEvents(
   session: ChatWebSession,
   prompt: string,
   model: string,
   captchaVerifyParam?: string,
-): AsyncGenerator<{ data: UpstreamEventData }> {
+): AsyncGenerator<{ data?: UpstreamEventData; status?: Record<string, unknown> }> {
   const timestampMs = String(Date.now())
   const requestId = crypto.randomUUID()
   const signature = signPrompt(requestId, timestampMs, session.userId, prompt)
   const recordId = await createChatRecord(session, model, prompt)
 
+  const agent = isAgentModel(model)
   const body = {
     stream: true,
     model,
@@ -380,14 +412,28 @@ async function* upstreamEvents(
     signature_prompt: prompt.slice(0, 500),
     params: {},
     extra: {},
-    features: {
-      image_generation: false,
-      web_search: false,
-      auto_web_search: true, // let the Z.ai agent decide when to search
-      preview_mode: false,
-      flags: [],
-      enable_thinking: false,
-    },
+    features: agent
+      ? {
+          // Z.ai agent mode: its own toolbelt (web search, IMAGE GENERATION,
+          // file QA, code interpreter) runs server-side on the account's
+          // quota — no extra API keys. reasoning_effort 'max' mirrors the
+          // chat.z.ai frontend in agent mode.
+          image_generation: true,
+          web_search: false,
+          auto_web_search: false,
+          preview_mode: false,
+          flags: [],
+          enable_thinking: true,
+          reasoning_effort: 'max',
+        }
+      : {
+          image_generation: false,
+          web_search: false,
+          auto_web_search: true, // plain chat: let Z.ai decide when to search
+          preview_mode: false,
+          flags: [],
+          enable_thinking: false,
+        },
     variables: {
       '{{USER_NAME}}': session.name,
       '{{USER_LOCATION}}': 'Unknown',
@@ -448,9 +494,14 @@ async function* upstreamEvents(
         const payload = line.slice(5).trim()
         if (!payload || payload === '[DONE]') continue
         try {
-          const event = JSON.parse(payload) as { type?: string; data?: UpstreamEventData }
-          if (event.type && event.type !== 'chat:completion') continue
-          yield { data: event.data || {} }
+          const event = JSON.parse(payload) as {
+            type?: string
+            data?: UpstreamEventData & Record<string, unknown>
+          }
+          if (event.type === 'chat:completion') yield { data: event.data || {} }
+          else if (event.type === 'status')
+            yield { status: (event.data || {}) as Record<string, unknown> }
+          // chat:title / chat:tags / notification / conn:heartbeat — ignored
         } catch { /* partial line */ }
       }
     }
@@ -469,11 +520,67 @@ function openaiChunk(delta: { content?: string }, finish: string | null = null):
   })}\n\n`
 }
 
+/** Map an upstream type:'status' payload into a human activity label. */
+function describeStatus(status: Record<string, unknown>): { name: string; args?: Record<string, unknown> } | null {
+  const action = String(status.action || status.type || '').toLowerCase()
+  const detail = String(status.query || status.keyword || status.title || status.description || '').slice(0, 80)
+  if (/image|picture|photo|изображ/.test(action))
+    return { name: 'generate_image', args: detail ? { title: detail } : {} }
+  if (/search|web/.test(action)) return { name: 'web_search', args: detail ? { query: detail } : {} }
+  if (/knowledge/.test(action)) return { name: 'knowledge_search', args: detail ? { query: detail } : {} }
+  if (/code|python|exec/.test(action)) return { name: 'code_interpreter', args: detail ? { title: detail } : {} }
+  if (/file|document|doc|read/.test(action)) return { name: 'file_qa', args: detail ? { title: detail } : {} }
+  if (/ppt|slide|presentation/.test(action)) return { name: 'ppt_maker', args: detail ? { title: detail } : {} }
+  if (action) return { name: 'Агент: ' + action }
+  return null
+}
+
+/** Try to extract a tool name/content from a tool_call / tool_response phase. */
+function describeToolPhase(phase: string, data: UpstreamEventData): { name: string; args?: Record<string, unknown> } | null {
+  const blocks = (data as { content_blocks?: unknown }).content_blocks
+  if (Array.isArray(blocks)) {
+    for (const b of blocks) {
+      const block = b as { type?: string; content?: unknown }
+      if (block?.type === 'tool_calls' && Array.isArray(block.content)) {
+        for (const c of block.content) {
+          const call = c as { function?: { name?: unknown; arguments?: unknown } }
+          const fn = call?.function?.name
+          if (typeof fn === 'string' && fn)
+            return {
+              name: /search/i.test(fn)
+                ? 'web_search'
+                : /image/i.test(fn)
+                  ? 'generate_image'
+                  : fn,
+              args: typeof call.function?.arguments === 'object' && call.function?.arguments
+                ? (call.function.arguments as Record<string, unknown>)
+                : {},
+            }
+        }
+      }
+    }
+  }
+  const raw = (data.delta_content || '').trim()
+  if (raw.startsWith('{')) {
+    try {
+      const j = JSON.parse(raw) as { name?: unknown; function?: { name?: unknown } }
+      const fn = j.name || j.function?.name
+      if (typeof fn === 'string' && fn) return { name: fn, args: {} }
+    } catch { /* not json */ }
+  }
+  return phase === 'tool_call' ? { name: 'Агент вызывает инструмент' } : null
+}
+
 /** Streaming chat via chat.z.ai -> OpenAI-compatible SSE chunks.
- * Session: explicit transport token (per-user guest session) → site-wide
+ * Session: explicit transport token (per-user session) → site-wide
  * ZAI_JWT (owner, optional) → fresh anonymous guest. The captcha param is
  * relayed as-is; without it Z.ai demands the captcha (the UI catches the
- * typed error and pops Z.ai's own widget). */
+ * typed error and pops Z.ai's own widget).
+ *
+ * Agent mode: besides content, the stream carries agent activity
+ * (type:'status' events, tool phases, thinking). Those are relayed as
+ * `{"zai_activity": …}` SSE lines — the loop converts them into ephemeral
+ * ToolCards so the user sees the agent working (search/images/files). */
 export async function chatWebStream(
   messages: PlainMessage[],
   opts?: { model?: string; transport?: ChatWebTransport },
@@ -491,17 +598,68 @@ export async function chatWebStream(
       const push = (s: string) => {
         try { controller.enqueue(enc.encode(s)) } catch { /* closed */ }
       }
+      // ---- ephemeral agent-activity relay (running card per label) ----
+      let openActivity: { id: string; name: string; args: Record<string, unknown> } | null = null
+      const closeActivity = (summary?: string) => {
+        if (!openActivity) return
+        push(
+          `data: ${JSON.stringify({
+            zai_activity: { id: openActivity.id, done: true, ...(summary ? { summary } : {}) },
+          })}\n\n`,
+        )
+        openActivity = null
+      }
+      const startActivity = (name: string, args: Record<string, unknown> = {}) => {
+        if (openActivity && openActivity.name === name) return // same step continues
+        closeActivity()
+        const id = 'z' + crypto.randomUUID().replace(/-/g, '').slice(0, 10)
+        openActivity = { id, name, args }
+        push(`data: ${JSON.stringify({ zai_activity: { id, name, args, done: false } })}\n\n`)
+      }
+      // ---- content assembly with edit_content dedupe guard ----
+      // Some upstreams stream answer as pure delta_content; others resend
+      // the whole answer-so-far in edit_content. If a cleaned edit_content
+      // starts with everything already emitted, emit only the suffix.
+      let emittedAnswer = ''
+      const emitAnswer = (text: string) => {
+        if (!text) return
+        if (text.startsWith(emittedAnswer) && text.length > emittedAnswer.length) {
+          push(openaiChunk({ content: text.slice(emittedAnswer.length) }))
+          emittedAnswer = text
+          return
+        }
+        if (emittedAnswer.startsWith(text)) return // stale resend — nothing new
+        push(openaiChunk({ content: text }))
+        emittedAnswer += text
+      }
       try {
-        for await (const { data } of upstreamEvents(session, prompt, model, captchaVerifyParam)) {
+        for await (const ev of upstreamEvents(session, prompt, model, captchaVerifyParam)) {
+          if (ev.status !== undefined) {
+            const described = describeStatus(ev.status)
+            if (described) startActivity(described.name, described.args || {})
+            continue
+          }
+          const data = ev.data as UpstreamEventData
           if (data.error) throw mapUpstreamError(data.error)
           const phase = data.phase || 'answer'
+          if (phase === 'thinking') {
+            startActivity('Агент думает')
+            continue
+          }
+          if (phase === 'tool_call' || phase === 'tool_response') {
+            const described = describeToolPhase(phase, data)
+            if (described) startActivity(described.name, described.args || {})
+            continue
+          }
           if (phase === 'other') continue
-          if (phase === 'thinking') continue // agent runs with thinking disabled
+          // answer (or unknown phase carrying content)
+          closeActivity()
           const raw = data.edit_content ?? data.delta_content ?? ''
           const text = cleanAnswerDelta(raw)
-          if (text) push(openaiChunk({ content: text }))
+          if (text) emitAnswer(text)
           if (data.done) break
         }
+        closeActivity()
         push(openaiChunk({}, 'stop'))
         push('data: [DONE]\n\n')
       } catch (e) {

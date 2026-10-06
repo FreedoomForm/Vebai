@@ -26,14 +26,22 @@ export class TransportError extends Error {
 
 /* ------------------------------------------------------- LLM stream utils */
 
-/** parse the Z.ai OpenAI-compatible SSE stream into content deltas.
- * Throws TransportError('captcha_required') when Z.ai demands its captcha —
- * the turn is aborted BEFORE any assistant content and the UI relays
- * Z.ai's own widget, then retries the same message. */
+/** Stream item: either a content delta or an ephemeral Z.ai agent
+ * activity card (the agent's own toolbelt at work — search, images, files). */
+interface StreamItem {
+  delta?: string
+  activity?: { id: string; name: string; args?: Record<string, unknown>; done: boolean; summary?: string }
+}
+
+/** parse the Z.ai OpenAI-compatible SSE stream into content deltas and
+ * agent-activity events. Throws TransportError('captcha_required') when
+ * Z.ai demands its captcha — the turn is aborted BEFORE any assistant
+ * content and the UI relays Z.ai's own widget, then retries the same
+ * message. */
 async function* streamLLM(
   messages: LLMMessage[],
   transport?: ChatWebTransport,
-): AsyncGenerator<string> {
+): AsyncGenerator<StreamItem> {
   const body = await zai.streamChat(
     {
       messages,
@@ -69,8 +77,13 @@ async function* streamLLM(
               String(chunk.error.code || 'chatweb_error'),
             )
           }
+          // ephemeral Z.ai agent activity (thinking / search / image gen …)
+          if (chunk?.zai_activity) {
+            yield { activity: chunk.zai_activity as StreamItem['activity'] }
+            continue
+          }
           const delta: string = chunk?.choices?.[0]?.delta?.content ?? ''
-          if (delta) yield delta
+          if (delta) yield { delta }
         } catch (e) {
           if (e instanceof TransportError) throw e
           /* partial JSON line — skip */
@@ -290,8 +303,18 @@ export async function runAgentTurn(
       let emitted = 0
       const iterTransport: ChatWebTransport =
         iter === 0 ? transport : { sessionToken: transport.sessionToken }
-      for await (const delta of streamLLM(llmMessages, iterTransport)) {
-        full += delta
+      for await (const item of streamLLM(llmMessages, iterTransport)) {
+        // relay Z.ai agent activity (its own toolbelt) as ephemeral cards
+        if (item.activity) {
+          const a = item.activity
+          if (a.done) {
+            emit({ type: 'tool_result', id: a.id, status: 'ok', summary: a.summary || '' })
+          } else {
+            emit({ type: 'tool', id: a.id, call: { name: a.name, args: a.args || {}, status: 'running' } })
+          }
+          continue
+        }
+        full += item.delta || ''
         const idx = full.toLowerCase().indexOf('```tool')
         const visible = idx >= 0 ? full.slice(0, idx).replace(/\s+$/, '') : full
         if (visible.length > emitted) {

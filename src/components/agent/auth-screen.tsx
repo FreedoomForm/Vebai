@@ -117,8 +117,9 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
           <p className="text-[12px] leading-relaxed text-amber-200/80">
             Регистрация создаёт <span className="font-medium text-amber-200">твой настоящий аккаунт chat.z.ai</span> —
             этот email и пароль работают и на самом chat.z.ai. Капча Z.ai (тот же виджет Aliyun, что у них)
-            нужна только при регистрации и входе. Все запросы к ИИ выполняет агент chat.z.ai (Z.ai) с его
-            поиском и инструментами — <span className="font-medium text-amber-200">под твоим аккаунтом и на твою
+            нужна только при регистрации и входе. Все запросы выполняет <span className="font-medium text-amber-200">агент
+            chat.z.ai в режиме «Агент»</span> — веб-поиск, генерация изображений, работа с файлами и кодом —{' '}
+            <span className="font-medium text-amber-200">под твоим аккаунтом и на твою
             личную квоту Z.ai</span>. Никакие токены у тебя не запрашиваются. Это неофициальный клиент,
             не аффилированный с Z.ai.
           </p>

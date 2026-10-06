@@ -30,8 +30,9 @@ export function WarningBanner() {
     <div className="flex items-start gap-2 border-b border-amber-900/50 bg-amber-950/25 px-3 py-2 sm:px-4">
       <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
       <p className="flex-1 text-[11px] leading-relaxed text-amber-200/80">
-        ИИ-запросы выполняет агент <span className="font-medium text-amber-200">chat.z.ai (Z.ai)</span> со
-        встроенным поиском — под <span className="font-medium text-amber-200">твоим собственным аккаунтом Z.ai</span>, на твою личную квоту
+        ИИ-запросы выполняет <span className="font-medium text-amber-200">агент chat.z.ai (Z.ai)</span> — режим
+        «Агент»: веб-поиск, генерация изображений, работа с файлами и кодом — под{' '}
+        <span className="font-medium text-amber-200">твоим собственным аккаунтом Z.ai</span>, на твою личную квоту
         (email/пароль работают и на chat.z.ai). Сервис неофициальный и не аффилирован с Z.ai.
       </p>
       <button
