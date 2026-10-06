@@ -3,6 +3,13 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* display serif for the hero headline (z.ai-style first screen) */
+@utility font-display {
+  font-family: Georgia, 'Times New Roman', 'Noto Serif', serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);

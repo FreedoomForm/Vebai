@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  Bot, Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, Circle,
+  Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
+  Loader2, Circle, ChevronDown, Check, Globe,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -12,7 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { useAgentSocket, type AgentStatePayload } from '@/hooks/use-agent-socket'
 import { MessageItem } from './message-item'
 import { ActivityPanel } from './activity-panel'
-import { Composer } from './composer'
+import { Composer, type Effort, type SendOptions } from './composer'
 import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
 import { ZaiLinkCard } from './zai-link-card'
@@ -35,11 +35,38 @@ interface StreamState {
   plan?: { title?: string; steps: { title: string; status: 'pending' | 'active' | 'done' }[] }
 }
 
+/* --------------------------------------------------------------- models */
+// mirrors z.ai's model dropdown; ids are whitelisted server-side
+const MODEL_OPTIONS = [
+  {
+    id: 'x-preview-l',
+    label: 'GLM-5.3-Flash',
+    sub: 'Лёгкий флагман: премиум-качество, мгновенный отклик',
+    badge: 'NEW',
+  },
+  {
+    id: 'glm-5.2',
+    label: 'GLM-5.2',
+    sub: 'Предыдущий флагман',
+  },
+  {
+    id: 'glm-4.7',
+    label: 'GLM-4.7',
+    sub: 'Классический чат (без агент-инструментов)',
+  },
+] as const
+
 const SUGGESTIONS = [
   { icon: '🎬', text: 'Сделай план и обучающее видео про физику электронов' },
   { icon: '🖼', text: 'Сгенерируй обложку для научного YouTube-канала' },
   { icon: '🌐', text: 'Найди свежие данные о модели MiniMax H3 и перескажи' },
   { icon: '🎨', text: 'Придумай и нарисуй маскота для IT-блога' },
+]
+
+const GALLERY = [
+  { grad: 'from-stone-800 via-stone-700 to-stone-900', label: 'Лендинг для продукта' },
+  { grad: 'from-emerald-200 via-teal-100 to-stone-100', label: 'Мини-игра' },
+  { grad: 'from-amber-100 via-stone-100 to-stone-200', label: 'Личный блог' },
 ]
 
 export function AgentApp() {
@@ -57,11 +84,49 @@ export function AgentApp() {
   const [linkReason, setLinkReason] = useState('')
   const [zaiLinked, setZaiLinked] = useState(false)
 
+  // composer / selector state (z.ai-style, persisted like their last_selected_agent_model)
+  const [model, setModel] = useState<string>('x-preview-l')
+  const [effort, setEffort] = useState<Effort>('max')
+  const [webSearch, setWebSearch] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [modelOpen, setModelOpen] = useState(false)
+
   const sendingRef = useRef(false)
   const activeIdRef = useRef<string | null>(null)
   activeIdRef.current = activeId
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const stickToBottomRef = useRef(true)
+
+  /* --------------------------------------------------- persisted settings */
+
+  useEffect(() => {
+    try {
+      const m = localStorage.getItem('vebai_model')
+      if (m && MODEL_OPTIONS.some((o) => o.id === m)) setModel(m)
+      const e = localStorage.getItem('vebai_effort')
+      if (e === 'high' || e === 'max') setEffort(e)
+      const w = localStorage.getItem('vebai_websearch')
+      if (w === '1') setWebSearch(true)
+    } catch { /* private mode */ }
+  }, [])
+
+  const selectModel = useCallback((id: string) => {
+    setModel(id)
+    setModelOpen(false)
+    try { localStorage.setItem('vebai_model', id) } catch { /* noop */ }
+  }, [])
+
+  const toggleWebSearch = useCallback(() => {
+    setWebSearch((v) => {
+      try { localStorage.setItem('vebai_websearch', v ? '0' : '1') } catch { /* noop */ }
+      return !v
+    })
+  }, [])
+
+  const changeEffort = useCallback((e: Effort) => {
+    setEffort(e)
+    try { localStorage.setItem('vebai_effort', e) } catch { /* noop */ }
+  }, [])
 
   /* ------------------------------------------------------------ fetching */
 
@@ -270,7 +335,7 @@ export function AgentApp() {
   const resendRef = useRef<(() => void) | null>(null)
 
   const handleSend = useCallback(
-    (content: string, opts?: { captchaVerifyParam?: string; resume?: boolean }) => {
+    (content: string, opts?: SendOptions) => {
       if (sendingRef.current || !content.trim()) return
       sendingRef.current = true
       setSending(true)
@@ -290,6 +355,7 @@ export function AgentApp() {
         ])
       }
 
+      const extra = { model, webSearch, effort }
       const viaSocket = send(activeIdRef.current, content, opts)
       if (!viaSocket) {
         // HTTP fallback: read the SSE stream directly
@@ -303,6 +369,7 @@ export function AgentApp() {
                 content,
                 captchaVerifyParam: opts?.captchaVerifyParam,
                 resume: opts?.resume,
+                ...extra,
               }),
             })
             const cid = res.headers.get('X-Conversation-Id')
@@ -339,7 +406,7 @@ export function AgentApp() {
         })()
       }
     },
-    [send, onEvent, loadConversations],
+    [send, onEvent, loadConversations, model, webSearch, effort],
   )
 
   /* ------------------------------------------------- Z.ai captcha relay */
@@ -391,6 +458,7 @@ export function AgentApp() {
     setMessages([])
     setTasks([])
     setStream(null)
+    setDraft('')
     setNavOpen(false)
   }, [])
 
@@ -432,9 +500,9 @@ export function AgentApp() {
   // auth gate: while the session check runs show a quiet splash
   if (!session.checked) {
     return (
-      <div className="flex h-dvh items-center justify-center bg-zinc-950">
-        <div className="flex items-center gap-3 text-zinc-500">
-          <Loader2 className="h-5 w-5 animate-spin text-emerald-400" />
+      <div className="flex h-dvh items-center justify-center bg-stone-50">
+        <div className="flex items-center gap-3 text-stone-500">
+          <Loader2 className="h-5 w-5 animate-spin text-emerald-600" />
           <span className="text-sm">Загрузка…</span>
         </div>
       </div>
@@ -449,22 +517,72 @@ export function AgentApp() {
     setLinkOpen(true)
   }
 
+  const activeModel = MODEL_OPTIONS.find((m) => m.id === model) || MODEL_OPTIONS[0]
+  const modelSelector = (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setModelOpen((v) => !v)}
+        className="flex h-9 items-center gap-1.5 rounded-full px-3 text-[14px] font-medium text-stone-800 hover:bg-stone-100 transition-colors"
+      >
+        {activeModel.label}
+        <ChevronDown className="h-4 w-4 text-stone-400" />
+      </button>
+      {modelOpen && (
+        <>
+          <button
+            type="button"
+            aria-label="Закрыть"
+            className="fixed inset-0 z-10 cursor-default"
+            onClick={() => setModelOpen(false)}
+          />
+          <div className="absolute left-0 top-11 z-20 w-80 overflow-hidden rounded-2xl border border-stone-200 bg-white p-2 shadow-xl shadow-stone-900/10">
+            {MODEL_OPTIONS.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => selectModel(m.id)}
+                className={cn(
+                  'flex w-full items-start gap-2 rounded-xl px-3 py-2.5 text-left transition-colors',
+                  m.id === model ? 'bg-stone-100' : 'hover:bg-stone-50',
+                )}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[14px] font-medium text-stone-900">{m.label}</span>
+                    {'badge' in m && m.badge && (
+                      <span className="rounded-md bg-stone-900 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                        {m.badge}
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-[12px] leading-snug text-stone-500">{m.sub}</p>
+                </div>
+                {m.id === model && <Check className="mt-1 h-4 w-4 shrink-0 text-emerald-600" />}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  )
+
   const sidebar = (
-    <div className="flex h-full w-full min-w-0 flex-col bg-zinc-950">
+    <div className="flex h-full w-full min-w-0 flex-col bg-stone-50">
       <div className="flex items-center gap-2.5 px-4 py-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/15 border border-emerald-800/40">
-          <Sparkles className="h-4 w-4 text-emerald-400" />
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-stone-900">
+          <Sparkles className="h-4 w-4 text-white" />
         </div>
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-zinc-100 leading-tight">Нейро-Архитектор</p>
-          <p className="text-[11px] text-zinc-500 leading-tight">персистентный ИИ-агент</p>
+          <p className="text-sm font-semibold text-stone-900 leading-tight">Vebai</p>
+          <p className="text-[11px] text-stone-500 leading-tight">агент на базе GLM · 24/7</p>
         </div>
       </div>
       <div className="px-3">
         <Button
           onClick={newChat}
           disabled={sending}
-          className="w-full justify-start gap-2 bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
+          className="w-full justify-start gap-2 bg-stone-900 text-white hover:bg-stone-700 font-medium"
         >
           <MessageSquarePlus className="h-4 w-4" />
           Новый чат
@@ -475,45 +593,45 @@ export function AgentApp() {
           <div
             key={c.id}
             className={cn(
-              'group flex items-center gap-1 rounded-lg px-2 py-2 cursor-pointer transition-colors',
-              c.id === activeId ? 'bg-zinc-800/80' : 'hover:bg-zinc-900',
+              'group flex items-center gap-1 rounded-xl px-2 py-2 cursor-pointer transition-colors',
+              c.id === activeId ? 'bg-stone-200/70' : 'hover:bg-stone-100',
             )}
             onClick={() => selectConversation(c.id)}
           >
-            <Bot className={cn('h-3.5 w-3.5 shrink-0', c.id === activeId ? 'text-emerald-400' : 'text-zinc-600')} />
-            <span className="flex-1 truncate text-sm text-zinc-300">{c.title}</span>
+            <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', c.id === activeId ? 'bg-emerald-600' : 'bg-stone-300')} />
+            <span className="flex-1 truncate text-sm text-stone-700">{c.title}</span>
             <button
               aria-label="Удалить диалог"
               onClick={(e) => {
                 e.stopPropagation()
                 void deleteConversation(c.id)
               }}
-              className="hidden group-hover:block rounded p-1 text-zinc-600 hover:text-red-400 hover:bg-zinc-800"
+              className="hidden group-hover:block rounded p-1 text-stone-400 hover:text-red-500 hover:bg-stone-200"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
           </div>
         ))}
         {conversations.length === 0 && (
-          <p className="px-3 py-4 text-xs text-zinc-600">История диалогов появится здесь</p>
+          <p className="px-3 py-4 text-xs text-stone-400">История диалогов появится здесь</p>
         )}
       </div>
-      <div className="border-t border-zinc-800/80 px-4 py-3">
-        <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+      <div className="border-t border-stone-200 px-4 py-3">
+        <div className="flex items-center gap-2 text-[11px] text-stone-500">
           <span className="relative flex h-2 w-2">
-            <span className={cn('absolute inline-flex h-full w-full animate-ping rounded-full opacity-50', connected ? 'bg-emerald-400' : 'bg-amber-400')} />
-            <span className={cn('relative inline-flex h-2 w-2 rounded-full', connected ? 'bg-emerald-400' : 'bg-amber-400')} />
+            <span className={cn('absolute inline-flex h-full w-full animate-ping rounded-full opacity-50', connected ? 'bg-emerald-500' : 'bg-amber-500')} />
+            <span className={cn('relative inline-flex h-2 w-2 rounded-full', connected ? 'bg-emerald-500' : 'bg-amber-500')} />
           </span>
           {connected ? 'Агент на связи · работает 24/7' : 'Переподключение к агенту…'}
           {worker.activeTasks > 0 && (
-            <span className="ml-auto text-emerald-400">{worker.activeTasks} в фоне</span>
+            <span className="ml-auto text-emerald-700">{worker.activeTasks} в фоне</span>
           )}
         </div>
         <div className="mt-2 flex items-center gap-2">
-          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-[10px] font-semibold text-zinc-300">
+          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-800 text-[10px] font-semibold text-white">
             {(session.user?.name || session.user?.email || '?').slice(0, 1).toUpperCase()}
           </div>
-          <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-400" title={session.user?.email}>
+          <span className="min-w-0 flex-1 truncate text-[11px] text-stone-600" title={session.user?.email}>
             {session.user?.name || session.user?.email}
           </span>
           <button
@@ -521,8 +639,8 @@ export function AgentApp() {
             className={cn(
               'rounded px-2 py-1 text-[11px] border',
               zaiLinked
-                ? 'border-emerald-900/60 text-emerald-400 hover:bg-emerald-950/40'
-                : 'border-amber-900/60 text-amber-400 hover:bg-amber-950/40',
+                ? 'border-emerald-200 text-emerald-700 hover:bg-emerald-50'
+                : 'border-amber-300 text-amber-700 hover:bg-amber-50',
             )}
             title={zaiLinked ? 'Аккаунт Z.ai подключён' : 'Аккаунт Z.ai не подключён — гостевой режим'}
           >
@@ -530,7 +648,7 @@ export function AgentApp() {
           </button>
           <button
             onClick={() => void logout()}
-            className="rounded px-2 py-1 text-[11px] text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300"
+            className="rounded px-2 py-1 text-[11px] text-stone-500 hover:bg-stone-100 hover:text-stone-700"
           >
             Выйти
           </button>
@@ -539,16 +657,72 @@ export function AgentApp() {
     </div>
   )
 
+  const heroBlock = (
+    <div className="mx-auto flex h-full max-w-3xl flex-col items-center justify-center gap-7 px-4 py-10 text-center">
+      <div className="space-y-3">
+        <h2 className="font-display text-4xl text-stone-900 sm:text-5xl">
+          Что мне построить для тебя?
+        </h2>
+        <p className="text-sm leading-relaxed text-stone-500">
+          Введи задачу — агент сам спланирует, найдёт в интернете, нарисует и смонтирует видео.
+        </p>
+      </div>
+
+      <Composer
+        variant="hero"
+        onSend={handleSend}
+        disabled={sending}
+        connected={connected}
+        draft={draft}
+        onDraftChange={setDraft}
+        webSearch={webSearch}
+        onWebSearchToggle={toggleWebSearch}
+        effort={effort}
+        onEffortChange={changeEffort}
+      />
+
+      <div className="flex w-full flex-wrap justify-center gap-2">
+        {SUGGESTIONS.map((s) => (
+          <button
+            key={s.text}
+            onClick={() => handleSend(s.text)}
+            className="group flex items-center gap-2 rounded-full border border-stone-200 bg-white px-3.5 py-2 text-[13px] text-stone-600 transition-all hover:border-stone-300 hover:bg-stone-50 hover:text-stone-900 hover:shadow-sm"
+          >
+            <span className="text-[14px] leading-none">{s.icon}</span>
+            <span className="max-w-[240px] truncate">{s.text}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="grid w-full grid-cols-1 gap-3 sm:grid-cols-3">
+        {GALLERY.map((g) => (
+          <button
+            key={g.label}
+            onClick={() => handleSend(`Сделай ${g.label.toLowerCase()}: придумай концепцию и реализуй`)}
+            className={cn(
+              'group flex h-24 items-end rounded-2xl bg-gradient-to-br p-3 text-left shadow-sm transition-all hover:shadow-md',
+              g.grad,
+            )}
+          >
+            <span className="text-[12px] font-medium text-white drop-shadow group-hover:text-white">
+              {g.label}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+
   return (
-    <div className="flex h-dvh overflow-hidden bg-zinc-950">
+    <div className="flex h-dvh overflow-hidden bg-white">
       {/* desktop sidebar */}
-      <aside className="hidden md:flex w-64 shrink-0 border-r border-zinc-800/80">
+      <aside className="hidden md:flex w-64 shrink-0 border-r border-stone-200">
         {sidebar}
       </aside>
 
       {/* mobile sidebar sheet */}
       <Sheet open={navOpen} onOpenChange={setNavOpen}>
-        <SheetContent side="left" className="w-72 p-0 border-zinc-800 bg-zinc-950 [&>button]:text-zinc-400">
+        <SheetContent side="left" className="w-72 p-0 border-stone-200 bg-stone-50 [&>button]:text-stone-500">
           <SheetHeader className="sr-only">
             <SheetTitle>Диалоги</SheetTitle>
           </SheetHeader>
@@ -559,25 +733,25 @@ export function AgentApp() {
       {/* center chat column */}
       <main className="flex min-w-0 flex-1 flex-col">
         <WarningBanner />
-        <header className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-2.5 sm:px-4">
+        <header className="flex items-center gap-2 px-3 py-2.5 sm:px-4">
           <Button
             variant="ghost"
             size="icon"
             aria-label="Диалоги"
-            className="md:hidden h-8 w-8 text-zinc-400"
+            className="md:hidden h-9 w-9 text-stone-600 hover:bg-stone-100"
             onClick={() => setNavOpen(true)}
           >
             <Menu className="h-4 w-4" />
           </Button>
-          <div className="flex min-w-0 items-center gap-2">
-            <Sparkles className="h-4 w-4 shrink-0 text-emerald-400 md:hidden" />
-            <h1 className="truncate text-sm font-medium text-zinc-200">
-              {conversations.find((c) => c.id === activeId)?.title || 'Новый диалог'}
-            </h1>
-          </div>
+          {modelSelector}
+          {webSearch && (
+            <span className="hidden sm:inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
+              <Globe className="h-3 w-3" /> поиск включён
+            </span>
+          )}
           <div className="ml-auto flex items-center gap-2">
             {worker.activeTasks > 0 && (
-              <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-emerald-900/50 bg-emerald-950/30 px-2 py-0.5 text-[11px] text-emerald-400">
+              <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
                 <Loader2 className="h-3 w-3 animate-spin" />
                 {worker.activeTasks} фоновых задач
               </span>
@@ -586,12 +760,12 @@ export function AgentApp() {
               variant="ghost"
               size="sm"
               aria-label="Активность агента"
-              className="lg:hidden h-8 gap-1.5 px-2 text-zinc-400"
+              className="lg:hidden h-9 gap-1.5 px-2 text-stone-600 hover:bg-stone-100"
               onClick={() => setActivityOpen(true)}
             >
               <Activity className="h-4 w-4" />
               {worker.activeTasks > 0 && (
-                <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-semibold text-zinc-950">
+                <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-600 px-1 text-[10px] font-semibold text-white">
                   {worker.activeTasks}
                 </span>
               )}
@@ -605,33 +779,7 @@ export function AgentApp() {
           className="flex-1 overflow-y-auto"
         >
           {messages.length === 0 && !stream && !sending ? (
-            <div className="mx-auto flex h-full max-w-2xl flex-col items-center justify-center gap-6 px-4 py-10 text-center">
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-500/10 border border-emerald-800/40">
-                <Sparkles className="h-7 w-7 text-emerald-400" />
-              </div>
-              <div className="space-y-2">
-                <h2 className="text-xl font-semibold text-zinc-100">Нейро-Архитектор</h2>
-                <p className="text-sm leading-relaxed text-zinc-500">
-                  Опиши задачу — я составлю план и выполню его своими инструментами:
-                  поиск в интернете, генерация изображений и видео (MiniMax H3 на Kaggle).
-                  Работаю 24/7 — закрой браузер, я продолжу, а результаты сами появятся в чате.
-                </p>
-              </div>
-              <div className="grid w-full gap-2 sm:grid-cols-2">
-                {SUGGESTIONS.map((s) => (
-                  <button
-                    key={s.text}
-                    onClick={() => handleSend(s.text)}
-                    className="group flex items-start gap-2.5 rounded-xl border border-zinc-800 bg-zinc-900/60 px-3.5 py-3 text-left transition-colors hover:border-emerald-900/60 hover:bg-zinc-900"
-                  >
-                    <span className="text-base leading-none mt-0.5">{s.icon}</span>
-                    <span className="text-[13px] leading-snug text-zinc-400 group-hover:text-zinc-200">
-                      {s.text}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </div>
+            heroBlock
           ) : (
             <div className="mx-auto max-w-3xl space-y-6 px-4 py-6">
               {messages.map((m, i) => (
@@ -645,45 +793,45 @@ export function AgentApp() {
               {/* live stream segment */}
               {stream && (stream.text.trim() || stream.tools.length > 0 || stream.plan) && (
                 <div className="flex gap-3">
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-800/50 bg-emerald-950/40">
-                    <Bot className="h-4 w-4 text-emerald-400" />
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-stone-200 bg-stone-900">
+                    <Sparkles className="h-4 w-4 text-white" />
                   </div>
                   <div className="min-w-0 flex-1 space-y-3 pt-0.5">
                     {stream.plan && (
-                      <div className="rounded-xl border border-emerald-900/50 bg-emerald-950/20 p-4">
+                      <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4">
                         <ol className="space-y-2">
                           {stream.plan.steps.map((step, i) => (
                             <li key={i} className="flex items-start gap-2.5 text-sm">
-                              <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-emerald-800/60 bg-emerald-900/30 text-[11px] font-medium text-emerald-300">
+                              <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-stone-300 bg-white text-[11px] font-medium text-stone-700">
                                 {i + 1}
                               </span>
-                              <span className="text-zinc-300 leading-snug">{step.title}</span>
+                              <span className="text-stone-700 leading-snug">{step.title}</span>
                             </li>
                           ))}
                         </ol>
                       </div>
                     )}
                     {stream.tools.map((call) => (
-                      <div key={call.id} className="rounded-lg border border-zinc-800 bg-zinc-900/70 px-3 py-2.5 flex items-center gap-2.5">
+                      <div key={call.id} className="rounded-xl border border-stone-200 bg-white px-3 py-2.5 flex items-center gap-2.5">
                         <Circle
                           className={cn(
                             'h-2.5 w-2.5',
-                            call.status === 'running' && 'text-emerald-400 fill-emerald-400 animate-pulse',
-                            call.status === 'ok' && 'text-emerald-400',
-                            call.status === 'error' && 'text-red-400',
+                            call.status === 'running' && 'text-emerald-600 fill-emerald-600 animate-pulse',
+                            call.status === 'ok' && 'text-emerald-600',
+                            call.status === 'error' && 'text-red-500',
                           )}
                         />
-                        <span className="text-sm text-zinc-300">{call.name}</span>
+                        <span className="text-sm text-stone-700">{call.name}</span>
                         {call.status === 'running' && (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-600" />
                         )}
                         {call.summary && (
-                          <span className="ml-auto truncate text-xs text-zinc-500 max-w-[45%]">{call.summary}</span>
+                          <span className="ml-auto truncate text-xs text-stone-400 max-w-[45%]">{call.summary}</span>
                         )}
                       </div>
                     ))}
                     {stream.text.trim() && (
-                      <div className="text-sm leading-relaxed text-zinc-300 whitespace-pre-wrap break-words">
+                      <div className="text-[15px] leading-relaxed text-stone-800 whitespace-pre-wrap break-words">
                         {stream.text}
                       </div>
                     )}
@@ -694,13 +842,13 @@ export function AgentApp() {
               {/* typing indicator */}
               {sending && !stream && (
                 <div className="flex gap-3">
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-800/50 bg-emerald-950/40">
-                    <Bot className="h-4 w-4 text-emerald-400" />
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-stone-200 bg-stone-900">
+                    <Sparkles className="h-4 w-4 text-white" />
                   </div>
                   <div className="flex items-center gap-1.5 pt-2.5">
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-emerald-400 [animation-delay:0ms]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-emerald-400 [animation-delay:150ms]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-emerald-400 [animation-delay:300ms]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-stone-400 [animation-delay:0ms]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-stone-400 [animation-delay:150ms]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-stone-400 [animation-delay:300ms]" />
                   </div>
                 </div>
               )}
@@ -708,11 +856,29 @@ export function AgentApp() {
           )}
         </div>
 
-        <Composer onSend={handleSend} disabled={sending} connected={connected} />
+        {activeId && (
+          <div className="px-3 pb-3 sm:px-6 sm:pb-4 pt-1">
+            <Composer
+              variant="dock"
+              onSend={handleSend}
+              disabled={sending}
+              connected={connected}
+              draft={draft}
+              onDraftChange={setDraft}
+              webSearch={webSearch}
+              onWebSearchToggle={toggleWebSearch}
+              effort={effort}
+              onEffortChange={changeEffort}
+            />
+            <p className="mt-2 text-center text-[11px] text-stone-400">
+              Enter — отправить · Shift+Enter — новая строка · агент работает 24/7, результаты придут в чат
+            </p>
+          </div>
+        )}
       </main>
 
       {/* desktop activity panel */}
-      <aside className="hidden lg:flex w-80 shrink-0 border-l border-zinc-800/80">
+      <aside className="hidden lg:flex w-80 shrink-0 border-l border-stone-200">
         <div className="w-full">
           <ActivityPanel tasks={tasks} worker={worker} />
         </div>
@@ -720,7 +886,7 @@ export function AgentApp() {
 
       {/* mobile activity sheet */}
       <Sheet open={activityOpen} onOpenChange={setActivityOpen}>
-        <SheetContent side="right" className="w-80 p-0 border-zinc-800 bg-zinc-950 [&>button]:text-zinc-400">
+        <SheetContent side="right" className="w-80 p-0 border-stone-200 bg-white [&>button]:text-stone-500">
           <SheetHeader className="sr-only">
             <SheetTitle>Активность агента</SheetTitle>
           </SheetHeader>
@@ -730,10 +896,10 @@ export function AgentApp() {
 
       {/* Z.ai account link modal (connect / reconnect own chat.z.ai account) */}
       <Dialog open={linkOpen} onOpenChange={setLinkOpen}>
-        <DialogContent className="border-zinc-800 bg-zinc-950 text-zinc-100 max-w-md">
+        <DialogContent className="border-stone-200 bg-white text-stone-900 max-w-md">
           <DialogHeader>
             <DialogTitle className="text-base">Аккаунт Z.ai</DialogTitle>
-            <DialogDescription className="text-[12px] text-zinc-500">
+            <DialogDescription className="text-[12px] text-stone-500">
               {zaiLinked
                 ? 'Подключён твой аккаунт chat.z.ai — сообщения идут на твоей личной квоте.'
                 : 'Сейчас сообщения идут в гостевом режиме на общей квоте. Подключи свой аккаунт — это твоя личная квота Z.ai.'}

@@ -8,7 +8,7 @@ import { ZaiAuthCaptcha, preloadZaiCaptcha } from './zai-captcha'
 import { BookmarkletLink } from './bookmarklet'
 
 /**
- * Landing / auth gate (v6).
+ * Landing / auth gate (v7) — z.ai-style welcome card (our own design).
  *
  * REGISTRATION is instant and unconditional: the local account is created
  * immediately — nothing Z.ai-side can block it. The Z.ai captcha widget is
@@ -20,18 +20,19 @@ import { BookmarkletLink } from './bookmarklet'
  * LOGIN needs no captcha at all: local password first, stored Z.ai session
  * refreshes silently, and a dead session is re-linked inside the app.
  *
- * GOOGLE (v6 — token AUTO-COPY): byte-level research proved chat.z.ai only
- * returns its Google-login session to its own whitelisted domains (the
- * sso_redirect whitelist is exact-hostname and we are not on it), so no 100%
- * seamless redirect exists. The v6 bridge: our button opens Z.ai's REAL
- * Google login (popup) and the "⚡ Vebai — забрать токен" bookmarklet — one
- * click on the logged-in chat.z.ai tab — navigates the browser to
- * /auth/google/catch#token=… (plain navigation: no CSP/CORS can block it);
- * the catch page claims the token server-side and this screen auto-enters
- * the app via the /api/auth/me poll. Manual paste stays as the fallback.
+ * GOOGLE (bridge, v6): byte-level research proved chat.z.ai only returns
+ * its Google-login session to its own whitelisted domains (the sso_redirect
+ * whitelist is exact-hostname and we are not on it), so no 100% seamless
+ * redirect exists. Our button opens Z.ai's REAL Google login (popup) and the
+ * "⚡ Vebai — забрать токен" bookmarklet — one click on the logged-in
+ * chat.z.ai tab — navigates the browser to /auth/google/catch#token=… (plain
+ * navigation: no CSP/CORS can block it); the catch page claims the token
+ * server-side and this screen auto-enters the app via the /api/auth/me poll.
+ * Manual paste stays as the fallback.
  */
 export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('register')
+  const [emailOpen, setEmailOpen] = useState(false)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [name, setName] = useState('')
@@ -200,47 +201,34 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     setError('')
   }, [])
 
-  return (
-    <div className="flex min-h-dvh items-center justify-center bg-zinc-950 px-4 py-10">
-      <div className="w-full max-w-md space-y-5">
-        {/* brand */}
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/15 border border-emerald-800/40">
-            <Sparkles className="h-5 w-5 text-emerald-400" />
-          </div>
-          <div>
-            <h1 className="text-lg font-semibold text-zinc-100 leading-tight">Нейро-Архитектор</h1>
-            <p className="text-xs text-zinc-500 leading-tight">персистентный ИИ-агент 24/7</p>
-          </div>
-        </div>
+  const openZaiSso = (provider: 'google' | 'github') => {
+    window.open(
+      `https://chat.z.ai/oauth/${provider}/login?t=2`,
+      `zai_${provider}`,
+      'width=560,height=760',
+    )
+  }
 
-        {/* mandatory proxy disclosure */}
-        <div className="rounded-xl border border-amber-900/60 bg-amber-950/30 p-4 space-y-2">
-          <div className="flex items-center gap-2 text-amber-400">
-            <ShieldAlert className="h-4 w-4 shrink-0" />
-            <p className="text-[13px] font-semibold leading-tight">
-              Важно: прозрачный прокси к Z.ai
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-stone-50 px-4 py-10">
+      <div className="w-full max-w-md space-y-4">
+        {/* welcome card (z.ai-style) */}
+        <div className="rounded-3xl border border-stone-200/80 bg-white p-7 shadow-[0_16px_48px_rgba(28,25,23,0.07)]">
+          <div className="flex flex-col items-center text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-stone-900">
+              <Sparkles className="h-7 w-7 text-white" />
+            </div>
+            <h1 className="font-display mt-4 text-2xl text-stone-900">Добро пожаловать в Vebai</h1>
+            <p className="mt-1 text-[13px] text-stone-500">
+              Открой все возможности — вход за пару секунд
             </p>
           </div>
-          <p className="text-[12px] leading-relaxed text-amber-200/80">
-            Регистрация мгновенная и ни от чего не зависит. Капча Z.ai (тот же виджет Aliyun, что у
-            них) нужна только чтобы <span className="font-medium text-amber-200">создать твой
-            настоящий аккаунт chat.z.ai</span>: Z.ai пришлёт на email код — после него этот email и
-            пароль будут работать и на самом chat.z.ai, а все запросы пойдут{' '}
-            <span className="font-medium text-amber-200">под твоим аккаунтом и на твою личную
-            квоту</span>. Агент chat.z.ai в режиме «Агент» сам делает веб-поиск, генерацию
-            изображений, работу с файлами и кодом. Это неофициальный клиент, не аффилированный с
-            Z.ai.
-          </p>
-        </div>
 
-        {/* form */}
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 space-y-4">
           {codeStep ? (
-            <>
-              <p className="text-[13px] font-semibold text-zinc-200">Код из письма Z.ai</p>
-              <p className="text-[12px] leading-relaxed text-zinc-500">
-                Письмо отправил chat.z.ai на <span className="text-zinc-300">{email}</span>. Введи
+            <div className="mt-6 space-y-4">
+              <p className="text-[13px] font-semibold text-stone-800">Код из письма Z.ai</p>
+              <p className="text-[12px] leading-relaxed text-stone-500">
+                Письмо отправил chat.z.ai на <span className="text-stone-700">{email}</span>. Введи
                 код подтверждения — аккаунт Z.ai станет твоим (как будто регистрировался у них).
               </p>
               <input
@@ -250,14 +238,14 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
                 inputMode="numeric"
                 autoComplete="one-time-code"
                 placeholder="Код из письма"
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm tracking-[0.3em] text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
+                className="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2.5 text-sm tracking-[0.3em] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
               />
-              {info && <p className="text-[12px] leading-relaxed text-amber-300">{info}</p>}
-              {error && <p className="text-[12px] leading-relaxed text-red-400">{error}</p>}
+              {info && <p className="text-[12px] leading-relaxed text-amber-600">{info}</p>}
+              {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
               <Button
                 onClick={() => void submitCode(false)}
                 disabled={busy || !code}
-                className="w-full bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
+                className="w-full rounded-xl bg-stone-900 text-white hover:bg-stone-700 font-medium"
               >
                 {busy && <Loader2 className="h-4 w-4 animate-spin" />}
                 Подтвердить и войти
@@ -266,172 +254,183 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
                 <button
                   onClick={() => void resendCode()}
                   disabled={busy}
-                  className="rounded-lg px-3 py-1.5 text-[12px] text-zinc-400 hover:text-zinc-200"
+                  className="rounded-xl px-3 py-1.5 text-[12px] text-stone-500 hover:text-stone-800"
                 >
                   Отправить код снова
                 </button>
                 <button
                   onClick={() => void submitCode(true)}
                   disabled={busy}
-                  className="rounded-lg px-3 py-1.5 text-[12px] text-zinc-500 hover:text-zinc-300"
+                  className="rounded-xl px-3 py-1.5 text-[12px] text-stone-400 hover:text-stone-600"
                 >
                   Позже — войти сейчас
                 </button>
               </div>
-            </>
+            </div>
           ) : (
-            <>
-              <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-950 p-1">
-                {(['register', 'login'] as const).map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => {
-                      setMode(m)
-                      setError('')
-                      setInfo('')
-                      setCaptchaParam('')
-                    }}
-                    className={cn(
-                      'rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors',
-                      mode === m
-                        ? 'bg-emerald-500/90 text-zinc-950'
-                        : 'text-zinc-400 hover:text-zinc-200',
-                    )}
-                  >
-                    {m === 'register' ? 'Регистрация' : 'Вход'}
-                  </button>
-                ))}
+            <div className="mt-6 space-y-3">
+              {/* dark Google button first — z.ai order */}
+              <button
+                type="button"
+                onClick={() => openZaiSso('google')}
+                className="flex w-full items-center justify-center gap-2.5 rounded-xl bg-gradient-to-b from-stone-800 to-stone-950 px-4 py-3 text-[14px] font-medium text-white shadow-md transition-all hover:from-stone-700 hover:to-stone-900 hover:shadow-lg"
+              >
+                <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" aria-hidden>
+                  <path
+                    fill="#EA4335"
+                    d="M12 10.2v3.9h5.5c-.25 1.3-1.66 3.8-5.5 3.8-3.32 0-6.03-2.74-6.03-6.1S8.68 5.7 12 5.7c1.9 0 3.16.8 3.88 1.5l2.65-2.55C16.83 3 14.62 2 12 2 6.98 2 2.9 6.03 2.9 12S6.98 22 12 22c5.77 0 9.6-4.05 9.6-9.75 0-.66-.07-1.16-.16-1.66H12z"
+                    transform="translate(0 .5) scale(.98)"
+                  />
+                </svg>
+                Продолжить с Google
+              </button>
+
+              <div className="flex items-center gap-3 py-1">
+                <div className="h-px flex-1 bg-stone-200" />
+                <span className="text-[11px] text-stone-400">или</span>
+                <div className="h-px flex-1 bg-stone-200" />
               </div>
 
-              {mode === 'register' && (
-                <input
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="Имя (необязательно)"
-                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
-                />
-              )}
-              <input
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                type="email"
-                autoComplete="email"
-                placeholder="Email"
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
-              />
-              <input
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                type="password"
-                autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
-                placeholder="Пароль (мин. 6 символов)"
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
-              />
+              <button
+                type="button"
+                onClick={() => setEmailOpen((v) => !v)}
+                className="flex w-full items-center justify-center gap-2.5 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-[14px] font-medium text-stone-800 transition-colors hover:bg-stone-100"
+              >
+                <svg viewBox="0 0 24 24" className="h-4 w-4 text-stone-500" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden>
+                  <rect x="3" y="5" width="18" height="14" rx="2" />
+                  <path d="m3 7 9 6 9-6" />
+                </svg>
+                Продолжить с Email
+              </button>
 
-              {/* Z.ai's own auth captcha — OPTIONAL: starts the real Z.ai
-                  account creation right here; skipping is fine */}
-              {mode === 'register' && (
-                <div className="space-y-1.5">
-                  <p className="text-[11px] leading-relaxed text-zinc-600">
-                    Капча Z.ai — запускает создание твоего аккаунта на их стороне (рекомендую, но
-                    не обязательно: можно подключиться позже из приложения). Нажми на полоску,
-                    иногда нужно перетащить ползунок на картинке.
+              {emailOpen && (
+                <div className="space-y-3 rounded-2xl border border-stone-200 bg-stone-50/60 p-4">
+                  <div className="grid grid-cols-2 gap-1 rounded-xl bg-white p-1 border border-stone-200">
+                    {(['register', 'login'] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => {
+                          setMode(m)
+                          setError('')
+                          setInfo('')
+                          setCaptchaParam('')
+                        }}
+                        className={cn(
+                          'rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors',
+                          mode === m
+                            ? 'bg-stone-900 text-white'
+                            : 'text-stone-500 hover:text-stone-800',
+                        )}
+                      >
+                        {m === 'register' ? 'Регистрация' : 'Вход'}
+                      </button>
+                    ))}
+                  </div>
+
+                  {mode === 'register' && (
+                    <input
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="Имя (необязательно)"
+                      className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
+                    />
+                  )}
+                  <input
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    type="email"
+                    autoComplete="email"
+                    placeholder="Email"
+                    className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
+                  />
+                  <input
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    type="password"
+                    autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
+                    placeholder="Пароль (мин. 6 символов)"
+                    className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
+                  />
+
+                  {/* Z.ai's own auth captcha — OPTIONAL: starts the real Z.ai
+                      account creation right here; skipping is fine */}
+                  {mode === 'register' && (
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] leading-relaxed text-stone-500">
+                        Капча Z.ai — запускает создание твоего аккаунта на их стороне (рекомендую,
+                        но не обязательно: можно подключиться позже из приложения).
+                      </p>
+                      <ZaiAuthCaptcha onParam={onWidgetParam} token={captchaToken} />
+                    </div>
+                  )}
+
+                  {info && <p className="text-[12px] leading-relaxed text-amber-600">{info}</p>}
+                  {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
+
+                  <Button
+                    onClick={() => void submit()}
+                    disabled={busy || !email || !password}
+                    className="w-full rounded-xl bg-stone-900 text-white hover:bg-stone-700 font-medium"
+                  >
+                    {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+                    {mode === 'register' ? 'Создать аккаунт' : 'Войти'}
+                  </Button>
+
+                  <p className="text-[11px] leading-relaxed text-stone-400">
+                    Диалоги привязаны к аккаунту. Фоновые задачи продолжают выполняться после
+                    закрытия браузера, результаты появятся в чате.
                   </p>
-                  <ZaiAuthCaptcha onParam={onWidgetParam} token={captchaToken} />
                 </div>
               )}
 
-              {info && <p className="text-[12px] leading-relaxed text-amber-300">{info}</p>}
-              {error && <p className="text-[12px] leading-relaxed text-red-400">{error}</p>}
-
-              <Button
-                onClick={() => void submit()}
-                disabled={busy || !email || !password}
-                className="w-full bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
+              {/* GitHub — secondary, like z.ai */}
+              <button
+                type="button"
+                onClick={() => openZaiSso('github')}
+                className="flex w-full items-center justify-center gap-2.5 rounded-xl border border-stone-200 bg-white px-4 py-2.5 text-[13px] font-medium text-stone-600 transition-colors hover:bg-stone-50"
               >
-                {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-                {mode === 'register' ? 'Создать аккаунт' : 'Войти'}
-              </Button>
-
-              <p className="text-[11px] leading-relaxed text-zinc-600">
-                Диалоги привязаны к аккаунту. Фоновые задачи (видео, изображения) продолжают
-                выполняться после закрытия браузера, результаты появятся в чате.
-              </p>
-            </>
+                GitHub-вход Z.ai
+              </button>
+            </div>
           )}
         </div>
 
-        {/* Google bridge — honest proxying of Z.ai's own Google auth */}
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-2.5">
-          <p className="text-[13px] font-semibold text-zinc-200">Вход через Google — с автокопированием токена</p>
-          <ol className="list-decimal space-y-0.5 pl-4 text-[11px] leading-relaxed text-zinc-500">
+        {/* transparency note */}
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+          <div className="flex items-start gap-2 text-amber-800">
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            <p className="text-[11.5px] leading-relaxed text-amber-800/90">
+              Прозрачный прокси к Z.ai: регистрация мгновенная. Кнопка Google открывает{' '}
+              <span className="font-medium">настоящий Google-вход chat.z.ai</span>; капча Z.ai (их
+              же виджет Aliyun) нужна только чтобы создать твой настоящий аккаунт chat.z.ai — все
+              запросы пойдут под твоим аккаунтом и на твою личную квоту. Неофициальный клиент, не
+              аффилирован с Z.ai.
+            </p>
+          </div>
+        </div>
+
+        {/* Google bridge — the honest one-click token handoff */}
+        <div className="rounded-2xl border border-stone-200 bg-white p-4 space-y-2.5">
+          <p className="text-[13px] font-semibold text-stone-800">Автокопирование токена — 1 клик</p>
+          <ol className="list-decimal space-y-0.5 pl-4 text-[11px] leading-relaxed text-stone-500">
             <li>
-              <span className="text-zinc-400">Один раз</span>: перетащи кнопку «⚡ Vebai — забрать
+              <span className="text-stone-700">Один раз</span>: перетащи кнопку «⚡ Vebai — забрать
               токен» ниже на панель закладок браузера.
             </li>
+            <li>Нажми «Продолжить с Google» выше и войди своим Google-аккаунтом.</li>
             <li>
-              Нажми «Google-вход chat.z.ai» — откроется настоящий Google-вход chat.z.ai (страница
-              выбора аккаунта Google, твой Google-аккаунт, их OAuth).
-            </li>
-            <li>
-              После входа нажми закладку <span className="text-zinc-400">⚡ Vebai</span> прямо на
-              вкладке chat.z.ai — токен перебросится нам <span className="text-zinc-400">автоматически</span>,
-              эта страница сама войдёт в приложение.
+              На вкладке chat.z.ai нажми закладку <span className="text-stone-700">⚡ Vebai</span> —
+              токен перебросится нам <span className="text-stone-700">автоматически</span>, и эта
+              страница сама войдёт в приложение.
             </li>
             <li>Не хочешь закладку — просто вставь адрес из адресной строки chat.z.ai в поле ниже.</li>
           </ol>
-          <div className="rounded-lg border border-dashed border-emerald-900/70 bg-emerald-950/20 p-2.5">
-            <BookmarkletLink className="inline-block cursor-grab rounded-md border border-emerald-800/60 bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-emerald-300 hover:border-emerald-500" />
-            <p className="mt-1 text-[10px] leading-relaxed text-zinc-600">
+          <div className="rounded-xl border border-dashed border-stone-300 bg-stone-50 p-2.5">
+            <BookmarkletLink className="inline-block cursor-grab rounded-md border border-stone-300 bg-white px-3 py-1.5 text-[12px] font-semibold text-stone-800 hover:border-stone-500" />
+            <p className="mt-1 text-[10px] leading-relaxed text-stone-400">
               Перетащи кнопку на панель закладок (клик — скопирует код закладки). Работает один раз
               на каждый вход в Z.ai — дальше в один клик.
             </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() =>
-                window.open(
-                  'https://chat.z.ai/oauth/google/login?t=2',
-                  'zai_google',
-                  'width=560,height=760',
-                )
-              }
-              className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-[12px] font-medium text-zinc-200 hover:border-emerald-800 hover:text-emerald-300"
-            >
-              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" aria-hidden>
-                <path
-                  fill="#4285F4"
-                  d="M23.5 12.3c0-.9-.1-1.5-.3-2.2H12v4.1h6.5c-.1 1.1-.8 2.7-2.4 3.8l-.02.15 3.5 2.7.24.02c2.2-2 3.5-5 3.5-8.6z"
-                />
-                <path
-                  fill="#34A853"
-                  d="M12 24c3.2 0 5.9-1 7.9-2.9l-3.8-2.9c-1 .7-2.4 1.2-4.1 1.2-3.2 0-5.9-2.1-6.8-5l-.14.01-3.1 2.4-.04.14C3.9 20.7 7.6 24 12 24z"
-                />
-                <path
-                  fill="#FBBC05"
-                  d="M5.2 14.4c-.25-.7-.4-1.5-.4-2.4s.14-1.6.4-2.4l-.01-.16L2 7.1l-.1.08C.7 9.1 0 10.5 0 12s.7 2.9 1.9 4.8l3.3-2.4z"
-                />
-                <path
-                  fill="#EA4335"
-                  d="M12 4.6c2.3 0 3.8 1 4.7 1.8l3.4-3.3C18 1.2 15.2 0 12 0 7.6 0 3.9 3.3 1.9 7.2l3.3 2.5C6.1 6.7 8.8 4.6 12 4.6z"
-                />
-              </svg>
-              Google-вход chat.z.ai
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                window.open(
-                  'https://chat.z.ai/oauth/github/login?t=2',
-                  'zai_github',
-                  'width=560,height=760',
-                )
-              }
-              className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-[12px] font-medium text-zinc-200 hover:border-emerald-800 hover:text-emerald-300"
-            >
-              GitHub-вход
-            </button>
           </div>
           <textarea
             value={bridgeRaw}
@@ -439,25 +438,24 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             onPaste={() => setTimeout(() => void claimGoogle(), 120)}
             rows={2}
             placeholder="Вставь сюда скопированный адрес chat.z.ai/auth#token=…"
-            className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[12px] text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
+            className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
           />
           {bridgeError && (
-            <p className="text-[12px] leading-relaxed text-red-400">{bridgeError}</p>
+            <p className="text-[12px] leading-relaxed text-red-500">{bridgeError}</p>
           )}
           <Button
             onClick={() => void claimGoogle()}
             disabled={bridgeBusy || !bridgeRaw.trim()}
             variant="outline"
-            className="w-full border-zinc-700 text-zinc-200 hover:bg-zinc-800 font-medium"
+            className="w-full rounded-xl border-stone-300 text-stone-800 hover:bg-stone-100 font-medium"
           >
             {bridgeBusy && <Loader2 className="h-4 w-4 animate-spin" />}
             Войти через Z.ai-аккаунт Google
           </Button>
-          <p className="text-[11px] leading-relaxed text-zinc-600">
+          <p className="text-[10.5px] leading-relaxed text-stone-400">
             Почему так: Z.ai отдаёт токен Google-входа только своим доменам (whitelist зашит у них
-            в коде и в настройках OAuth у Google — проверено по байтам их фронтенда), поэтому
-            полностью бесшовный перехват невозможен. Букмарклет сокращает ручной шаг до одного
-            клика: он сам читает токен и перебрасывает нас.
+            в коде и в настройках OAuth у Google — проверено по их фронтенду), поэтому полностью
+            бесшовный перехват невозможен. Букмарклет сокращает ручной шаг до одного клика.
           </p>
         </div>
       </div>

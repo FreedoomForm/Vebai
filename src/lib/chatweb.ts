@@ -65,6 +65,12 @@ export interface ChatWebTransport {
   sessionToken?: string | null
   /** one-time Aliyun captcha_verify_param relayed from the user's widget */
   captchaVerifyParam?: string
+  /** upstream model id (whitelisted in /api/chat) */
+  model?: string
+  /** the 🌐 web-search toggle from the composer (agent mode: tools stay on) */
+  webSearch?: boolean
+  /** reasoning effort from the Deep-Think selector: 'high' | 'max' */
+  effort?: 'high' | 'max'
 }
 
 export class ChatWebError extends Error {
@@ -536,6 +542,7 @@ async function* upstreamEvents(
   prompt: string,
   model: string,
   captchaVerifyParam?: string,
+  transport?: ChatWebTransport,
 ): AsyncGenerator<{ data?: UpstreamEventData; status?: Record<string, unknown> }> {
   const timestampMs = String(Date.now())
   const requestId = crypto.randomUUID()
@@ -554,20 +561,21 @@ async function* upstreamEvents(
       ? {
           // Z.ai agent mode: its own toolbelt (web search, IMAGE GENERATION,
           // file QA, code interpreter) runs server-side on the account's
-          // quota — no extra API keys. reasoning_effort 'max' mirrors the
-          // chat.z.ai frontend in agent mode.
+          // quota — no extra API keys. reasoning_effort mirrors the chat.z.ai
+          // composer's Deep-Think selector (High/Max); the 🌐 toggle turns
+          // web_search on explicitly.
           image_generation: true,
-          web_search: false,
+          web_search: Boolean(transport?.webSearch),
           auto_web_search: false,
           preview_mode: false,
           flags: [],
           enable_thinking: true,
-          reasoning_effort: 'max',
+          reasoning_effort: transport?.effort === 'high' ? 'high' : 'max',
         }
       : {
           image_generation: false,
-          web_search: false,
-          auto_web_search: true, // plain chat: let Z.ai decide when to search
+          web_search: Boolean(transport?.webSearch),
+          auto_web_search: !transport?.webSearch, // plain chat: let Z.ai decide
           preview_mode: false,
           flags: [],
           enable_thinking: false,
@@ -723,7 +731,7 @@ export async function chatWebStream(
   messages: PlainMessage[],
   opts?: { model?: string; transport?: ChatWebTransport },
 ): Promise<ReadableStream<Uint8Array>> {
-  const model = opts?.model || DEFAULT_CHATWEB_MODEL
+  const model = opts?.model || opts?.transport?.model || DEFAULT_CHATWEB_MODEL
   const session = await resolveSession(
     opts?.transport?.sessionToken ?? process.env.ZAI_JWT ?? null,
   )
@@ -771,7 +779,7 @@ export async function chatWebStream(
         emittedAnswer += text
       }
       try {
-        for await (const ev of upstreamEvents(session, prompt, model, captchaVerifyParam)) {
+        for await (const ev of upstreamEvents(session, prompt, model, captchaVerifyParam, opts?.transport)) {
           if (ev.status !== undefined) {
             const described = describeStatus(ev.status)
             if (described) startActivity(described.name, described.args || {})

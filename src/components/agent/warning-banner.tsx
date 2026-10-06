@@ -27,12 +27,12 @@ export function WarningBanner() {
   if (!visible) return null
 
   return (
-    <div className="flex items-start gap-2 border-b border-amber-900/50 bg-amber-950/25 px-3 py-2 sm:px-4">
-      <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
-      <p className="flex-1 text-[11px] leading-relaxed text-amber-200/80">
-        ИИ-запросы выполняет <span className="font-medium text-amber-200">агент chat.z.ai (Z.ai)</span> — режим
+    <div className="flex items-start gap-2 border-b border-amber-200 bg-amber-50 px-3 py-2 sm:px-4">
+      <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+      <p className="flex-1 text-[11px] leading-relaxed text-amber-800/90">
+        ИИ-запросы выполняет <span className="font-medium text-amber-900">агент chat.z.ai (Z.ai)</span> — режим
         «Агент»: веб-поиск, генерация изображений, работа с файлами и кодом — под{' '}
-        <span className="font-medium text-amber-200">твоим собственным аккаунтом Z.ai</span>, на твою личную квоту
+        <span className="font-medium text-amber-900">твоим собственным аккаунтом Z.ai</span>, на твою личную квоту
         (email/пароль работают и на chat.z.ai). Сервис неофициальный и не аффилирован с Z.ai.
       </p>
       <button
@@ -41,7 +41,7 @@ export function WarningBanner() {
           try { localStorage.setItem(STORAGE_KEY, '1') } catch { /* noop */ }
           setVisible(false)
         }}
-        className="rounded p-1 text-amber-400/70 hover:bg-amber-950/50 hover:text-amber-300"
+        className="rounded p-1 text-amber-500 hover:bg-amber-100 hover:text-amber-700"
       >
         <X className="h-3.5 w-3.5" />
       </button>

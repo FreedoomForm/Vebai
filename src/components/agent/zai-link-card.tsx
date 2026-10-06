@@ -141,16 +141,16 @@ export function ZaiLinkCard({
 
   return (
     <div className="space-y-3">
-      {reason && <p className="text-[12px] leading-relaxed text-amber-300/90">{reason}</p>}
-      <p className="text-[12px] leading-relaxed text-zinc-400">
-        Подключи <span className="text-zinc-200">свой настоящий аккаунт chat.z.ai</span> — он же
+      {reason && <p className="text-[12px] leading-relaxed text-amber-600">{reason}</p>}
+      <p className="text-[12px] leading-relaxed text-stone-500">
+        Подключи <span className="text-stone-800">свой настоящий аккаунт chat.z.ai</span> — он же
         даёт личную квоту Z.ai. Этот email и пароль будут работать и на самом chat.z.ai.
       </p>
 
       {codeStep ? (
         <>
-          <p className="text-[12px] leading-relaxed text-zinc-500">
-            Код отправлен на <span className="text-zinc-300">{email}</span>. Введи его — аккаунт
+          <p className="text-[12px] leading-relaxed text-stone-500">
+            Код отправлен на <span className="text-stone-700">{email}</span>. Введи его — аккаунт
             Z.ai будет завершён (verify + finish на их стороне).
           </p>
           <input
@@ -159,17 +159,17 @@ export function ZaiLinkCard({
             onChange={(e) => setCode(e.target.value)}
             inputMode="numeric"
             placeholder="Код из письма Z.ai"
-            className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm tracking-[0.3em] text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
+            className="w-full rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm tracking-[0.3em] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
           />
           {ok && (
-            <p className="text-[12px] leading-relaxed text-emerald-400">{ok}</p>
+            <p className="text-[12px] leading-relaxed text-emerald-600">{ok}</p>
           )}
-          {error && <p className="text-[12px] leading-relaxed text-red-400">{error}</p>}
+          {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
           <div className="grid grid-cols-2 gap-2">
             <Button
               onClick={() => void submitCode()}
               disabled={busy !== null || !code}
-              className="bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
+              className="bg-stone-900 text-white hover:bg-stone-700 font-medium"
             >
               {busy === 'code' && <Loader2 className="h-4 w-4 animate-spin" />}
               Подтвердить
@@ -180,7 +180,7 @@ export function ZaiLinkCard({
                 setError('')
               }}
               variant="outline"
-              className="border-zinc-700 text-zinc-200 hover:bg-zinc-800"
+              className="border-stone-300 text-stone-800 hover:bg-stone-100"
             >
               Назад
             </Button>
@@ -194,7 +194,7 @@ export function ZaiLinkCard({
             type="email"
             autoComplete="email"
             placeholder="Email (какой использовать на Z.ai)"
-            className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
+            className="w-full rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
           />
           <input
             value={password}
@@ -202,28 +202,28 @@ export function ZaiLinkCard({
             type="password"
             autoComplete="new-password"
             placeholder="Пароль для Z.ai (мин. 6 символов)"
-            className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
+            className="w-full rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
           />
 
           <div className="space-y-1">
-            <p className="text-[11px] leading-relaxed text-zinc-600">
+            <p className="text-[11px] leading-relaxed text-stone-500">
               Официальная капча Z.ai (Aliyun) — нажми на полоску, иногда нужно собрать картинку.
             </p>
             <ZaiAuthCaptcha onParam={setParam} token={widgetToken} />
           </div>
 
           {ok && (
-            <p className="flex items-start gap-1.5 text-[12px] text-emerald-400">
+            <p className="flex items-start gap-1.5 text-[12px] text-emerald-600">
               <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {ok}
             </p>
           )}
-          {error && <p className="text-[12px] leading-relaxed text-red-400">{error}</p>}
+          {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
 
           <div className="grid grid-cols-2 gap-2">
             <Button
               onClick={() => void submit('signup')}
               disabled={busy !== null || !email || !password || !param}
-              className="bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
+              className="bg-stone-900 text-white hover:bg-stone-700 font-medium"
             >
               {busy === 'signup' && <Loader2 className="h-4 w-4 animate-spin" />}
               Создать аккаунт
@@ -232,7 +232,7 @@ export function ZaiLinkCard({
               onClick={() => void submit('signin')}
               disabled={busy !== null || !email || !password || !param}
               variant="outline"
-              className={cn('border-zinc-700 text-zinc-200 hover:bg-zinc-800')}
+              className={cn('border-stone-300 text-stone-800 hover:bg-stone-100')}
             >
               {busy === 'signin' && <Loader2 className="h-4 w-4 animate-spin" />}
               У меня есть Z.ai
@@ -242,23 +242,23 @@ export function ZaiLinkCard({
       )}
 
       {/* Google / GitHub bridge — paste the address that carries the token */}
-      <div className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-3 space-y-2">
+      <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 space-y-2">
         <button
           onClick={() => setBridgeOpen((v) => !v)}
-          className="text-left text-[11px] font-semibold leading-relaxed text-zinc-400 hover:text-zinc-200"
+          className="text-left text-[11px] font-semibold leading-relaxed text-stone-500 hover:text-stone-800"
         >
           Аккаунт Z.ai через Google / GitHub? {bridgeOpen ? 'Скрыть' : 'Показать мост'}
         </button>
         {bridgeOpen && (
           <>
-            <p className="text-[11px] leading-relaxed text-zinc-500">
-              Быстро (<span className="text-zinc-300">автокопирование</span>): один раз перетащи
+            <p className="text-[11px] leading-relaxed text-stone-500">
+              Быстро (<span className="text-stone-700">автокопирование</span>): один раз перетащи
               кнопку ниже на панель закладок, войди в Z.ai через Google, затем нажми закладку прямо
               на вкладке chat.z.ai — токен подключится автоматически. Либо вставь адрес
               (<code className="text-[10px]">chat.z.ai/auth#token=…</code>) в поле ниже.
             </p>
-            <div className="rounded-lg border border-dashed border-emerald-900/70 bg-emerald-950/20 p-2.5">
-              <BookmarkletLink className="inline-block cursor-grab rounded-md border border-emerald-800/60 bg-zinc-950 px-2.5 py-1 text-[11px] font-semibold text-emerald-300 hover:border-emerald-500" />
+            <div className="rounded-lg border border-dashed border-stone-300 bg-white p-2.5">
+              <BookmarkletLink className="inline-block cursor-grab rounded-md border border-stone-300 bg-stone-50 px-2.5 py-1 text-[11px] font-semibold text-stone-800 hover:border-stone-500" />
             </div>
             <div className="flex flex-wrap gap-2">
               <button
@@ -270,7 +270,7 @@ export function ZaiLinkCard({
                     'width=560,height=760',
                   )
                 }
-                className="rounded-md border border-zinc-700 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:border-emerald-800 hover:text-emerald-300"
+                className="rounded-md border border-stone-300 bg-white px-2.5 py-1 text-[11px] font-medium text-stone-700 hover:border-stone-500"
               >
                 Google-вход chat.z.ai
               </button>
@@ -283,7 +283,7 @@ export function ZaiLinkCard({
                     'width=560,height=760',
                   )
                 }
-                className="rounded-md border border-zinc-700 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:border-emerald-800 hover:text-emerald-300"
+                className="rounded-md border border-stone-300 bg-white px-2.5 py-1 text-[11px] font-medium text-stone-700 hover:border-stone-500"
               >
                 GitHub-вход
               </button>
@@ -294,13 +294,13 @@ export function ZaiLinkCard({
               onPaste={() => setTimeout(() => void claimBridge(), 120)}
               rows={2}
               placeholder="Вставь сюда адрес chat.z.ai/auth#token=…"
-              className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[12px] text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
+              className="w-full rounded-lg border border-stone-200 bg-white px-3 py-2 text-[12px] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
             />
             <Button
               onClick={() => void claimBridge()}
               disabled={busy !== null || !bridgeRaw.trim()}
               variant="outline"
-              className="w-full border-zinc-700 text-zinc-200 hover:bg-zinc-800"
+              className="w-full border-stone-300 text-stone-800 hover:bg-stone-100"
             >
               {busy === 'claim' && <Loader2 className="h-4 w-4 animate-spin" />}
               Подключить
@@ -312,7 +312,7 @@ export function ZaiLinkCard({
       {onDismiss && (
         <button
           onClick={onDismiss}
-          className="w-full rounded-lg px-3 py-1.5 text-[12px] text-zinc-500 hover:text-zinc-300"
+          className="w-full rounded-lg px-3 py-1.5 text-[12px] text-stone-500 hover:text-stone-700"
         >
           Позже — продолжить в гостевом режиме (своя квота подключится позже)
         </button>

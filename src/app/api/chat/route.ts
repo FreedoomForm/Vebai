@@ -8,11 +8,18 @@ import type { AgentEvent } from '@/lib/agent/types'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 300 // hobby-plan cap; SSE heartbeat keeps proxies from idling
 
+/** Whitelisted upstream models (the composer's model selector maps here).
+ * Anything else silently falls back to the server default — no client-side
+ * model id can switch us onto an unvetted/level-gated upstream model. */
+const MODEL_WHITELIST = new Set(['x-preview-l', 'glm-5.2', 'glm-4.7'])
+const EFFORTS = new Set(['high', 'max'])
+
 /** POST /api/chat — runs one agent turn and streams AgentEvents as SSE.
- * Body: { conversationId?, content, captchaVerifyParam?, resume? }
+ * Body: { conversationId?, content, captchaVerifyParam?, resume?, model?, webSearch?, effort? }
  * - captchaVerifyParam: one-time param from Z.ai's own widget (relay —
  *   the user solved it in the browser); needed on every completions.
- * - resume: captcha retry — the user message is already persisted. */
+ * - resume: captcha retry — the user message is already persisted.
+ * - model/webSearch/effort: the composer's selector state (z.ai-style UI). */
 export async function POST(req: NextRequest) {
   const { user, unauthorized } = await requireAuth(req)
   if (unauthorized) return unauthorized
@@ -21,17 +28,26 @@ export async function POST(req: NextRequest) {
   let content = ''
   let captchaVerifyParam = ''
   let resume = false
+  let model = ''
+  let webSearch = false
+  let effort: 'high' | 'max' = 'max'
   try {
     const body = (await req.json()) as {
       conversationId?: string
       content?: string
       captchaVerifyParam?: string
       resume?: boolean
+      model?: string
+      webSearch?: boolean
+      effort?: string
     }
     conversationId = String(body.conversationId || '')
     content = String(body.content || '').trim()
     captchaVerifyParam = String(body.captchaVerifyParam || '').slice(0, 4096)
     resume = Boolean(body.resume)
+    model = MODEL_WHITELIST.has(String(body.model || '')) ? String(body.model) : ''
+    webSearch = Boolean(body.webSearch)
+    effort = EFFORTS.has(String(body.effort || '')) ? (String(body.effort) as 'high' | 'max') : 'max'
     if (!content)
       return new Response(JSON.stringify({ error: 'content is required' }), {
         status: 400,
@@ -122,6 +138,9 @@ export async function POST(req: NextRequest) {
           zaiSessionToken,
           captchaVerifyParam: captchaVerifyParam || undefined,
           skipUserMessage: resume,
+          model: model || undefined,
+          webSearch,
+          effort,
         })
       } catch (e) {
         emit({

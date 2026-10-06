@@ -249,6 +249,12 @@ export interface AgentTurnOptions {
   captchaVerifyParam?: string
   /** captcha retry: the user message is already persisted — don't duplicate */
   skipUserMessage?: boolean
+  /** upstream model id (whitelisted in /api/chat before reaching here) */
+  model?: string
+  /** 🌐 web-search toggle from the composer */
+  webSearch?: boolean
+  /** Deep-Think selector: 'high' | 'max' */
+  effort?: 'high' | 'max'
 }
 
 export async function runAgentTurn(
@@ -281,6 +287,9 @@ export async function runAgentTurn(
   const transport: ChatWebTransport = {
     sessionToken: opts?.zaiSessionToken ?? undefined,
     captchaVerifyParam: opts?.captchaVerifyParam || undefined,
+    model: opts?.model || undefined,
+    webSearch: opts?.webSearch || undefined,
+    effort: opts?.effort || undefined,
   }
 
   try {
