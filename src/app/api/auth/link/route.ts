@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { AUTH_REQUIRED, hashPassword, requireAuth } from '@/lib/auth'
-import { zaiSignUp, zaiSignIn, resolveSession, ChatWebError } from '@/lib/chatweb'
+import { zaiSignUpStart, zaiSignIn, resolveSession, ChatWebError } from '@/lib/chatweb'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,15 +11,13 @@ export const dynamic = 'force-dynamic'
  * for it to ever block logging in or registering.
  *
  * Body: { email?, password, zaiCaptchaParam, mode: 'signup' | 'signin' }
- *  - mode 'signup'  → create a REAL chat.z.ai account with these creds;
- *  - mode 'signin'  → sign in to an EXISTING chat.z.ai account.
+ *  - mode 'signup'  → START creating a REAL chat.z.ai account: Z.ai emails
+ *    a verification code; the user finishes via /api/auth/zai/verify
+ *    (byte-verified flow — signup no longer returns a token directly);
+ *  - mode 'signin'  → sign in to an EXISTING chat.z.ai account — this one
+ *    still returns the JWT immediately, so the link completes right here.
  * The Aliyun captcha param is single-use, so the UI shows two explicit
  * buttons (Создать / Войти) — a wrong guess never burns the param twice.
- *
- * On success the fresh JWT is stored on the User row: from now on the
- * user's AI traffic runs on THEIR OWN Z.ai quota (no per-message captcha).
- * If the Z.ai password differs from the local one, the local hash is
- * adopted to keep one password everywhere.
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -61,10 +59,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'mode должен быть signup или signin' }, { status: 400 })
 
   try {
-    const session =
-      mode === 'signup'
-        ? await zaiSignUp(email.split('@')[0], email, password, zaiCaptchaParam)
-        : await zaiSignIn(email, password, zaiCaptchaParam)
+    if (mode === 'signup') {
+      // Z.ai's signup is now email-verification based: it accepts the
+      // captcha, emails a code, and returns NO token. The user completes
+      // the flow (code + password) via /api/auth/zai/verify.
+      await zaiSignUpStart(user.name || email.split('@')[0], email, password, zaiCaptchaParam)
+      return NextResponse.json({ zai: { linked: false, needsCode: true, email } })
+    }
+    const session = await zaiSignIn(email, password, zaiCaptchaParam)
     const canonical = await resolveSession(session.token)
     await db.user.update({
       where: { id: user.id },

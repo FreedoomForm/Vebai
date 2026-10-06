@@ -6,7 +6,7 @@ import {
   sessionCookieHeader,
   verifyPassword,
 } from '@/lib/auth'
-import { resolveSession } from '@/lib/chatweb'
+import { isRealZaiToken, resolveSession } from '@/lib/chatweb'
 
 export const dynamic = 'force-dynamic'
 
@@ -46,9 +46,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Неверный email или пароль' }, { status: 401 })
   }
 
-  // silently refresh the stored Z.ai session when possible
-  let zaiSession: 'linked' | 'expired' | 'none' = user.zaiToken ? 'expired' : 'none'
-  if (user.zaiToken) {
+  // silently refresh the stored Z.ai session when possible.
+  // A stored GUEST token is the user's per-user anonymous chat session —
+  // keep it (chat history continuity) but do NOT report it as a linked
+  // account; only a real-account JWT counts as 'linked'.
+  const storedIsReal = isRealZaiToken(user.zaiToken)
+  let zaiSession: 'linked' | 'expired' | 'none' = storedIsReal ? 'expired' : 'none'
+  if (storedIsReal) {
     try {
       const session = await resolveSession(user.zaiToken)
       await db.user.update({
@@ -57,7 +61,7 @@ export async function POST(req: NextRequest) {
       })
       zaiSession = 'linked'
     } catch {
-      /* dead JWT — the in-app card will re-link it */
+      /* dead real JWT — the in-app card will re-link it */
     }
   }
 

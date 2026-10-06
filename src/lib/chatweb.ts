@@ -86,6 +86,16 @@ function mapAuthError(status: number, txt: string): ChatWebError {
     if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
   } catch { /* raw text */ }
   const short = detail.slice(0, 180)
+  if (/verification token/i.test(detail))
+    return new ChatWebError(
+      `Z.ai не принял код из письма (invalid verification token) — проверь код или запроси новый`,
+      'bad_code',
+    )
+  if (/not pending/i.test(detail))
+    return new ChatWebError(
+      `Z.ai: активной регистрации с этим email нет — сначала запусти создание аккаунта (капча + «Создать»)`,
+      'signup_not_pending',
+    )
   if (/captcha/i.test(detail))
     return new ChatWebError(`Z.ai не принял проверку капчи: ${short}`, 'captcha_failed')
   if (status === 400 && /already|exists|занят/i.test(detail))
@@ -112,8 +122,41 @@ const commonHeaders = (): Record<string, string> => ({
   Referer: `${BASE}/`,
 })
 
-/** Exchange a (possibly stale) JWT for a fresh session, or mint a guest one. */
+/** Decode a chat.z.ai JWT payload WITHOUT verification (we only need the
+ * identity fields to detect silent downgrades — Z.ai signs with ES256 and
+ * the server validates tokens itself; we never trust these fields for
+ * authorization, only to notice when a token stopped being what it was). */
+export function peekZaiJwtEmail(token: string): string {
+  try {
+    const pl = token.split('.')[1] || ''
+    const json = JSON.parse(Buffer.from(pl, 'base64url').toString('utf8')) as { email?: string }
+    return String(json.email || '')
+  } catch {
+    return ''
+  }
+}
+
+const GUEST_EMAIL_RE = /^guest-\d+@guest\.com$/i
+
+/** True when a stored zaiToken is a REAL account session (not the per-user
+ * anonymous guest session every user gets by default). This is what
+ * "linked" means for the UI badge and session reporting. */
+export function isRealZaiToken(token?: string | null): boolean {
+  if (!token) return false
+  const email = peekZaiJwtEmail(token)
+  return Boolean(email) && !GUEST_EMAIL_RE.test(email)
+}
+
+/** Exchange a (possibly stale) JWT for a fresh session, or mint a guest one.
+ *
+ * Z.ai quirk (verified live): a STALE/revoked Bearer token does NOT produce
+ * 401 — GET /auths/ silently mints a fresh GUEST session instead. We detect
+ * that downgrade by comparing identities and THROW `zai_session_expired`,
+ * so callers never mistake a guest session for a refreshed real account
+ * (and never persist a guest token over a real one). */
 export async function resolveSession(userToken?: string | null): Promise<ChatWebSession> {
+  const originalEmail = userToken ? peekZaiJwtEmail(userToken) : ''
+  const originalIsGuest = !userToken || !originalEmail || GUEST_EMAIL_RE.test(originalEmail)
   const res = await fetch(`${BASE}/api/v1/auths/`, {
     headers: {
       ...commonHeaders(),
@@ -137,6 +180,14 @@ export async function resolveSession(userToken?: string | null): Promise<ChatWeb
     email?: string
     role?: string
   }
+  // the silent-downgrade guard (see docblock): a real token must never
+  // come back as a guest session
+  if (!originalIsGuest && GUEST_EMAIL_RE.test(String(data.email || ''))) {
+    throw new ChatWebError(
+      'Сессия chat.z.ai истекла — аккаунт подключён, но токен устарел. Перелогинись (кнопка «Аккаунт Z.ai»).',
+      'zai_session_expired',
+    )
+  }
   return {
     token: data.token,
     userId: data.id,
@@ -147,18 +198,20 @@ export async function resolveSession(userToken?: string | null): Promise<ChatWeb
 }
 
 /**
- * Create a REAL chat.z.ai account (email+password the user chose) behind
- * Z.ai's own auth-scene captcha (Aliyun rotate/inpainting puzzle — the same
- * widget chat.z.ai embeds on its login/signup page, SceneId '36qgs6xb').
- * The returned session is a first-class account: its own JWT, its own quota,
- * and NO per-message captcha (that gate only applies to anonymous guests).
+ * STEP 1 of Z.ai email registration (byte-verified against their frontend
+ * prod-fe-1.1.98, 2026-10): POST /auths/signup is captcha-gated and on
+ * success returns {success:...} with NO token — Z.ai emails a verification
+ * code instead and the account sits in "signup pending" state.
+ * (The old contract "token in the signup response" is gone on their side —
+ * expecting one here was the exact root cause of the "green captcha, but
+ * verification failed" bug our users reported.)
  */
-export async function zaiSignUp(
+export async function zaiSignUpStart(
   name: string,
   email: string,
   password: string,
   captchaVerifyParam: string,
-): Promise<ChatWebSession> {
+): Promise<void> {
   const res = await fetch(`${BASE}/api/v1/auths/signup`, {
     method: 'POST',
     headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
@@ -174,15 +227,96 @@ export async function zaiSignUp(
   })
   const txt = await res.text().catch(() => '')
   if (!res.ok) throw mapAuthError(res.status, txt)
-  const data = JSON.parse(txt) as { token?: string; id?: string; name?: string; email?: string; role?: string }
-  if (!data?.token) throw new ChatWebError('Z.ai не вернул токен аккаунта', 'auth_failed')
-  return {
-    token: data.token,
-    userId: data.id || '',
-    name: data.name || name || 'User',
-    email: data.email || email,
-    role: data.role || 'user',
+  // accepted shapes: {success:true} | {token:...} (if Z.ai ever reverts)
+  let data: { success?: boolean; token?: string; detail?: string } = {}
+  try {
+    data = JSON.parse(txt)
+  } catch { /* empty body counts as success */ }
+  if (data?.detail) throw new ChatWebError(String(data.detail), 'auth_failed')
+}
+
+/** STEP 2 (NO captcha on Z.ai side): confirm the emailed code. */
+export async function zaiVerifyEmailCode(
+  email: string,
+  username: string,
+  code: string,
+): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/auths/verify_email`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: username || email.split('@')[0], email, token: code }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+}
+
+/** STEP 3 (NO captcha): finalize the account; response carries the JWT. */
+export async function zaiFinishSignup(
+  email: string,
+  username: string,
+  code: string,
+  password: string,
+): Promise<ChatWebSession> {
+  const res = await fetch(`${BASE}/api/v1/auths/finish_signup`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: username || email.split('@')[0],
+      email,
+      token: code,
+      password,
+      profile_image_url: '/static/favicon.png',
+      sso_redirect: '',
+    }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+  const data = JSON.parse(txt) as {
+    token?: string
+    user?: { token?: string; id?: string; name?: string; email?: string; role?: string }
+    id?: string
+    name?: string
+    email?: string
+    role?: string
   }
+  const token = data?.user?.token || data?.token
+  if (!token) throw new ChatWebError('Z.ai не вернул токен аккаунта', 'auth_failed')
+  const u = data.user || data
+  return {
+    token,
+    userId: u.id || '',
+    name: u.name || username || 'User',
+    email: u.email || email,
+    role: u.role || 'user',
+  }
+}
+
+/** Re-send the signup verification email (works while signup is pending). */
+export async function zaiResendCode(name: string, email: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/auths/resend_email`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name || email.split('@')[0], email, sso_redirect: '' }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+}
+
+/** Pull a chat.z.ai JWT out of what the user pasted after Google/GitHub login:
+ * the full page URL (`https://chat.z.ai/auth#token=…&is_new_user=…`), a bare
+ * JWT, or JSON. Returns '' when nothing JWT-shaped is found. */
+export function extractZaiTokenFromPaste(raw: string): string {
+  const s = (raw || '').trim()
+  if (!s) return ''
+  const m = s.match(/[#&?]token=([^&\s]+)/) || s.match(/token=([^&\s]+)/)
+  if (m) return decodeURIComponent(m[1])
+  // bare JWT (three base64url segments)
+  const jwt = s.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/)
+  if (jwt) return jwt[0]
+  return ''
 }
 
 /** Sign in to an EXISTING chat.z.ai account (also captcha-gated by Z.ai). */

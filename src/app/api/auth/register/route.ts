@@ -1,24 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { AUTH_REQUIRED, createSessionToken, hashPassword, sessionCookieHeader } from '@/lib/auth'
-import { zaiSignUp, resolveSession, ChatWebError } from '@/lib/chatweb'
+import { zaiSignUpStart, ChatWebError } from '@/lib/chatweb'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/auth/register — create the site account INSTANTLY (v4).
+ * POST /api/auth/register — create the site account INSTANTLY (v5).
  *
  * The local account is created first and the user is let in immediately —
- * registration can no longer be blocked by anything Z.ai-side (the old
- * hard captcha gate produced "green but rejected" dead ends).
+ * registration can no longer be blocked by anything Z.ai-side.
  *
  * If the browser also relayed a solved Z.ai auth-scene captcha param, we
- * TRY to create the user's REAL chat.z.ai account in the same breath:
- *  - success → their own JWT is stored; their traffic consumes their own
- *    Z.ai quota (no per-message captcha);
- *  - failure → the account still exists and works (guest-relay chat), and
- *    the exact upstream reason is returned so the user can retry linking
- *    later from the in-app card.
+ * START the creation of the user's REAL chat.z.ai account (byte-verified
+ * flow, prod-fe-1.1.98): POST /auths/signup {name,email,password,captcha}
+ * → Z.ai emails a 6-digit verification code → the user enters it (in-app
+ * or right on the auth screen) → verify_email + finish_signup complete the
+ * account and hand us the JWT. The code step never blocks logging in —
+ * skipping it just leaves the account unlinked (connect later in-app).
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -62,26 +61,20 @@ export async function POST(req: NextRequest) {
     select: { id: true, email: true, name: true },
   })
 
-  // 2) best-effort: create the user's OWN chat.z.ai account behind the
-  //    relayed captcha param. Never blocks registration.
-  let zai: { linked: boolean; code?: string; detail?: string } = { linked: false }
+  // 2) best-effort: START the user's REAL chat.z.ai account behind the
+  //    relayed captcha param. Success = verification email sent by Z.ai;
+  //    the in-code step finishes the link. Never blocks registration.
+  let zai: { linked: boolean; needsCode?: boolean; code?: string; detail?: string } = {
+    linked: false,
+  }
   if (zaiCaptchaParam) {
     try {
-      const session = await zaiSignUp(name || email.split('@')[0], email, password, zaiCaptchaParam)
-      const canonical = await resolveSession(session.token)
-      await db.user.update({
-        where: { id: user.id },
-        data: {
-          zaiToken: canonical.token,
-          zaiUserId: canonical.userId,
-          zaiSessionAt: new Date(),
-        },
-      })
-      zai = { linked: true }
+      await zaiSignUpStart(name || email.split('@')[0], email, password, zaiCaptchaParam)
+      zai = { linked: false, needsCode: true }
     } catch (e) {
       const detail = e instanceof ChatWebError ? e.message : 'Z.ai недоступен'
       const code = e instanceof ChatWebError ? e.code : 'zai_unavailable'
-      console.error(`[register] z.ai link failed for ${email}: ${code} :: ${detail.slice(0, 200)}`)
+      console.error(`[register] z.ai signup start failed for ${email}: ${code} :: ${detail.slice(0, 200)}`)
       zai = { linked: false, code, detail: detail.slice(0, 220) }
     }
   }

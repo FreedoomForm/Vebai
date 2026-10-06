@@ -16,7 +16,9 @@
  */
 
 import { db } from '@/lib/db'
-import { resolveSession, type ChatWebSession } from '@/lib/chatweb'
+import { peekZaiJwtEmail, resolveSession, type ChatWebSession } from '@/lib/chatweb'
+
+const GUEST_EMAIL_RE = /^guest-\d+@guest\.com$/i
 
 export interface UserZaiSession {
   token: string
@@ -55,14 +57,26 @@ export async function getUserZaiSession(userId: string | null | undefined): Prom
       select: { zaiToken: true },
     })
     if (user?.zaiToken) {
+      const storedEmail = peekZaiJwtEmail(user.zaiToken)
+      if (!storedEmail || GUEST_EMAIL_RE.test(storedEmail)) {
+        // a stored guest token is the user's own per-user anonymous session
+        // (minted on an earlier chat) — refresh it in place to keep chat
+        // history continuity; it is NOT a linked account and must never
+        // shadow a real one
+        const session = await resolveSession(user.zaiToken)
+        if (session.token !== user.zaiToken) await persist(userId, session)
+        return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: true, downgraded: false }
+      }
       try {
         const session = await resolveSession(user.zaiToken)
         // resolveSession may refresh the token — persist the latest
         if (session.token !== user.zaiToken) await persist(userId, session)
         return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: false, downgraded: false }
       } catch {
-        // stored JWT died — keep it on the row (it marks account ownership)
-        // and continue THIS request on a guest session
+        // stored real JWT died — KEEP it on the row (it marks account
+        // ownership and blocks the silent-downgrade overwrite) and continue
+        // THIS request on a guest session; resolveSession now throws for
+        // dead real tokens instead of silently returning a guest session
         const session = await resolveSession(null)
         return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: true, downgraded: true }
       }

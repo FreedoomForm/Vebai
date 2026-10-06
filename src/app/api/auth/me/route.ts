@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { AUTH_REQUIRED, requireAuth } from '@/lib/auth'
-import { DEFAULT_CHATWEB_MODEL } from '@/lib/chatweb'
+import { DEFAULT_CHATWEB_MODEL, isRealZaiToken } from '@/lib/chatweb'
 
 export const dynamic = 'force-dynamic'
 
@@ -20,7 +20,8 @@ export async function GET(req: NextRequest) {
     user: { id: user.id, email: user.email, name: user.name },
     authRequired: true,
     model: DEFAULT_CHATWEB_MODEL,
-    // whether a real chat.z.ai account session is attached to this profile
-    zaiLinked: Boolean(row?.zaiToken),
+    // true only when a REAL chat.z.ai account session is attached (a stored
+    // guest JWT is just the user's own anonymous chat session, not a link)
+    zaiLinked: isRealZaiToken(row?.zaiToken),
   })
 }
