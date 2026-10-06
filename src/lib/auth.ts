@@ -84,7 +84,6 @@ export interface SessionUser {
   id: string
   email: string
   name: string
-  zaiToken: string | null
 }
 
 export async function getSessionUser(req: Request): Promise<SessionUser | null> {
@@ -98,7 +97,7 @@ export async function getSessionUser(req: Request): Promise<SessionUser | null> 
   if (!payload) return null
   const user = await db.user.findUnique({
     where: { id: payload.uid },
-    select: { id: true, email: true, name: true, zaiToken: true },
+    select: { id: true, email: true, name: true },
   })
   return user
 }

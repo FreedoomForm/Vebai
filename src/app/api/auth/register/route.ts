@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { AUTH_REQUIRED, createSessionToken, hashPassword, sessionCookieHeader } from '@/lib/auth'
+import { verifyCaptcha } from '@/lib/captcha'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/auth/register — create a local site account.
+ * POST /api/auth/register — create a local site account (captcha-gated).
  *
  * Transparency note (also shown on the landing page): registration happens
- * HERE, but AI requests are proxied through chat.z.ai. We do not create
- * chat.z.ai accounts programmatically (their signup is captcha-protected);
- * users can attach their own chat.z.ai token via /api/auth/token or the
- * site-wide ZAI_JWT env is used.
+ * HERE behind a captcha; no chat.z.ai tokens are ever collected from users.
+ * AI traffic is proxied through chat.z.ai with the site's ZAI_JWT (owner) or
+ * a guest session — see src/lib/chatweb.ts.
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -20,11 +20,21 @@ export async function POST(req: NextRequest) {
   let email = ''
   let password = ''
   let name = ''
+  let captchaId = ''
+  let captchaText = ''
   try {
-    const body = (await req.json()) as { email?: string; password?: string; name?: string }
+    const body = (await req.json()) as {
+      email?: string
+      password?: string
+      name?: string
+      captchaId?: string
+      captchaText?: string
+    }
     email = String(body.email || '').trim().toLowerCase()
     password = String(body.password || '')
     name = String(body.name || '').trim().slice(0, 60)
+    captchaId = String(body.captchaId || '').trim()
+    captchaText = String(body.captchaText || '').trim()
   } catch {
     return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 })
   }
@@ -33,6 +43,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Укажи корректный email' }, { status: 400 })
   if (password.length < 6)
     return NextResponse.json({ error: 'Пароль — минимум 6 символов' }, { status: 400 })
+
+  if (!(await verifyCaptcha(captchaId, captchaText)))
+    return NextResponse.json({ error: 'Капча введена неверно — обнови картинку и попробуй снова' }, { status: 400 })
 
   const existing = await db.user.findUnique({ where: { email } })
   if (existing)

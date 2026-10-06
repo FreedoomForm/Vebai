@@ -15,8 +15,12 @@
  *
  * Captcha note: anonymous guest sessions are rate-limited by an Aliyun
  * captcha on chat.z.ai (FRONTEND_CAPTCHA_REQUIRED). Real accounts used via
- * ZAI_JWT (or a user's own token) are not affected. When the captcha is
- * required we surface a clear, actionable error message.
+ * ZAI_JWT are not affected. When the captcha is required we surface a clear,
+ * actionable error message.
+ *
+ * Agent tools: the chat.z.ai agent keeps its OWN toolbelt (z.ai web SDK —
+ * web search etc.); we enable its auto web search so answers come with
+ * fresh data through Z.ai's quota. Our site adds the video tool on top.
  */
 
 import crypto from 'node:crypto'
@@ -202,7 +206,7 @@ async function createChatRecord(session: ChatWebSession, model: string, prompt: 
       features: [],
       mcp_servers: [],
       enable_thinking: false,
-      auto_web_search: false,
+      auto_web_search: true,
       message_version: 1,
       timestamp: Date.now(),
     },
@@ -228,7 +232,7 @@ function mapUpstreamError(err: { detail?: unknown; code?: unknown; error_code?: 
   const detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail ?? err)
   if (code.includes('CAPTCHA') || /captcha/i.test(detail))
     return new ChatWebError(
-      'Z.ai требует капчу для анонимных сессий. Решение: задай ZAI_JWT (токен реального аккаунта chat.z.ai) в переменных окружения Vercel — см. README, раздел «Прокси chat.z.ai».',
+      'Z.ai требует капчу для анонимных гостевых сессий. Решение: задай ZAI_JWT (токен аккаунта владельца chat.z.ai) в переменных окружения Vercel — см. README, раздел «Прокси chat.z.ai».',
       'captcha_required',
     )
   if (/user level/i.test(detail) || code === '403')
@@ -278,7 +282,7 @@ async function* upstreamEvents(
     features: {
       image_generation: false,
       web_search: false,
-      auto_web_search: false,
+      auto_web_search: true, // let the Z.ai agent decide when to search
       preview_mode: false,
       flags: [],
       enable_thinking: false,
@@ -361,14 +365,13 @@ function openaiChunk(delta: { content?: string }, finish: string | null = null):
 }
 
 /** Streaming chat via chat.z.ai -> OpenAI-compatible SSE chunks.
- * `userToken` = the caller's own chat.z.ai JWT; falls back to ZAI_JWT env,
- * then to an anonymous guest session. */
+ * Uses the site-wide ZAI_JWT (owner account) or an anonymous guest session. */
 export async function chatWebStream(
   messages: PlainMessage[],
-  opts?: { userToken?: string | null; model?: string },
+  opts?: { model?: string },
 ): Promise<ReadableStream<Uint8Array>> {
   const model = opts?.model || DEFAULT_CHATWEB_MODEL
-  const session = await resolveSession(opts?.userToken || process.env.ZAI_JWT || null)
+  const session = await resolveSession(process.env.ZAI_JWT || null)
   const prompt = renderPrompt(messages)
   if (!prompt) throw new ChatWebError('Пустой промпт', 'empty_prompt')
   const enc = new TextEncoder()
@@ -409,7 +412,7 @@ export async function chatWebStream(
 /** Non-streaming chat via chat.z.ai (collects the stream). */
 export async function chatWebComplete(
   messages: PlainMessage[],
-  opts?: { userToken?: string | null; model?: string },
+  opts?: { model?: string },
 ): Promise<{ choices: { message: { content: string } }[] }> {
   const stream = await chatWebStream(messages, opts)
   const reader = stream.getReader()

@@ -44,7 +44,6 @@ export async function POST(req: NextRequest) {
   }
 
   const cid = conversationId
-  const zaiToken = user?.zaiToken || null
   const encoder = new TextEncoder()
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -65,7 +64,7 @@ export async function POST(req: NextRequest) {
       const hb = setInterval(() => safeEnqueue(': hb\n\n'), 15_000)
 
       try {
-        await runAgentTurn(cid, content, emit, zaiToken)
+        await runAgentTurn(cid, content, emit)
       } catch (e) {
         emit({
           type: 'error',

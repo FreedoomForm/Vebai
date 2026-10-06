@@ -3,7 +3,7 @@
  *
  * Two backends for chat:
  *   1. chatweb (default) — the chat.z.ai web protocol (src/lib/chatweb.ts).
- *      Credentials chain: user's own token (BYO) -> ZAI_JWT env -> guest.
+ *      Credentials: ZAI_JWT env (site-wide) -> anonymous guest session.
  *   2. official — the paid OpenAI-compatible api.z.ai (ZAI_BASE_URL+ZAI_API_KEY),
  *      enabled with ZAI_MODE=official. Image generation always needs it.
  *
@@ -25,11 +25,6 @@ export interface ZaiConfig {
   token?: string
   chatId?: string
   userId?: string
-}
-
-export interface ZaiCallOptions {
-  /** the caller's own chat.z.ai JWT (BYO); falls back to ZAI_JWT, then guest */
-  userToken?: string | null
 }
 
 const OFFICIAL_MODE = process.env.ZAI_MODE === 'official'
@@ -256,7 +251,6 @@ export const zai = {
     /** non-streaming chat completion (streaming lives in streamChat) */
     async completions(
       body: ChatBody,
-      opts?: ZaiCallOptions,
     ): Promise<{ choices: { message: { content: string } }[] }> {
       if (chatBackend() === 'official') {
         const cfg = await loadOfficialConfig()
@@ -268,20 +262,18 @@ export const zai = {
         return (await res.json()) as { choices: { message: { content: string } }[] }
       }
       return chatWebComplete(body.messages as PlainMessage[], {
-        userToken: opts?.userToken,
         model: DEFAULT_CHATWEB_MODEL,
       })
     },
   },
 
   /** streaming chat: returns an SSE ReadableStream of OpenAI-style chunks */
-  async streamChat(body: ChatBody, opts?: ZaiCallOptions): Promise<ReadableStream<Uint8Array>> {
+  async streamChat(body: ChatBody): Promise<ReadableStream<Uint8Array>> {
     if (chatBackend() === 'official') {
       const cfg = await loadOfficialConfig()
       return officialStream(cfg, body)
     }
     return chatWebStream(body.messages as PlainMessage[], {
-      userToken: opts?.userToken,
       model: DEFAULT_CHATWEB_MODEL,
     })
   },

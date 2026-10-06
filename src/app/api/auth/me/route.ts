@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
   const { user } = await requireAuth(req)
   if (!user) return NextResponse.json({ user: null, authRequired: true }, { status: 401 })
   return NextResponse.json({
-    user: { id: user.id, email: user.email, name: user.name, hasZaiToken: !!user.zaiToken },
+    user: { id: user.id, email: user.email, name: user.name },
     authRequired: true,
     model: DEFAULT_CHATWEB_MODEL,
   })

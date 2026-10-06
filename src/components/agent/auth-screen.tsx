@@ -1,36 +1,71 @@
 'use client'
 
-import { useState } from 'react'
-import { Loader2, ShieldAlert, Sparkles } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Loader2, RefreshCw, ShieldAlert, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 
+interface CaptchaChallenge {
+  id: string
+  svg: string
+}
+
 /**
  * Landing / auth gate. Shows the mandatory proxy warning prominently:
- * the account is created here, but AI traffic goes through chat.z.ai
- * and consumes Z.ai quota (the user's own token or the site owner's).
+ * the account is created here (behind a captcha), but AI traffic goes
+ * through chat.z.ai and consumes the Z.ai quota of the site's account.
+ * Users never provide any Z.ai tokens.
  */
 export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('register')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [name, setName] = useState('')
+  const [captcha, setCaptcha] = useState<CaptchaChallenge | null>(null)
+  const [captchaText, setCaptchaText] = useState('')
+  const [captchaLoading, setCaptchaLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+
+  const loadCaptcha = useCallback(async () => {
+    setCaptchaLoading(true)
+    setCaptchaText('')
+    try {
+      const res = await fetch('/api/auth/captcha', { cache: 'no-store' })
+      const data = (await res.json().catch(() => null)) as CaptchaChallenge | { error?: string } | null
+      if (data && 'id' in data && 'svg' in data) setCaptcha(data as CaptchaChallenge)
+    } catch {
+      /* network error — user can retry via the refresh button */
+    } finally {
+      setCaptchaLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (mode !== 'register') return
+    // queueMicrotask keeps setState out of the synchronous effect body
+    const t = setTimeout(() => { void loadCaptcha() }, 0)
+    return () => clearTimeout(t)
+  }, [mode, loadCaptcha])
 
   const submit = async () => {
     if (busy) return
     setBusy(true)
     setError('')
     try {
+      const body =
+        mode === 'register'
+          ? { email, password, name, captchaId: captcha?.id, captchaText }
+          : { email, password }
       const res = await fetch(`/api/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(mode === 'register' ? { email, password, name } : { email, password }),
+        body: JSON.stringify(body),
       })
       const data = (await res.json().catch(() => ({}))) as { error?: string }
       if (!res.ok) {
         setError(data.error || `Ошибка ${res.status}`)
+        if (mode === 'register') void loadCaptcha() // captcha is single-use
         return
       }
       onAuthed()
@@ -64,11 +99,11 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             </p>
           </div>
           <p className="text-[12px] leading-relaxed text-amber-200/80">
-            Аккаунт создаётся здесь, но все запросы к ИИ выполняются через платформу{' '}
-            <span className="font-medium text-amber-200">chat.z.ai (Z.ai)</span> и расходуют её квоту —
-            твою собственную (если укажешь свой токен Z.ai в настройках) или аккаунт владельца сайта.
-            Это неофициальный клиент, не аффилированный с Z.ai. Регистрируясь, ты подтверждаешь, что
-            понимаешь, как работает прокси.
+            Аккаунт создаётся здесь (за капчей), но все запросы к ИИ выполняет агент платформы{' '}
+            <span className="font-medium text-amber-200">chat.z.ai (Z.ai)</span> — с её встроенным
+            поиском и инструментами — и расходует <span className="font-medium text-amber-200">квоту Z.ai</span>,
+            закреплённую за сайтом. Никакие токены Z.ai у тебя не запрашиваются.
+            Это неофициальный клиент, не аффилированный с Z.ai.
           </p>
         </div>
 
@@ -114,11 +149,52 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-emerald-800"
           />
 
+          {mode === 'register' && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <div
+                  data-testid="captcha-image"
+                  className="flex h-14 w-[172px] shrink-0 items-center justify-center overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950"
+                >
+                  {captcha ? (
+                    <img
+                      src={`data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(captcha.svg)))}`}
+                      alt="Капча: пять символов с картинки"
+                      className="h-14 w-[172px]"
+                      draggable={false}
+                    />
+                  ) : (
+                    <span className="text-[11px] text-zinc-600">
+                      {captchaLoading ? 'загрузка…' : 'капча недоступна'}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  aria-label="Обновить капчу"
+                  onClick={() => void loadCaptcha()}
+                  className="rounded-lg border border-zinc-800 p-2.5 text-zinc-400 transition-colors hover:border-zinc-700 hover:text-zinc-200"
+                >
+                  <RefreshCw className={cn('h-4 w-4', captchaLoading && 'animate-spin')} />
+                </button>
+              </div>
+              <input
+                value={captchaText}
+                onChange={(e) => setCaptchaText(e.target.value)}
+                placeholder="Символы с картинки"
+                maxLength={10}
+                autoCapitalize="characters"
+                autoCorrect="off"
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm uppercase tracking-[0.3em] text-zinc-200 placeholder:text-zinc-600 placeholder:tracking-normal placeholder:normal-case outline-none focus:border-emerald-800"
+              />
+            </div>
+          )}
+
           {error && <p className="text-[12px] text-red-400">{error}</p>}
 
           <Button
             onClick={submit}
-            disabled={busy || !email || !password}
+            disabled={busy || !email || !password || (mode === 'register' && (!captchaText || !captcha))}
             className="w-full bg-emerald-500/90 text-zinc-950 hover:bg-emerald-400 font-medium"
           >
             {busy && <Loader2 className="h-4 w-4 animate-spin" />}

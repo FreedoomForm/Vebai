@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Неверный email или пароль' }, { status: 401 })
 
   const res = NextResponse.json({
-    user: { id: user.id, email: user.email, name: user.name, hasZaiToken: !!user.zaiToken },
+    user: { id: user.id, email: user.email, name: user.name },
   })
   res.headers.append('Set-Cookie', sessionCookieHeader(createSessionToken(user.id)))
   return res

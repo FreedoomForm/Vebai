@@ -20,7 +20,6 @@ interface SessionUser {
   id: string
   email: string
   name: string
-  hasZaiToken?: boolean
 }
 
 interface ConvSummary extends ConversationDTO {
