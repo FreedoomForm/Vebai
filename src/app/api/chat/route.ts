@@ -2,22 +2,36 @@ import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { runAgentTurn } from '@/lib/agent/loop'
 import { requireAuth } from '@/lib/auth'
+import { getUserZaiSession } from '@/lib/zai-session'
 import type { AgentEvent } from '@/lib/agent/types'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 800
 
-/** POST /api/chat — runs one agent turn and streams AgentEvents as SSE */
+/** POST /api/chat — runs one agent turn and streams AgentEvents as SSE.
+ * Body: { conversationId?, content, captchaVerifyParam?, resume? }
+ * - captchaVerifyParam: one-time param from Z.ai's own widget (relay —
+ *   the user solved it in the browser); needed on every completions.
+ * - resume: captcha retry — the user message is already persisted. */
 export async function POST(req: NextRequest) {
   const { user, unauthorized } = await requireAuth(req)
   if (unauthorized) return unauthorized
 
   let conversationId = ''
   let content = ''
+  let captchaVerifyParam = ''
+  let resume = false
   try {
-    const body = (await req.json()) as { conversationId?: string; content?: string }
+    const body = (await req.json()) as {
+      conversationId?: string
+      content?: string
+      captchaVerifyParam?: string
+      resume?: boolean
+    }
     conversationId = String(body.conversationId || '')
     content = String(body.content || '').trim()
+    captchaVerifyParam = String(body.captchaVerifyParam || '').slice(0, 4096)
+    resume = Boolean(body.resume)
     if (!content)
       return new Response(JSON.stringify({ error: 'content is required' }), {
         status: 400,
@@ -33,6 +47,12 @@ export async function POST(req: NextRequest) {
       }
     }
     if (!conversationId) {
+      // on a captcha retry the conversation must exist already
+      if (resume)
+        return new Response(JSON.stringify({ error: 'conversation required for resume' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        })
       const conv = await db.conversation.create({ data: { userId: user?.id ?? null } })
       conversationId = conv.id
     }
@@ -44,6 +64,16 @@ export async function POST(req: NextRequest) {
   }
 
   const cid = conversationId
+
+  // per-user anonymous chat.z.ai session (minted on first use, stored on the
+  // User row; the user never handles any token)
+  let zaiSessionToken: string | null = null
+  try {
+    zaiSessionToken = (await getUserZaiSession(user?.id ?? null)).token
+  } catch {
+    zaiSessionToken = null // fall back to chatWeb's own guest flow
+  }
+
   const encoder = new TextEncoder()
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -64,7 +94,11 @@ export async function POST(req: NextRequest) {
       const hb = setInterval(() => safeEnqueue(': hb\n\n'), 15_000)
 
       try {
-        await runAgentTurn(cid, content, emit)
+        await runAgentTurn(cid, content, emit, {
+          zaiSessionToken,
+          captchaVerifyParam: captchaVerifyParam || undefined,
+          skipUserMessage: resume,
+        })
       } catch (e) {
         emit({
           type: 'error',

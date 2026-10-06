@@ -16,8 +16,11 @@ import {
   chatWebComplete,
   ChatWebError,
   DEFAULT_CHATWEB_MODEL,
+  type ChatWebTransport,
   type PlainMessage,
 } from './chatweb'
+
+export type { ChatWebTransport } from './chatweb'
 
 export interface ZaiConfig {
   baseUrl: string
@@ -263,18 +266,24 @@ export const zai = {
       }
       return chatWebComplete(body.messages as PlainMessage[], {
         model: DEFAULT_CHATWEB_MODEL,
+        transport: body.transport as ChatWebTransport | undefined,
       })
     },
   },
 
-  /** streaming chat: returns an SSE ReadableStream of OpenAI-style chunks */
-  async streamChat(body: ChatBody): Promise<ReadableStream<Uint8Array>> {
+  /** streaming chat: returns an SSE ReadableStream of OpenAI-style chunks.
+   * transport carries the per-user session token + one-time captcha param. */
+  async streamChat(
+    body: ChatBody,
+    transport?: ChatWebTransport,
+  ): Promise<ReadableStream<Uint8Array>> {
     if (chatBackend() === 'official') {
       const cfg = await loadOfficialConfig()
       return officialStream(cfg, body)
     }
     return chatWebStream(body.messages as PlainMessage[], {
       model: DEFAULT_CHATWEB_MODEL,
+      transport: (transport || (body.transport as ChatWebTransport | undefined)),
     })
   },
 

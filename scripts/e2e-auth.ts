@@ -1,141 +1,165 @@
 /**
- * E2E self-check for Vebai auth + chat proxy.
+ * E2E test for the Z.ai captcha-relay architecture (Vebai 0.5).
  *
- * Usage:  bun scripts/e2e-auth.ts            (BASE_URL defaults to localhost:3000)
- * Needs DATABASE_URL pointing at the same Postgres the server uses (to read
- * the captcha answer for the happy path).
+ * Prerequisites:
+ *   - dev server on :3000 (AUTH_REQUIRED=true, Postgres via DATABASE_URL)
+ *   - a REAL one-time Z.ai captcha param (solved by the relayed Aliyun widget)
+ *     passed via ZAI_CAPTCHA_PARAM (see scripts/README or worklog)
  *
  * Steps:
- *  1. GET / renders the landing
- *  2. GET /api/auth/captcha returns an SVG challenge
- *  3. register with a WRONG captcha -> 400 (and the challenge is consumed)
- *  4. register with the CORRECT captcha -> 200 + session cookie
- *  5. GET /api/auth/me -> session user
- *  6. POST /api/chat -> SSE stream (deltas / tool / error events)
- *  7. GET /api/agent/state -> worker payload
+ *   1. GET  /            — landing renders
+ *   2. GET  /api/auth/captcha — must be 404 (homemade captcha is REMOVED)
+ *   3. POST /api/auth/register without captcha param — rejected 400
+ *   4. POST /api/auth/register with a STALE param — rejected 400 (z.ai verify fails)
+ *   5. POST /api/auth/register with a REAL param — 200, session cookie, user
+ *      gets a private anonymous z.ai session (zaiToken stored server-side)
+ *   6. GET  /api/auth/me — user identity
+ *   7. POST /api/chat without param — SSE contains captcha_required event
+ *      (Z.ai demands the captcha; UI relays the widget)
+ *   8. POST /api/chat with a fresh REAL param, resume=true — SSE streams the
+ *      agent answer (z.ai accepted the captcha)
+ *
+ * Usage: ZAI_CAPTCHA_PARAM=... ZAI_CAPTCHA_PARAM2=... tsx scripts/e2e-auth.ts
  */
+import crypto from 'node:crypto'
 
-import { PrismaClient } from '@prisma/client'
-
-const BASE = process.env.BASE_URL || 'http://localhost:3000'
-const EMAIL = `e2e-${Date.now().toString(36)}@vebai.test`
-const PASSWORD = 'e2e-password-123'
-const db = new PrismaClient()
+const BASE = process.env.E2E_BASE || 'http://localhost:3000'
+const REAL1 = process.env.ZAI_CAPTCHA_PARAM || ''
+const REAL2 = process.env.ZAI_CAPTCHA_PARAM2 || ''
 
 let cookie = ''
-let failures = 0
+let pass = 0
+let fail = 0
 
-function ok(name: string, cond: boolean, detail = '') {
-  const mark = cond ? 'PASS' : 'FAIL'
-  if (!cond) failures++
-  console.log(`[${mark}] ${name}${detail ? ` — ${detail}` : ''}`)
+function ok(name: string, cond: boolean, extra = '') {
+  if (cond) {
+    pass++
+    console.log(`  ✅ ${name}${extra ? ` — ${extra}` : ''}`)
+  } else {
+    fail++
+    console.log(`  ❌ ${name}${extra ? ` — ${extra}` : ''}`)
+  }
 }
 
-async function api(path: string, init?: RequestInit) {
+async function post(path: string, body: unknown) {
   const res = await fetch(`${BASE}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(cookie ? { Cookie: cookie } : {}),
-      ...(init?.headers || {}),
-    },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+    body: JSON.stringify(body),
   })
   const setCookie = res.headers.get('set-cookie')
   if (setCookie) cookie = setCookie.split(';')[0]
   return res
 }
 
-async function main() {
-  // 1. landing
-  const page = await fetch(`${BASE}/`)
-  const html = await page.text()
-  ok('GET / renders', page.status === 200 && /Нейро-Архитектор/.test(html), `status ${page.status}`)
-
-  // 2. captcha endpoint
-  const capRes = await api('/api/auth/captcha')
-  const cap = (await capRes.json()) as { id: string; svg: string }
-  ok('GET /api/auth/captcha', capRes.status === 200 && !!cap.id && cap.svg.startsWith('<svg'), `${cap?.id}`)
-
-  // 3. wrong captcha rejected
-  const badRes = await api('/api/auth/register', {
-    method: 'POST',
-    body: JSON.stringify({ email: EMAIL, password: PASSWORD, name: 'E2E', captchaId: cap.id, captchaText: 'XXXXX' }),
-  })
-  const bad = (await badRes.json()) as { error?: string }
-  ok('register wrong captcha -> 400', badRes.status === 400, bad.error || '')
-  const consumed = await db.captcha.findUnique({ where: { id: cap.id } })
-  ok('wrong attempt consumes challenge', consumed === null, '')
-
-  // 4. correct captcha
-  const cap2Res = await api('/api/auth/captcha')
-  const cap2 = (await cap2Res.json()) as { id: string; svg: string }
-  const row = await db.captcha.findUnique({ where: { id: cap2.id } })
-  ok('challenge stored in DB', !!row?.answer, '')
-  const regRes = await api('/api/auth/register', {
-    method: 'POST',
-    body: JSON.stringify({ email: EMAIL, password: PASSWORD, name: 'E2E', captchaId: cap2.id, captchaText: row!.answer }),
-  })
-  const reg = (await regRes.json()) as { user?: { id: string }; error?: string }
-  ok('register correct captcha -> 200', regRes.status === 200 && !!reg.user?.id, reg.error || reg.user?.id || '')
-  ok('session cookie set', cookie.startsWith('vb_session='), '')
-
-  // 5. session
-  const meRes = await api('/api/auth/me')
-  const me = (await meRes.json()) as { user?: { email: string } }
-  ok('GET /api/auth/me', meRes.status === 200 && me.user?.email === EMAIL, me.user?.email || '')
-
-  // 6. chat via proxy (guest or ZAI_JWT; guest may hit z.ai captcha — both are valid outcomes)
-  console.log('— POST /api/chat (SSE)…')
-  const chatRes = await api('/api/chat', {
-    method: 'POST',
-    body: JSON.stringify({ content: 'Ответь ровно одним словом: работает' }),
-  })
-  ok('POST /api/chat starts stream', chatRes.status === 200 && !!chatRes.body, `status ${chatRes.status}`)
-  if (chatRes.body) {
-    const reader = (chatRes.body as ReadableStream<Uint8Array>).getReader()
-    const dec = new TextDecoder()
-    let buf = ''
-    let text = ''
-    const events = new Map<string, number>()
-    const deadline = Date.now() + 60_000
-    let errored = ''
-    outer: while (Date.now() < deadline) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += dec.decode(value, { stream: true })
-      let idx: number
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).trim()
-        buf = buf.slice(idx + 1)
-        if (!line.startsWith('data:')) continue
-        const payload = line.slice(5).trim()
-        if (!payload) continue
+/** Read an SSE stream and collect event types + text deltas. */
+async function readSSE(res: Response): Promise<{ types: string[]; text: string; captchaRequired: boolean }> {
+  const types: string[] = []
+  let text = ''
+  let captchaRequired = false
+  if (!res.body) return { types, text, captchaRequired }
+  const reader = res.body.getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    let idx: number
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, idx)
+      buf = buf.slice(idx + 2)
+      for (const line of block.split('\n')) {
+        const t = line.trim()
+        if (!t.startsWith('data:')) continue
         try {
-          const evt = JSON.parse(payload) as { type?: string; text?: string; message?: string }
-          const t = evt.type || '?'
-          events.set(t, (events.get(t) || 0) + 1)
-          if (t === 'delta' && evt.text) text += evt.text
-          if (t === 'error') errored = evt.message || 'unknown'
-          if (t === 'done') break outer
-        } catch { /* heartbeat or partial */ }
+          const evt = JSON.parse(t.slice(5)) as { type?: string; text?: string }
+          if (evt.type) types.push(evt.type)
+          if (evt.type === 'captcha_required') captchaRequired = true
+          if (evt.type === 'delta' && evt.text) text += evt.text
+          if (evt.type === 'message') {
+            const m = evt as unknown as { message?: { content?: string } }
+            if (m.message?.content) text += m.message.content
+          }
+        } catch { /* partial */ }
       }
     }
-    const flat = text.replace(/\s+/g, ' ').trim()
-    ok('chat stream produced events', events.size > 0, `types: ${[...events.entries()].map(([k, v]) => `${k}:${v}`).join(' ')}`)
-    if (errored) console.log(`[INFO] upstream says: ${errored.slice(0, 200)}`)
-    else ok('chat produced answer text', flat.length > 0, `"${flat.slice(0, 120)}"`)
   }
-
-  // 7. agent state
-  const stateRes = await api('/api/agent/state')
-  ok('GET /api/agent/state', stateRes.status === 200, `status ${stateRes.status}`)
-
-  await db.$disconnect()
-  console.log(failures === 0 ? '\nE2E: ALL PASS' : `\nE2E: ${failures} FAILURE(S)`)
-  process.exit(failures === 0 ? 0 : 1)
+  return { types, text, captchaRequired }
 }
 
-main().catch((e) => {
-  console.error('E2E crashed:', e)
-  process.exit(1)
-})
+async function main() {
+  console.log('\n=== Vebai 0.5 E2E — Z.ai captcha relay ===\n')
+
+  // 1. landing
+  const landing = await fetch(`${BASE}/`)
+  ok('landing renders', landing.ok)
+
+  // 2. homemade captcha route removed
+  const oldCaptcha = await fetch(`${BASE}/api/auth/captcha`)
+  ok('old SVG captcha route removed (404)', oldCaptcha.status === 404, `status ${oldCaptcha.status}`)
+
+  // 3. register without captcha
+  const email = `e2e-${crypto.randomUUID().slice(0, 8)}@vebaitest.org`
+  const noCaptcha = await post('/api/auth/register', { email, password: 'e2epass123', name: 'E2E' })
+  ok('register without captcha rejected', noCaptcha.status === 400, `status ${noCaptcha.status}`)
+
+  // 4. register with garbage param (unique email — attempts never share rows)
+  const email2 = `e2e-${crypto.randomUUID().slice(0, 8)}@vebaitest.org`
+  const badCaptcha = await post('/api/auth/register', {
+    email: email2, password: 'e2epass123', name: 'E2E', zaiCaptchaParam: 'garbage-param',
+  })
+  ok('register with fake captcha rejected', badCaptcha.status === 400, `status ${badCaptcha.status}`)
+
+  // 5. register with REAL captcha param
+  if (!REAL1) {
+    console.log('  ⚠️  ZAI_CAPTCHA_PARAM not set — skipping live steps 5-8')
+  } else {
+    const email3 = `e2e-${crypto.randomUUID().slice(0, 8)}@vebaitest.org`
+    const good = await post('/api/auth/register', {
+      email: email3, password: 'e2epass123', name: 'E2E', zaiCaptchaParam: REAL1,
+    })
+    ok('register with REAL z.ai captcha', good.ok, `status ${good.status}`)
+    if (good.ok) {
+      // 6. session
+      const me = await fetch(`${BASE}/api/auth/me`, { headers: { Cookie: cookie } })
+      const meData = (await me.json().catch(() => ({}))) as { user?: { email?: string } }
+      ok('/api/auth/me returns user', meData.user?.email === email3, JSON.stringify(meData).slice(0, 80))
+
+      // 7. chat without param -> captcha_required event
+      const chatRes = await post('/api/chat', { content: 'Ответь одним словом: ТЕСТ' })
+      const sse1 = await readSSE(chatRes)
+      const cid = chatRes.headers.get('X-Conversation-Id') || ''
+      ok(
+        'chat without param -> captcha_required',
+        sse1.captchaRequired,
+        `events: ${sse1.types.join(',')}`,
+      )
+
+      // 8. chat with fresh param + resume -> real answer
+      if (REAL2 && cid) {
+        const chat2 = await post('/api/chat', {
+          conversationId: cid,
+          content: 'Ответь одним словом: ТЕСТ',
+          captchaVerifyParam: REAL2,
+          resume: true,
+        })
+        const sse2 = await readSSE(chat2)
+        ok(
+          'chat with REAL param streams answer',
+          sse2.text.trim().length > 0 && !sse2.captchaRequired,
+          `answer: ${sse2.text.trim().slice(0, 60) || '(empty)'} | events: ${sse2.types.join(',')}`,
+        )
+        // no duplicate user message: history must contain exactly one user msg
+        // (resume=true skips re-persisting it)
+      } else {
+        console.log('  ⚠️  ZAI_CAPTCHA_PARAM2 not set — skipping the answered-chat step')
+      }
+    }
+  }
+
+  console.log(`\n=== ${pass} passed, ${fail} failed ===\n`)
+  process.exit(fail > 0 ? 1 : 0)
+}
+
+void main()

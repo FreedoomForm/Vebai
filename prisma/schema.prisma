@@ -28,27 +28,22 @@ model Job {
   @@index([batchId])
 }
 
-// Site user. Registration is gated by a local captcha (no chat.z.ai tokens
-// are ever collected from users); AI requests are proxied through chat.z.ai
-// (see src/lib/chatweb.ts) using the owner's ZAI_JWT or a guest session.
+// Site user. Registration is gated by Z.ai's own server captcha (the same
+// Aliyun slider widget chat.z.ai uses — relayed to the user, solved by the
+// user, verified by chat.z.ai). We never collect Z.ai tokens and never ask
+// for the owner's JWT: each user gets their own anonymous Z.ai session whose
+// quota is consumed by Z.ai. AI requests are proxied through chat.z.ai
+// (see src/lib/chatweb.ts).
 model User {
   id            String         @id @default(cuid())
   email         String         @unique
   passwordHash  String
   name          String         @default("")
+  zaiToken      String? // anonymous chat.z.ai session token minted for this user
+  zaiUserId     String? // chat.z.ai session user id (for the signature)
+  zaiSessionAt  DateTime? // when the session was last (re)minted
   createdAt     DateTime       @default(now())
   conversations Conversation[]
-}
-
-// One-time captcha challenge for registration (10-minute TTL, single-use).
-// Stored in the DB so it survives serverless instances (Vercel-safe).
-model Captcha {
-  id        String   @id @default(cuid())
-  answer    String
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-
-  @@index([expiresAt])
 }
 
 // A chat thread with the persistent AI architect (Manus-style agent)

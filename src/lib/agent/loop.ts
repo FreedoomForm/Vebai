@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { buildSystemPrompt } from './prompt'
 import { executeTool, isToolName, messageToDTO, type ToolName } from './tools'
 import type { AgentEvent, MessageDTO, PlanStepDTO, ToolCallDTO } from './types'
+import type { ChatWebTransport } from '@/lib/chatweb'
 
 const MAX_ITERATIONS = 8
 const HISTORY_LIMIT = 40
@@ -14,10 +15,25 @@ interface LLMMessage {
   content: string
 }
 
+/** Error carrying a machine-readable transport code out of streamLLM. */
+export class TransportError extends Error {
+  code: string
+  constructor(message: string, code: string) {
+    super(message)
+    this.code = code
+  }
+}
+
 /* ------------------------------------------------------- LLM stream utils */
 
-/** parse the Z.ai OpenAI-compatible SSE stream into content deltas */
-async function* streamLLM(messages: LLMMessage[]): AsyncGenerator<string> {
+/** parse the Z.ai OpenAI-compatible SSE stream into content deltas.
+ * Throws TransportError('captcha_required') when Z.ai demands its captcha —
+ * the turn is aborted BEFORE any assistant content and the UI relays
+ * Z.ai's own widget, then retries the same message. */
+async function* streamLLM(
+  messages: LLMMessage[],
+  transport?: ChatWebTransport,
+): AsyncGenerator<string> {
   const body = await zai.streamChat(
     {
       messages,
@@ -25,6 +41,7 @@ async function* streamLLM(messages: LLMMessage[]): AsyncGenerator<string> {
       thinking: { type: 'disabled' },
       temperature: 0.5,
     },
+    transport,
   )
   if (!body || typeof body.getReader !== 'function')
     throw new Error('LLM вернул нестриминговый ответ')
@@ -46,9 +63,18 @@ async function* streamLLM(messages: LLMMessage[]): AsyncGenerator<string> {
         if (!payload || payload === '[DONE]') continue
         try {
           const chunk = JSON.parse(payload)
+          if (chunk?.error) {
+            throw new TransportError(
+              String(chunk.error.message || 'Z.ai error').slice(0, 300),
+              String(chunk.error.code || 'chatweb_error'),
+            )
+          }
           const delta: string = chunk?.choices?.[0]?.delta?.content ?? ''
           if (delta) yield delta
-        } catch { /* partial JSON line — skip */ }
+        } catch (e) {
+          if (e instanceof TransportError) throw e
+          /* partial JSON line — skip */
+        }
       }
     }
   } finally {
@@ -203,28 +229,46 @@ async function persistAssistantMessage(
 
 /* -------------------------------------------------------------- main loop */
 
+export interface AgentTurnOptions {
+  /** per-user chat.z.ai session token (see getUserZaiSession) */
+  zaiSessionToken?: string | null
+  /** one-time captcha_verify_param relayed from the user's Z.ai widget */
+  captchaVerifyParam?: string
+  /** captcha retry: the user message is already persisted — don't duplicate */
+  skipUserMessage?: boolean
+}
+
 export async function runAgentTurn(
   conversationId: string,
   userContent: string,
   emit: Emit,
+  opts?: AgentTurnOptions,
 ): Promise<void> {
-  // 1. persist + emit the user message
-  const userMsg = await db.message.create({
-    data: { conversationId, role: 'user', kind: 'text', content: userContent },
-  })
-  const userDto = messageToDTO(userMsg)
-  emit({ type: 'start', conversationId, userMessage: userDto })
+  // 1. persist + emit the user message (skipped on captcha retry — the
+  // original message is already in the history, a duplicate would confuse
+  // both the model and the transcript)
+  if (!opts?.skipUserMessage) {
+    const userMsg = await db.message.create({
+      data: { conversationId, role: 'user', kind: 'text', content: userContent },
+    })
+    const userDto = messageToDTO(userMsg)
+    emit({ type: 'start', conversationId, userMessage: userDto })
 
-  // auto-title the conversation from its first user message
-  const conv = await db.conversation.findUnique({ where: { id: conversationId } })
-  if (conv && conv.title === 'Новый диалог') {
-    const title = userContent.replace(/\s+/g, ' ').trim().slice(0, 48) || 'Новый диалог'
-    await db.conversation.update({ where: { id: conversationId }, data: { title } })
-    emit({ type: 'title', conversationId, title })
+    // auto-title the conversation from its first user message
+    const conv = await db.conversation.findUnique({ where: { id: conversationId } })
+    if (conv && conv.title === 'Новый диалог') {
+      const title = userContent.replace(/\s+/g, ' ').trim().slice(0, 48) || 'Новый диалог'
+      await db.conversation.update({ where: { id: conversationId }, data: { title } })
+      emit({ type: 'title', conversationId, title })
+    }
   }
 
   const systemPrompt = buildSystemPrompt()
   const toolLog: ToolCallDTO[] = []
+  const transport: ChatWebTransport = {
+    sessionToken: opts?.zaiSessionToken ?? undefined,
+    captchaVerifyParam: opts?.captchaVerifyParam || undefined,
+  }
 
   try {
     for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -235,10 +279,18 @@ export async function runAgentTurn(
       const trimmed = history.slice(-HISTORY_LIMIT)
       const llmMessages = mapHistory(trimmed, systemPrompt)
 
-      // 2. stream the model reply, hiding the tool block from the user
+      // 2. stream the model reply, hiding the tool block from the user.
+      // Subsequent iterations reuse the SAME one-time captcha param? No —
+      // it is single-use; but the param gates the REQUEST, and within one
+      // upstream SSE stream the model may run several internal tool rounds,
+      // so only the first LLM call per turn needs it. Tool-round iterations
+      // here issue new upstream requests — Z.ai may demand the captcha
+      // again; then the turn stops and the UI relays the widget.
       let full = ''
       let emitted = 0
-      for await (const delta of streamLLM(llmMessages)) {
+      const iterTransport: ChatWebTransport =
+        iter === 0 ? transport : { sessionToken: transport.sessionToken }
+      for await (const delta of streamLLM(llmMessages, iterTransport)) {
         full += delta
         const idx = full.toLowerCase().indexOf('```tool')
         const visible = idx >= 0 ? full.slice(0, idx).replace(/\s+$/, '') : full
@@ -312,6 +364,14 @@ export async function runAgentTurn(
     emit({ type: 'message', message: msg })
     emit({ type: 'done' })
   } catch (e) {
+    // Z.ai demands its captcha: abort cleanly BEFORE any assistant content.
+    // The UI relays Z.ai's own widget, the user solves it, and the same
+    // message is retried with the fresh one-time param.
+    if (e instanceof TransportError && e.code === 'captcha_required') {
+      emit({ type: 'captcha_required' })
+      emit({ type: 'done' })
+      return
+    }
     const msg = e instanceof Error ? e.message : String(e)
     emit({ type: 'error', message: msg.slice(0, 400) })
     try {

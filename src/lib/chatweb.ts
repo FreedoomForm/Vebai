@@ -13,10 +13,17 @@
  * The public API of this module emits OpenAI-compatible SSE chunks
  * (`choices[0].delta.content`), so the agent loop stays unchanged.
  *
- * Captcha note: anonymous guest sessions are rate-limited by an Aliyun
- * captcha on chat.z.ai (FRONTEND_CAPTCHA_REQUIRED). Real accounts used via
- * ZAI_JWT are not affected. When the captcha is required we surface a clear,
- * actionable error message.
+ * Captcha relay (verified live 2026-10): anonymous guest sessions must pass
+ * Z.ai's server captcha — Aliyun Captcha 2.0 — on EVERY chat completions.
+ * The server answers with {code: FRONTEND_CAPTCHA_REQUIRED, captcha_error_type:
+ * 'missing_param'} until the request carries a one-time `captcha_verify_param`.
+ * That param is produced by Aliyun's own slider widget which chat.z.ai's
+ * frontend loads from o.alicdn.com with SceneId 'didk33e0' (their main scene;
+ * Aliyun does NOT bind it to the chat.z.ai domain — verified: the widget
+ * renders and passes on foreign domains, and chat.z.ai accepts the resulting
+ * param). We therefore relay Z.ai's OWN captcha to our users: the user solves
+ * it, we forward the param, chat.z.ai verifies it — no owner JWT, no homemade
+ * captcha. One param = one request (reuse fails with verify_code F018).
  *
  * Agent tools: the chat.z.ai agent keeps its OWN toolbelt (z.ai web SDK —
  * web search etc.); we enable its auto web search so answers come with
@@ -31,6 +38,14 @@ const SIGNING_SECRET = 'key-@@@@)))()((9))-xxxx&&&%%%%%'
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
 
 export const DEFAULT_CHATWEB_MODEL = process.env.ZAI_CHATWEB_MODEL || 'glm-4.7'
+
+/** Transport extras threaded from /api/chat down to the completions call. */
+export interface ChatWebTransport {
+  /** per-user anonymous chat.z.ai session token (guest JWT) */
+  sessionToken?: string | null
+  /** one-time Aliyun captcha_verify_param relayed from the user's widget */
+  captchaVerifyParam?: string
+}
 
 export class ChatWebError extends Error {
   code: string
@@ -230,10 +245,15 @@ async function createChatRecord(session: ChatWebSession, model: string, prompt: 
 function mapUpstreamError(err: { detail?: unknown; code?: unknown; error_code?: unknown }): ChatWebError {
   const code = String(err.code ?? err.error_code ?? '')
   const detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail ?? err)
+  if (code.includes('FRONTEND_CAPTCHA_REQUIRED'))
+    return new ChatWebError(
+      'Z.ai требует подтверждение капчи для этой сессии.',
+      'captcha_required',
+    )
   if (code.includes('CAPTCHA') || /captcha/i.test(detail))
     return new ChatWebError(
-      'Z.ai требует капчу для анонимных гостевых сессий. Решение: задай ZAI_JWT (токен аккаунта владельца chat.z.ai) в переменных окружения Vercel — см. README, раздел «Прокси chat.z.ai».',
-      'captcha_required',
+      'Капча Z.ai не прошла проверку. Реши капчу ещё раз и повтори сообщение.',
+      'captcha_failed',
     )
   if (/user level/i.test(detail) || code === '403')
     return new ChatWebError(
@@ -266,6 +286,7 @@ async function* upstreamEvents(
   session: ChatWebSession,
   prompt: string,
   model: string,
+  captchaVerifyParam?: string,
 ): AsyncGenerator<{ data: UpstreamEventData }> {
   const timestampMs = String(Date.now())
   const requestId = crypto.randomUUID()
@@ -299,7 +320,9 @@ async function* upstreamEvents(
     current_user_message_id: crypto.randomUUID(),
     current_user_message_parent_id: null,
     background_tasks: { title_generation: false, tags_generation: false },
-    captcha_verify_param: '',
+    // one-time Aliyun captcha param relayed from the user's widget;
+    // empty string = server answers FRONTEND_CAPTCHA_REQUIRED (missing_param)
+    captcha_verify_param: captchaVerifyParam || '',
     stream_options: { include_usage: true },
   }
 
@@ -365,13 +388,19 @@ function openaiChunk(delta: { content?: string }, finish: string | null = null):
 }
 
 /** Streaming chat via chat.z.ai -> OpenAI-compatible SSE chunks.
- * Uses the site-wide ZAI_JWT (owner account) or an anonymous guest session. */
+ * Session: explicit transport token (per-user guest session) → site-wide
+ * ZAI_JWT (owner, optional) → fresh anonymous guest. The captcha param is
+ * relayed as-is; without it Z.ai demands the captcha (the UI catches the
+ * typed error and pops Z.ai's own widget). */
 export async function chatWebStream(
   messages: PlainMessage[],
-  opts?: { model?: string },
+  opts?: { model?: string; transport?: ChatWebTransport },
 ): Promise<ReadableStream<Uint8Array>> {
   const model = opts?.model || DEFAULT_CHATWEB_MODEL
-  const session = await resolveSession(process.env.ZAI_JWT || null)
+  const session = await resolveSession(
+    opts?.transport?.sessionToken ?? process.env.ZAI_JWT ?? null,
+  )
+  const captchaVerifyParam = opts?.transport?.captchaVerifyParam || ''
   const prompt = renderPrompt(messages)
   if (!prompt) throw new ChatWebError('Пустой промпт', 'empty_prompt')
   const enc = new TextEncoder()
@@ -381,7 +410,7 @@ export async function chatWebStream(
         try { controller.enqueue(enc.encode(s)) } catch { /* closed */ }
       }
       try {
-        for await (const { data } of upstreamEvents(session, prompt, model)) {
+        for await (const { data } of upstreamEvents(session, prompt, model, captchaVerifyParam)) {
           if (data.error) throw mapUpstreamError(data.error)
           const phase = data.phase || 'answer'
           if (phase === 'other') continue
@@ -395,12 +424,17 @@ export async function chatWebStream(
         push('data: [DONE]\n\n')
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
+        const code = e instanceof ChatWebError ? e.code : 'chatweb_error'
         push(
           `data: ${JSON.stringify({
-            error: { message: msg },
+            error: { message: msg, code },
           })}\n\n`,
         )
-        push(openaiChunk({ content: `\n\n[Ошибка Z.ai-прокси: ${msg.slice(0, 300)}]` }, 'stop'))
+        if (code !== 'captcha_required') {
+          // captcha is not an assistant-visible failure — the UI will relay
+          // Z.ai's own widget and retry; everything else surfaces inline
+          push(openaiChunk({ content: `\n\n[Ошибка Z.ai-прокси: ${msg.slice(0, 300)}]` }, 'stop'))
+        }
         push('data: [DONE]\n\n')
       } finally {
         try { controller.close() } catch { /* already closed */ }
@@ -409,16 +443,19 @@ export async function chatWebStream(
   })
 }
 
-/** Non-streaming chat via chat.z.ai (collects the stream). */
+/** Non-streaming chat via chat.z.ai (collects the stream).
+ * Transport errors (captcha_required, captcha_failed, upstream…) are THROWN
+ * as ChatWebError with the machine code — never swallowed into the content. */
 export async function chatWebComplete(
   messages: PlainMessage[],
-  opts?: { model?: string },
+  opts?: { model?: string; transport?: ChatWebTransport },
 ): Promise<{ choices: { message: { content: string } }[] }> {
   const stream = await chatWebStream(messages, opts)
   const reader = stream.getReader()
   const dec = new TextDecoder()
   let buf = ''
   let out = ''
+  let firstError: ChatWebError | null = null
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
@@ -433,11 +470,22 @@ export async function chatWebComplete(
         const payload = t.slice(5).trim()
         if (!payload || payload === '[DONE]') continue
         try {
-          const chunk = JSON.parse(payload) as { choices?: { delta?: { content?: string } }[] }
+          const chunk = JSON.parse(payload) as {
+            error?: { message?: string; code?: string }
+            choices?: { delta?: { content?: string } }[]
+          }
+          if (chunk.error && !firstError) {
+            firstError = new ChatWebError(
+              String(chunk.error.message || 'Z.ai error').slice(0, 300),
+              String(chunk.error.code || 'chatweb_error'),
+            )
+            continue
+          }
           out += chunk?.choices?.[0]?.delta?.content || ''
         } catch { /* ignore */ }
       }
     }
   }
+  if (firstError) throw firstError
   return { choices: [{ message: { content: out } }] }
 }

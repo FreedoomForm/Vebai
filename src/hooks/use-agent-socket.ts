@@ -82,14 +82,26 @@ export function useAgentSocket(handlers: Handlers) {
     }
   }, [useSocket])
 
-  const send = useCallback((conversationId: string | null, content: string) => {
-    const socket = socketRef.current
-    if (useSocket && socket?.connected) {
-      socket.emit('chat:send', { conversationId: conversationId || undefined, content })
-      return true
-    }
-    return false // agent-app falls back to POST /api/chat (SSE)
-  }, [useSocket])
+  const send = useCallback(
+    (
+      conversationId: string | null,
+      content: string,
+      opts?: { captchaVerifyParam?: string; resume?: boolean },
+    ) => {
+      const socket = socketRef.current
+      if (useSocket && socket?.connected) {
+        socket.emit('chat:send', {
+          conversationId: conversationId || undefined,
+          content,
+          captchaVerifyParam: opts?.captchaVerifyParam,
+          resume: opts?.resume,
+        })
+        return true
+      }
+      return false // agent-app falls back to POST /api/chat (SSE)
+    },
+    [useSocket],
+  )
 
   const subscribe = useCallback((conversationId: string | null) => {
     const socket = socketRef.current

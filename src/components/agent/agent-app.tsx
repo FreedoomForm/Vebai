@@ -14,6 +14,7 @@ import { ActivityPanel } from './activity-panel'
 import { Composer } from './composer'
 import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
+import { solveZaiCaptcha, preloadZaiCaptcha } from './zai-captcha'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
 
 interface SessionUser {
@@ -160,6 +161,13 @@ export function AgentApp() {
         }
         break
       }
+      case 'captcha_required': {
+        // Z.ai demands its own captcha for this request — solve it invisibly
+        // (smart verification) or via the slider, then retry the same message
+        console.info('[agent] Z.ai captcha required — relaying widget')
+        void resendRef.current?.()
+        break
+      }
       case 'done': {
         sendingRef.current = false
         setSending(false)
@@ -235,25 +243,31 @@ export function AgentApp() {
 
   /* -------------------------------------------------------------- sending */
 
+  const lastSentRef = useRef<{ content: string } | null>(null)
+  const resendRef = useRef<(() => void) | null>(null)
+
   const handleSend = useCallback(
-    (content: string) => {
+    (content: string, opts?: { captchaVerifyParam?: string; resume?: boolean }) => {
       if (sendingRef.current || !content.trim()) return
       sendingRef.current = true
       setSending(true)
       stickToBottomRef.current = true
+      if (!opts?.resume) lastSentRef.current = { content }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: 'temp-user',
-          role: 'user',
-          kind: 'text',
-          content,
-          createdAt: new Date().toISOString(),
-        },
-      ])
+      if (!opts?.resume) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: 'temp-user',
+            role: 'user',
+            kind: 'text',
+            content,
+            createdAt: new Date().toISOString(),
+          },
+        ])
+      }
 
-      const viaSocket = send(activeIdRef.current, content)
+      const viaSocket = send(activeIdRef.current, content, opts)
       if (!viaSocket) {
         // HTTP fallback: read the SSE stream directly
         void (async () => {
@@ -261,7 +275,12 @@ export function AgentApp() {
             const res = await fetch('/api/chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ conversationId: activeIdRef.current, content }),
+              body: JSON.stringify({
+                conversationId: activeIdRef.current,
+                content,
+                captchaVerifyParam: opts?.captchaVerifyParam,
+                resume: opts?.resume,
+              }),
             })
             const cid = res.headers.get('X-Conversation-Id')
             if (cid && cid !== activeIdRef.current) {
@@ -299,6 +318,33 @@ export function AgentApp() {
     },
     [send, onEvent, loadConversations],
   )
+
+  /* ------------------------------------------------- Z.ai captcha relay */
+  // When Z.ai demands its server captcha, solve it in the browser (usually an
+  // invisible smart-pass; worst case a slider) and retry the same message.
+  useEffect(() => {
+    resendRef.current = () => {
+      const last = lastSentRef.current
+      if (!last) return
+      void (async () => {
+        try {
+          const param = await solveZaiCaptcha()
+          if (param) handleSend(last.content, { captchaVerifyParam: param, resume: true })
+        } catch (e) {
+          onEvent({
+            type: 'error',
+            message: e instanceof Error ? e.message : 'капча Z.ai не прошла',
+          })
+          onEvent({ type: 'done' })
+        }
+      })()
+    }
+  }, [handleSend, onEvent])
+
+  useEffect(() => {
+    // warm the widget SDK so the first verification starts instantly
+    preloadZaiCaptcha()
+  }, [])
 
   /* --------------------------------------------------------- conversation */
 

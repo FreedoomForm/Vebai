@@ -30,3 +30,4 @@ prisma/*.db
 
 # typescript
 *.tsbuildinfo
+.pgembed/
