@@ -64,9 +64,9 @@ const SUGGESTIONS = [
 ]
 
 const GALLERY = [
-  { grad: 'from-stone-800 via-stone-700 to-stone-900', label: 'Лендинг для продукта' },
-  { grad: 'from-emerald-200 via-teal-100 to-stone-100', label: 'Мини-игра' },
-  { grad: 'from-amber-100 via-stone-100 to-stone-200', label: 'Личный блог' },
+  { grad: 'from-stone-800 via-stone-700 to-stone-900', label: 'Лендинг для продукта', dark: true },
+  { grad: 'from-emerald-600 via-teal-600 to-emerald-800', label: 'Мини-игра', dark: true },
+  { grad: 'from-amber-500 via-orange-600 to-amber-700', label: 'Личный блог', dark: true },
 ]
 
 export function AgentApp() {
@@ -704,7 +704,7 @@ export function AgentApp() {
               g.grad,
             )}
           >
-            <span className="text-[12px] font-medium text-white drop-shadow group-hover:text-white">
+            <span className="text-[12px] font-medium text-white drop-shadow-sm">
               {g.label}
             </span>
           </button>
