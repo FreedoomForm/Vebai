@@ -84,6 +84,20 @@ REST-клиент Kaggle API (без Python/CLI) + LLM через **прокси
 
 ## Деплой на Vercel
 
+> ### ✅ Текущий статус деплоя (выполнено через Vercel API)
+>
+> | Шаг | Состояние |
+> |---|---|
+> | Проект Vercel | `vebai` (аккаунт `afotimabegim-2706`) — https://vebai-six.vercel.app |
+> | Postgres | `vebai-postgres` (Supabase Free, регион eu-central-1, `store_fM3dyjNBWiFDv4gF`), подключён к проекту |
+> | `DATABASE_URL` | задан (pooled `pgbouncer=true` — для рантайма) |
+> | `KAGGLE_API_TOKEN` | задан (`KGAT_…`, аккаунт freedomform) |
+> | Схема БД | `npx prisma db push` выполнен против продовой базы |
+> | Git-интеграция | `FreedoomForm/Vebai` → main; каждый пуш = автодеплой |
+> | Deployment Protection | отключена (сайт публичный) |
+>
+> Дальнейшие изменения деплоятся автоматически при пуше в `main`.
+
 1. **База данных** — создай Postgres (Neon, Vercel Marketplace → Neon, или
    Supabase) и скопируй connection string.
 2. **Импорт репозитория** — Vercel → Add New Project → импортируй `Vebai`
