@@ -13,11 +13,9 @@ import { useEffect, useRef, useState } from 'react'
 const SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js'
 const SCENES: Record<string, string> = { chat: 'didk33e0', auth: '36qgs6xb' }
 
-declare global {
-  interface Window {
-    AliyunCaptchaConfig?: { region: string; prefix: string }
-    initAliyunCaptcha?: (o: Record<string, unknown>) => void
-  }
+type LabCaptchaWindow = Window & {
+  AliyunCaptchaConfig?: { region: string; prefix: string }
+  initAliyunCaptcha?: (o: Record<string, unknown>) => void
 }
 
 export default function CaptchaLab() {
@@ -30,7 +28,8 @@ export default function CaptchaLab() {
 
   useEffect(() => {
     keyRef.current = new URLSearchParams(window.location.search).get('k') || ''
-    window.AliyunCaptchaConfig = { region: 'sgp', prefix: 'no8xfe' }
+    const w = window as LabCaptchaWindow
+    w.AliyunCaptchaConfig = { region: 'sgp', prefix: 'no8xfe' }
     const s = document.createElement('script')
     s.src = SDK_URL
     s.onload = () => setReady('sdk ready')
@@ -39,14 +38,15 @@ export default function CaptchaLab() {
   }, [])
 
   const run = () => {
+    const w = window as LabCaptchaWindow
     const mount = mountRef.current
-    if (!mount || !window.initAliyunCaptcha) return
+    if (!mount || !w.initAliyunCaptcha) return
     mount.innerHTML = ''
     const el = document.createElement('div')
     el.id = 'lab-el'
     mount.appendChild(el)
     setReady(`solving ${scene}/${mode}…`)
-    window.initAliyunCaptcha({
+    w.initAliyunCaptcha({
       SceneId: SCENES[scene],
       mode: 'popup',
       element: '#lab-el',
