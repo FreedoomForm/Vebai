@@ -36,7 +36,16 @@
 import crypto from 'node:crypto'
 
 const BASE = process.env.ZAI_CHATWEB_BASE_URL || 'https://chat.z.ai'
-const FE_VERSION = 'prod-fe-1.0.272'
+/** X-FE-Version candidates, newest first. Z.ai's Aliyun WAF now blocks
+ * requests whose X-FE-Version is not the CURRENT frontend build (verified
+ * live 2026-10: prod-fe-1.0.272 => 405 WAF challenge page, prod-fe-1.1.98
+ * => 200). When Z.ai ships a new build, we detect the 405 and retry with
+ * the other candidates — ZAI_FE_VERSION env var overrides for hotfixes. */
+const FE_VERSIONS = [
+  process.env.ZAI_FE_VERSION,
+  'prod-fe-1.1.98', // current chat.z.ai build (index-BEIsjDOv.js)
+  'prod-fe-1.0.272', // previous build some older sessions were pinned to
+].filter((v): v is string => Boolean(v))
 const SIGNING_SECRET = 'key-@@@@)))()((9))-xxxx&&&%%%%%'
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
 
@@ -534,6 +543,46 @@ interface UpstreamEventData {
   error?: { detail?: unknown; code?: unknown; error_code?: unknown }
 }
 
+/** POST the signed completions request. Tries each X-FE-Version candidate;
+ * a 405 whose body is an Aliyun WAF HTML page means "stale client version"
+ * (Z.ai's WAF rejects old builds) — retry the next candidate. */
+async function openCompletionsStream(
+  session: ChatWebSession,
+  url: string,
+  body: string,
+  signature: string,
+): Promise<Response> {
+  let lastWafRes: Response | null = null
+  for (const feVersion of FE_VERSIONS) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        ...commonHeaders(),
+        Authorization: `Bearer ${session.token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'X-Signature': signature,
+        'X-FE-Version': feVersion,
+        'X-Device-Id': crypto.randomUUID(),
+        'X-Region': 'overseas',
+      },
+      body,
+      signal: AbortSignal.timeout(600_000),
+    })
+    if (res.status === 405) {
+      // Aliyun WAF challenge page = this X-FE-Version is no longer accepted
+      const head = await res.text().catch(() => '')
+      if (/aliyun|errors\.aliyun|<!doctype/i.test(head.slice(0, 400))) {
+        lastWafRes = res
+        continue // try the next candidate version
+      }
+      return res // genuine 405 from the API itself — surface it
+    }
+    return res
+  }
+  return lastWafRes!
+}
+
 /** Low-level: open the signed v2 SSE stream and yield raw upstream events.
  * Two kinds are yielded: {data} for chat:completion (phased content) and
  * {status} for the agent's activity updates (type:'status'). */
@@ -554,7 +603,7 @@ async function* upstreamEvents(
     stream: true,
     model,
     messages: [{ role: 'user', content: prompt }],
-    signature_prompt: prompt.slice(0, 500),
+    signature_prompt: prompt,
     params: {},
     extra: {},
     features: agent
@@ -589,6 +638,7 @@ async function* upstreamEvents(
     },
     chat_id: recordId,
     id: crypto.randomUUID(),
+    session_id: session.userId,
     current_user_message_id: crypto.randomUUID(),
     current_user_message_parent_id: null,
     background_tasks: { title_generation: false, tags_generation: false },
@@ -601,26 +651,17 @@ async function* upstreamEvents(
   }
 
   const url = `${BASE}/api/v2/chat/completions?${fingerprintQuery(session, requestId, timestampMs)}&signature_timestamp=${timestampMs}`
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      ...commonHeaders(),
-      Authorization: `Bearer ${session.token}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-      'X-Signature': signature,
-      'X-FE-Version': FE_VERSION,
-      'X-Device-Id': crypto.randomUUID(),
-      'X-Region': 'overseas',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(600_000),
-  })
+  const res = await openCompletionsStream(session, url, JSON.stringify(body), signature)
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => '')
     let parsed: { detail?: unknown; code?: unknown } | null = null
     try { parsed = JSON.parse(txt) } catch { /* raw text */ }
     if (parsed && (parsed.code || parsed.detail)) throw mapUpstreamError(parsed as never)
+    if (/aliyun|errors\.aliyun|<!doctype/i.test(txt.slice(0, 400)))
+      throw new ChatWebError(
+        'Z.ai обновила защиту своего сайта (WAF) и временно отклоняет запросы нашего сервера. Мы уже адаптируемся — попробуй ещё раз через несколько минут.',
+        'waf_blocked',
+      )
     throw new ChatWebError(`chat.z.ai completions ${res.status}: ${txt.slice(0, 200)}`, 'http_error')
   }
 

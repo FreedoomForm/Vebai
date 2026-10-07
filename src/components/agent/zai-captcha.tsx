@@ -127,6 +127,7 @@ function ensureSdk(): Promise<void> {
     window.AliyunCaptchaConfig = { region: REGION, prefix: PREFIX }
     if (window.initAliyunCaptcha) {
       ensureDom()
+      localizeSdkChrome()
       resolve()
       return
     }
@@ -138,6 +139,7 @@ function ensureSdk(): Promise<void> {
       setTimeout(() => {
         try {
           ensureDom()
+          localizeSdkChrome()
           resolve()
         } catch (e) {
           reject(e instanceof Error ? e : new Error(String(e)))
@@ -147,6 +149,30 @@ function ensureSdk(): Promise<void> {
     document.head.appendChild(s)
   })
   return window.__zaiCaptchaSdkReady
+}
+
+/** The SDK hardcodes Chinese aria-labels on its popup header buttons
+ * (关闭验证 = «закрыть проверку», 刷新验证码 = «обновить капчу») — they are
+ * NOT part of the upLang language pack. Patch them (and any future ones
+ * the SDK injects) with a body-wide observer so screen readers and
+ * hover titles show Russian instead of Chinese. */
+function localizeSdkChrome(): void {
+  if (typeof document === 'undefined' || (window as { __zaiCaptchaChromeRu?: boolean }).__zaiCaptchaChromeRu) return
+  ;(window as { __zaiCaptchaChromeRu?: boolean }).__zaiCaptchaChromeRu = true
+  const patch = () => {
+    const close = document.getElementById('aliyunCaptcha-btn-close')
+    if (close && close.getAttribute('aria-label') !== 'Закрыть проверку') {
+      close.setAttribute('aria-label', 'Закрыть проверку')
+      close.setAttribute('title', 'Закрыть')
+    }
+    const refresh = document.getElementById('aliyunCaptcha-btn-refresh')
+    if (refresh && refresh.getAttribute('aria-label') !== 'Обновить задание') {
+      refresh.setAttribute('aria-label', 'Обновить задание')
+      refresh.setAttribute('title', 'Обновить')
+    }
+  }
+  patch()
+  new MutationObserver(patch).observe(document.body, { childList: true, subtree: true })
 }
 
 /**
