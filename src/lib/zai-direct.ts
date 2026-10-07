@@ -13,15 +13,18 @@
  *   - every user's session/quota is naturally their own (their browser,
  *     their JWT, their limits).
  *
- * CAPTCHA (v11, settled by live probes): Aliyun binds every captcha solve
- * to the domains registered in chat.z.ai's scene config. A param solved on
- * a foreign domain (ours) is ALWAYS rejected by their backend with
- * "The captcha verification failed" — even when the widget showed green in
- * the same browser that sends the request (payload byte-identical to their
- * frontend, scene/prefix/region identical). So there is NO captcha flow
- * here anymore: Z.ai accounts are created/logged-in ON chat.z.ai (their
- * page, their domain) and connected via the token bridge — see
- * auth-screen.tsx / zai-link-card.tsx.
+ * CAPTCHA (v12, live-probed): when Z.ai's risk engine demands a captcha on
+ * chat completions it answers {code: FRONTEND_CAPTCHA_REQUIRED}. Their own
+ * frontend then pops the Aliyun Captcha 2.0 widget IN-PAGE and retries with
+ * the one-time captcha_verify_param. The scene is HOSTNAME-CONDITIONAL in
+ * their bundle:
+ *     SceneId = hostname === 'chat.z.ai' ? 'didk33e0' : 'xswyjefn'
+ * i.e. Z.ai officially ships a foreign-domain scene (xswyjefn, region sgp,
+ * prefix no8xfe, popup mode). Live probe on our domain: the widget loads,
+ * issues a certifyId and returns verdicts — the scene accepts foreign
+ * hostnames (an F015 verdict is a headless-client risk block, NOT a domain
+ * rejection). So solveChatCaptcha() below replicates their BN() flow
+ * byte-for-byte: hidden trigger -> popup -> solve -> param -> retry.
  *
  * Signing: chat.z.ai signs completions with a double HMAC-SHA256 whose
  * secret ships in their public bundle (`key-@@@@...)`). Here it runs via
@@ -73,8 +76,7 @@ const LS_DEVICE = 'vebai_zai_device_id'
 
 export function getStoredJwt(): string | null {
   try {
-    const t = localStorage.getItem(LS_JWT)
-    return t && !isGuestToken(t) ? t : null
+    return localStorage.getItem(LS_JWT)
   } catch {
     return null
   }
@@ -135,10 +137,13 @@ function commonHeaders(): Record<string, string> {
 }
 
 /**
- * Refresh a session JWT (sliding expiry) or mint a guest one.
- * Guard: a REAL token must never come back as a guest session.
+ * Refresh a session JWT (sliding expiry).
+ * Guard (silent-downgrade): a REAL token must never come back as a guest
+ * session — that means the account JWT died. A PERSONAL (guest-class)
+ * session refreshing into a guest session is the normal sliding path.
  */
 export async function refreshSession(userToken: string): Promise<ZaiSession> {
+  const wasGuest = isGuestToken(userToken)
   const res = await fetch(`${ZAI_BASE}/api/v1/auths/`, {
     headers: { ...commonHeaders(), Authorization: `Bearer ${userToken}` },
   })
@@ -146,8 +151,10 @@ export async function refreshSession(userToken: string): Promise<ZaiSession> {
     const txt = await res.text().catch(() => '')
     if (res.status === 401)
       throw new ZaiDirectError(
-        'Сессия chat.z.ai недействительна (401). Подключи аккаунт заново (кнопка «Z.ai»).',
-        'zai_session_expired',
+        wasGuest
+          ? 'Личная сессия Z.ai истекла — обновляю…'
+          : 'Сессия chat.z.ai недействительна (401). Подключи аккаунт заново (кнопка «Z.ai»).',
+        wasGuest ? 'personal_session_expired' : 'zai_session_expired',
       )
     throw new ZaiDirectError(`chat.z.ai auth ${res.status}: ${txt.slice(0, 160)}`, 'auth_failed')
   }
@@ -158,7 +165,7 @@ export async function refreshSession(userToken: string): Promise<ZaiSession> {
     email?: string
     role?: string
   }
-  if (GUEST_EMAIL_RE.test(String(data.email || ''))) {
+  if (!wasGuest && GUEST_EMAIL_RE.test(String(data.email || ''))) {
     throw new ZaiDirectError(
       'Сессия chat.z.ai истекла — аккаунт подключён, но токен устарел. Подключи аккаунт заново (кнопка «Z.ai»).',
       'zai_session_expired',
@@ -173,17 +180,52 @@ export async function refreshSession(userToken: string): Promise<ZaiSession> {
   }
 }
 
-/** Resolve the session for chatting: stored real JWT → refresh → persist. */
+/**
+ * Resolve the session for chatting: the stored token (personal or real) →
+ * refresh → persist the sliding value. A dead PERSONAL token is re-minted
+ * transparently (fresh personal quota bucket); a dead REAL token throws
+ * zai_session_expired.
+ */
 async function resolveChatSession(): Promise<ZaiSession> {
   const stored = getStoredJwt()
-  if (!stored)
+  if (!stored) {
+    // v12: the browser may not have received the personal token yet
+    // (e.g. this turn is the first after an old login) — the caller
+    // (agent-app) passes it from /api/chat/start; without any token we
+    // cannot chat
     throw new ZaiDirectError(
-      'Гостевой режим отключён: сообщения идут только с подключённого аккаунта Z.ai. Нажми «Z.ai» внизу слева и подключи свой аккаунт — это твоя личная квота, без капчи в чате.',
+      'Личная сессия Z.ai ещё не подключена — отправь сообщение ещё раз, она подключится автоматически.',
       'zai_not_linked',
     )
-  const session = await refreshSession(stored)
-  setStoredJwt(session.token) // sliding refresh
-  return session
+  }
+  try {
+    const session = await refreshSession(stored)
+    setStoredJwt(session.token) // sliding refresh
+    return session
+  } catch (e) {
+    if (e instanceof ZaiDirectError && e.code === 'personal_session_expired') {
+      // re-mint a fresh personal session (guest mint: no auth header)
+      const res = await fetch(`${ZAI_BASE}/api/v1/auths/`, { headers: commonHeaders() })
+      if (!res.ok) throw new ZaiDirectError(`chat.z.ai auth ${res.status}`, 'auth_failed')
+      const data = (await res.json()) as {
+        token: string
+        id: string
+        name?: string
+        email?: string
+        role?: string
+      }
+      const fresh: ZaiSession = {
+        token: data.token,
+        userId: data.id,
+        name: data.name || 'User',
+        email: data.email || '',
+        role: data.role || 'user',
+      }
+      setStoredJwt(fresh.token)
+      return fresh
+    }
+    throw e
+  }
 }
 
 /* ---------------------------------------------------------------- signing */
@@ -389,14 +431,12 @@ function mapUpstreamError(err: { detail?: unknown; code?: unknown; error_code?: 
   const detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail ?? err)
   if (code.includes('FRONTEND_CAPTCHA_REQUIRED'))
     return new ZaiDirectError(
-      'Z.ai требует капчу для этой сессии. Капча Z.ai проходит только на их домене: открой один раз ' +
-        'chat.z.ai в новой вкладке (можно просто открыть страницу), затем вернись и повтори сообщение.',
+      'Z.ai просит короткую проверку — реши её во всплывающем окне (та же капча, что и на chat.z.ai), и сообщение уйдёт автоматически.',
       'captcha_required',
     )
   if (code.includes('CAPTCHA') || /captcha/i.test(detail))
     return new ZaiDirectError(
-      'Z.ai отклонил проверку капчи: капча принимается только на их собственном домене. ' +
-        'Подключи/обнови аккаунт Z.ai (кнопка «Z.ai» внизу слева) — с подключённым аккаунтом капча в чате не нужна.',
+      'Z.ai отклонил проверку капчи. Попробуй отправить сообщение ещё раз — при повторном требовании капчи реши её аккуратно во всплывающем окне.',
       'captcha_failed',
     )
   if (/user level/i.test(detail) || code === '403')
@@ -674,7 +714,153 @@ export async function chatTurn(opts: ChatOptions): Promise<string> {
   }
 }
 
-/* ------------------------------------------------------------------ attach */
+/* ------------------------------------------------------------------ captcha */
+
+// v12 debug/automation hook (also lets support drive the flow manually)
+if (typeof window !== 'undefined') {
+  ;(window as unknown as Record<string, unknown>).__solveChatCaptcha = () => solveChatCaptcha()
+}
+
+/**
+ * In-page Z.ai chat captcha (v12) — a byte-level replica of chat.z.ai's own
+ * BN()/ohe()/she() flow from their public bundle (prod-fe-1.1.98):
+ *   - window.AliyunCaptchaConfig = { region: 'sgp', prefix: 'no8xfe' }
+ *   - load https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js
+ *   - hidden element `#chat-captcha-element` + trigger `#chat-captcha-trigger`
+ *   - initAliyunCaptcha({ SceneId: hostname==='chat.z.ai' ? 'didk33e0'
+ *     : 'xswyjefn', mode: 'popup', ... }) and click the trigger
+ *   - the success event (the whole object, exactly like their code) is the
+ *     captcha_verify_param that gets attached to the retried completions.
+ * The popup is solved by the REAL user in OUR page — no navigation.
+ */
+export function solveChatCaptcha(): Promise<unknown> {
+  const w = window as unknown as {
+    AliyunCaptchaConfig?: { region: string; prefix: string }
+    initAliyunCaptcha?: (cfg: Record<string, unknown>) => void
+  }
+  return new Promise((resolve, reject) => {
+    const ensureDom = () => {
+      if (!document.getElementById('chat-captcha-element')) {
+        const el = document.createElement('div')
+        el.id = 'chat-captcha-element'
+        el.style.cssText =
+          'position:absolute;left:-99999px;top:-99999px;width:0;height:0;overflow:hidden;pointer-events:none;'
+        document.body.appendChild(el)
+      }
+      if (!document.getElementById('chat-captcha-trigger')) {
+        const b = document.createElement('button')
+        b.id = 'chat-captcha-trigger'
+        b.style.display = 'none'
+        document.body.appendChild(b)
+      }
+    }
+    const CAPTCHA_SDK_ERR = () =>
+      new ZaiDirectError('Не удалось загрузить капчу Z.ai — отправь сообщение ещё раз', 'captcha_sdk_failed')
+    const loadSdk = () =>
+      new Promise<void>((res, rej) => {
+        // AliyunCaptcha.js defines window.initAliyunCaptcha ASYNCHRONOUSLY
+        // after the script's load event (it pulls sub-resources first) —
+        // poll until it appears; a plain post-load check races and hangs.
+        const poll = () => {
+          const t0 = Date.now()
+          const tick = () => {
+            if (w.initAliyunCaptcha) return res()
+            if (Date.now() - t0 > 12_000) return rej(CAPTCHA_SDK_ERR())
+            setTimeout(tick, 100)
+          }
+          tick()
+        }
+        if (w.initAliyunCaptcha) return res()
+        w.AliyunCaptchaConfig = { region: 'sgp', prefix: 'no8xfe' }
+        const SRC = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js'
+        const existing = document.querySelector(`script[src="${SRC}"]`)
+        if (existing) {
+          poll() // tag already there (maybe mid-load) — poll for the global
+          return
+        }
+        const s = document.createElement('script')
+        s.src = SRC
+        s.addEventListener('load', poll)
+        s.addEventListener('error', () => rej(CAPTCHA_SDK_ERR()))
+        document.head.appendChild(s)
+      })
+
+    void (async () => {
+      try {
+        ensureDom()
+        await loadSdk()
+        if (!w.initAliyunCaptcha) throw new ZaiDirectError('initAliyunCaptcha missing', 'captcha_sdk_failed')
+        const lang = (navigator.language || 'en').toLowerCase().startsWith('zh') ? 'cn' : 'en'
+        let settled = false
+        const callbacks = {
+          success: (e: unknown) => {
+            settled = true
+            resolve(e)
+          },
+          fail: () => {
+            // risk verdict failed (e.g. suspicious client) — keep the popup
+            // usable: refresh + re-show, exactly like their fail handler
+            try {
+              document.getElementById('chat-captcha-trigger')?.click()
+            } catch { /* noop */ }
+          },
+          onError: () => {
+            if (!settled) reject(new ZaiDirectError('Сервис капчи Z.ai недоступен', 'captcha_error'))
+          },
+          onClose: () => {
+            if (!settled)
+              reject(new ZaiDirectError('Проверка отменена — отправь сообщение ещё раз', 'captcha_cancelled'))
+          },
+        }
+        const cfg = {
+          SceneId: location.hostname === 'chat.z.ai' ? 'didk33e0' : 'xswyjefn',
+          mode: 'popup',
+          element: '#chat-captcha-element',
+          button: '#chat-captcha-trigger',
+          captchaLogoImg: 'https://z-cdn.chatglm.cn/z-ai/static/logo.svg',
+          ...(lang === 'cn'
+            ? {
+                upLang: {
+                  cn: {
+                    START_VERIFY: '点击开始验证',
+                    POPUP_TITLE: '请完成安全验证',
+                    SLIDE_TIP: '请按住滑块，拖动到最右边',
+                  },
+                },
+              }
+            : {}),
+          language: lang,
+          timeout: 10000,
+          delayBeforeSuccess: false,
+          ...callbacks,
+        }
+        // The SDK defines window.initAliyunCaptcha slightly BEFORE its
+        // internal assets are ready — an early init() call is silently
+        // swallowed. Retry init+trigger until the widget actually renders.
+        let attempt = 0
+        const tryInit = () => {
+          if (settled) return
+          attempt += 1
+          console.info('[captcha] init attempt', attempt, { sdk: typeof w.initAliyunCaptcha })
+          try {
+            w.initAliyunCaptcha?.({ ...cfg })
+            document.getElementById('chat-captcha-trigger')?.click()
+          } catch (e) { console.warn('[captcha] init threw', e) }
+          setTimeout(() => {
+            if (settled) return
+            const rendered = document.querySelector('[id^="aliyunCaptcha"]')
+            if (!rendered && attempt < 5) tryInit()
+            else if (!rendered)
+              reject(new ZaiDirectError('Капча Z.ai не открылась — отправь сообщение ещё раз', 'captcha_error'))
+          }, 3000)
+        }
+        tryInit()
+      } catch (e) {
+        reject(e instanceof ZaiDirectError ? e : new ZaiDirectError(String(e), 'captcha_error'))
+      }
+    })()
+  })
+}
 
 /**
  * Attach a freshly obtained REAL session to the site account: persist the

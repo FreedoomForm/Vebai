@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
 import { messageToDTO } from '@/lib/agent/tools'
-import { isGuestToken } from '@/lib/zai-direct'
+import { ensureUserZaiSession } from '@/lib/zai-session'
 import type { PlainMessage } from '@/lib/zai-direct'
 
 export const dynamic = 'force-dynamic'
@@ -10,16 +10,18 @@ export const dynamic = 'force-dynamic'
 const HISTORY_LIMIT = 40
 
 /**
- * POST /api/chat/start — persist the user's turn and hand the transcript to
- * the browser, which then talks to chat.z.ai DIRECTLY (v10 browser-direct).
+ * POST /api/chat/start — persist the user's turn and hand the transcript
+ * PLUS the user's OWN Z.ai session to the browser, which then talks to
+ * chat.z.ai DIRECTLY (v10 browser-direct, v12 personal sessions).
  *
  * The server stays out of the AI path: no proxying, no captcha relay, no
- * 300s cap. Its job: account policy (guest mode removed — a linked REAL
- * Z.ai account is required), conversation/message persistence, history.
+ * 300s cap. Its job: resolve/refresh the user's PERSONAL Z.ai session
+ * (minted automatically at registration — own quota, zero navigation),
+ * conversation/message persistence, history.
  *
  * Body: { conversationId?, content }
- * -> { conversationId, userMessage, history: [{role, content}...] }
- * Errors: 400 zai_not_linked | zai_session_expired (typed, UI opens the link card)
+ * -> { conversationId, userMessage, history, zai: { token, kind, email } }
+ * Errors: 400 zai_unavailable | zai_session_expired (typed)
  */
 export async function POST(req: NextRequest) {
   const { user, unauthorized } = await requireAuth(req)
@@ -38,20 +40,18 @@ export async function POST(req: NextRequest) {
   if (!content)
     return NextResponse.json({ error: 'content is required' }, { status: 400 })
 
-  // ---- policy: guest mode removed — a real linked Z.ai account required
-  const dbUser = await db.user.findUnique({
-    where: { id: user.id },
-    select: { zaiToken: true },
-  })
-  if (!dbUser?.zaiToken || isGuestToken(dbUser.zaiToken))
+  // ---- policy (v12): every user owns a PERSONAL Z.ai session — resolve it
+  // (refreshed sliding; minted automatically when missing/expired)
+  let zaiSession: Awaited<ReturnType<typeof ensureUserZaiSession>>
+  try {
+    zaiSession = await ensureUserZaiSession(user.id)
+  } catch (e) {
+    const code = e instanceof Error && 'code' in e ? String((e as { code?: string }).code) : 'zai_unavailable'
     return NextResponse.json(
-      {
-        error:
-          'Гостевой режим отключён: сообщения идут только с подключённого аккаунта Z.ai. Нажми «Z.ai» внизу слева и подключи свой аккаунт — это твоя личная квота, без капчи в чате.',
-        code: 'zai_not_linked',
-      },
+      { error: e instanceof Error ? e.message.slice(0, 300) : 'Z.ai сессия недоступна', code },
       { status: 400 },
     )
+  }
 
   // ---- scope + adopt legacy conversations
   if (conversationId) {
@@ -99,5 +99,7 @@ export async function POST(req: NextRequest) {
     userMessage: messageToDTO(userMsg),
     ...(titleEmitted ? { title: titleEmitted } : {}),
     history: plain,
+    // the user's own session — the browser chats under THEIR quota
+    zai: { token: zaiSession.token, kind: zaiSession.kind, email: zaiSession.email },
   })
 }

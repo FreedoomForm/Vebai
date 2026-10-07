@@ -16,7 +16,7 @@ import { Composer, type Effort, type SendOptions } from './composer'
 import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
 import { ZaiLinkCard } from './zai-link-card'
-import { chatTurn, type PlainMessage } from '@/lib/zai-direct'
+import { chatTurn, setStoredJwt, solveChatCaptcha, type PlainMessage } from '@/lib/zai-direct'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
 
 interface SessionUser {
@@ -33,6 +33,7 @@ interface StreamState {
   text: string
   tools: (ToolCallDTO & { id: string })[]
   plan?: { title?: string; steps: { title: string; status: 'pending' | 'active' | 'done' }[] }
+  note?: string
 }
 
 /* --------------------------------------------------------------- models */
@@ -246,9 +247,15 @@ export function AgentApp() {
         break
       }
       case 'captcha_required': {
-        // v10: handled inside runTurn (solve in-browser → retry in-place);
+        // v12: handled inside runTurn (in-page popup captcha → retry);
         // legacy socket path may still emit it — nothing to do
         console.info('[agent] Z.ai captcha required (legacy event)')
+        break
+      }
+      case 'notice': {
+        // v12: progress notes from the captcha flow (no silent waiting)
+        console.info('[agent]', evt.text)
+        setStream((s) => ({ text: '', tools: [], ...(s || {}), note: evt.text }))
         break
       }
       case 'done': {
@@ -275,9 +282,9 @@ export function AgentApp() {
         console.error('[agent]', evt.message, evt.code || '')
         // visible failure — no more silent "nothing happened"
         setErrorMsg({ message: evt.message, code: evt.code })
-        if (evt.code === 'zai_session_expired' || evt.code === 'zai_not_linked') {
+        if (evt.code === 'zai_session_expired') {
           setZaiLinked(false)
-          setLinkReason(evt.code === 'zai_not_linked' ? '' : evt.message)
+          setLinkReason(evt.message)
           setLinkOpen(true)
         }
         break
@@ -373,12 +380,16 @@ export function AgentApp() {
           userMessage?: MessageDTO
           title?: string
           history?: PlainMessage[]
+          zai?: { token?: string; kind?: 'personal' | 'real' | 'none'; email?: string }
         }
         if (!res.ok || !data.conversationId || !data.userMessage) {
           const err = new Error(data.error || `chat start ${res.status}`) as Error & { code?: string }
           err.code = data.code
           throw err
         }
+        // v12: the user's OWN Z.ai session (personal, auto-minted) — stash it
+        // so chatTurn() signs completions under THIS user's quota
+        if (data.zai?.token) setStoredJwt(data.zai.token)
         convId = data.conversationId
         if (convId !== activeIdRef.current) {
           setActiveId(convId)
@@ -397,34 +408,51 @@ export function AgentApp() {
         return
       }
 
-      // 2) the browser talks to chat.z.ai directly (v11: no captcha retry —
-      //    a param solved on our domain is always rejected by their risk
-      //    engine, so a captcha demand is surfaced as an honest error)
+      // 2) the browser talks to chat.z.ai directly under the user's OWN
+      //    session. If their risk engine demands a captcha, the SAME popup
+      //    chat.z.ai's own frontend uses (foreign-domain scene xswyjefn)
+      //    is solved in-page — then the turn retries once with the param.
       let answer = ''
       const activities: { name: string; summary: string }[] = []
+      const turnHandlers = {
+        onDelta: (text: string) => onEvent({ type: 'delta', text }),
+        onActivity: (a: { id: string; name: string; args?: Record<string, unknown>; done: boolean; summary?: string }) => {
+          if (a.done) {
+            activities.push({ name: a.name, summary: a.summary || '' })
+            onEvent({ type: 'tool_result', id: a.id, status: 'ok', summary: a.summary || '' })
+          } else {
+            onEvent({ type: 'tool', id: a.id, call: { name: a.name, args: a.args || {}, status: 'running' } })
+          }
+        },
+      }
       try {
-        answer = await chatTurn({
-          messages: history,
-          model,
-          webSearch,
-          effort,
-          handlers: {
-            onDelta: (text) => onEvent({ type: 'delta', text }),
-            onActivity: (a) => {
-              if (a.done) {
-                activities.push({ name: a.name, summary: a.summary || '' })
-                onEvent({ type: 'tool_result', id: a.id, status: 'ok', summary: a.summary || '' })
-              } else {
-                onEvent({ type: 'tool', id: a.id, call: { name: a.name, args: a.args || {}, status: 'running' } })
-              }
-            },
-          },
-        })
-      } catch (e) {
-        const err = e as Error & { code?: string }
-        onEvent({ type: 'error', message: err.message.slice(0, 300), code: err.code })
-        onEvent({ type: 'done' })
-        return
+        answer = await chatTurn({ messages: history, model, webSearch, effort, handlers: turnHandlers })
+      } catch (firstErr) {
+        const err = firstErr as Error & { code?: string }
+        if (err.code !== 'captcha_required') {
+          onEvent({ type: 'error', message: err.message.slice(0, 300), code: err.code })
+          onEvent({ type: 'done' })
+          return
+        }
+        // ---- in-page captcha (no navigation): solve → retry once
+        onEvent({ type: 'notice', text: 'Z.ai просит короткую проверку — реши её во всплывающем окне…' })
+        try {
+          const captchaParam = await solveChatCaptcha()
+          onEvent({ type: 'notice', text: 'Проверка пройдена — повторяю запрос…' })
+          answer = await chatTurn({
+            messages: history,
+            model,
+            webSearch,
+            effort,
+            captchaVerifyParam: captchaParam as never,
+            handlers: turnHandlers,
+          })
+        } catch (retryErr) {
+          const rerr = retryErr as Error & { code?: string }
+          onEvent({ type: 'error', message: rerr.message.slice(0, 300), code: rerr.code })
+          onEvent({ type: 'done' })
+          return
+        }
       }
 
       // 3) persist the answer
@@ -716,11 +744,11 @@ export function AgentApp() {
               'rounded px-2 py-1 text-[11px] border',
               zaiLinked
                 ? 'border-emerald-200 text-emerald-700 hover:bg-emerald-50'
-                : 'border-amber-300 text-amber-700 hover:bg-amber-50',
+                : 'border-stone-300 text-stone-600 hover:bg-stone-100',
             )}
-            title={zaiLinked ? 'Аккаунт Z.ai подключён' : 'Аккаунт Z.ai не подключён — нажми и подключи свой аккаунт'}
+            title={zaiLinked ? 'Аккаунт Z.ai подключён' : 'Личная сессия Z.ai подключена автоматически — нажми, чтобы подключить полноценный аккаунт'}
           >
-            {zaiLinked ? 'Z.ai ✓' : 'Z.ai ⚠'}
+            {zaiLinked ? 'Z.ai ✓' : 'Z.ai'}
           </button>
           <button
             onClick={() => void logout()}
@@ -869,7 +897,7 @@ export function AgentApp() {
               ))}
 
               {/* live stream segment */}
-              {stream && (stream.text.trim() || stream.tools.length > 0 || stream.plan) && (
+              {stream && (stream.note || stream.text.trim() || stream.tools.length > 0 || stream.plan) && (
                 <div className="flex gap-3">
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-stone-200 bg-stone-900">
                     <Sparkles className="h-4 w-4 text-white" />
@@ -908,6 +936,12 @@ export function AgentApp() {
                         )}
                       </div>
                     ))}
+                    {stream.note && !stream.text.trim() && (
+                      <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />
+                        <span className="text-[13px] text-amber-800">{stream.note}</span>
+                      </div>
+                    )}
                     {stream.text.trim() && (
                       <div className="text-[15px] leading-relaxed text-stone-800 whitespace-pre-wrap break-words">
                         {stream.text}
@@ -1019,7 +1053,7 @@ export function AgentApp() {
             <DialogDescription className="text-[12px] text-stone-500">
               {zaiLinked
                 ? 'Подключён твой аккаунт chat.z.ai — сообщения идут на твоей личной квоте.'
-                : 'Без своего аккаунта Z.ai чат не работает: подключи аккаунт — сообщения пойдут на твоей личной квоте, без капчи.'}
+                : 'Сейчас чат работает на твоей личной сессии Z.ai (подключена автоматически). Здесь можно дополнительно подключить полноценный аккаунт chat.z.ai — больше квота и сохранение истории на их стороне.'}
             </DialogDescription>
           </DialogHeader>
           <ZaiLinkCard

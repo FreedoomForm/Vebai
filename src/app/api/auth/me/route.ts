@@ -16,12 +16,17 @@ export async function GET(req: NextRequest) {
     where: { id: user.id },
     select: { zaiToken: true },
   })
+  const token = row?.zaiToken || null
+  const real = isRealZaiToken(token)
   return NextResponse.json({
     user: { id: user.id, email: user.email, name: user.name },
     authRequired: true,
     model: DEFAULT_CHATWEB_MODEL,
-    // true only when a REAL chat.z.ai account session is attached (a stored
-    // guest JWT is just the user's own anonymous chat session, not a link)
-    zaiLinked: isRealZaiToken(row?.zaiToken),
+    // zaiKind: 'real' — an actual chat.z.ai account attached (bridge/paste);
+    // 'personal' — the auto-minted dedicated session (own quota, default);
+    // 'none' — not yet minted (lazily minted on the first message)
+    zaiKind: real ? 'real' : token ? 'personal' : 'none',
+    // kept for compatibility with older clients
+    zaiLinked: real,
   })
 }

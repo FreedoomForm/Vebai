@@ -1,20 +1,20 @@
 /**
- * Per-user REAL chat.z.ai accounts only — guest mode is REMOVED (v5).
+ * Per-user Z.ai sessions (v12) — personal quota, ZERO navigation.
  *
- * Every user must chat under their OWN linked chat.z.ai account: the JWT
- * lives on the User row and all AI traffic consumes THEIR OWN Z.ai quota.
- * Anonymous/guest sessions (shared quota, per-message captcha, silent
- * "nothing happened" failures) no longer exist.
+ * Every site user automatically owns a DEDICATED chat.z.ai session, minted
+ * server-side at registration (GET /api/v1/auths/ without auth → a fresh
+ * anonymous session whose free quota belongs to THIS user alone). The token
+ * lives on the User row and all AI traffic consumes that personal quota —
+ * the user never leaves our site.
  *
- * - No linked account (or only a stale per-user guest token on the row)
- *   -> throws ChatWebError code `zai_not_linked`; the UI opens the
- *   "Подключить аккаунт Z.ai" card.
- * - A linked real JWT that died (long inactivity) -> `zai_session_expired`;
- *   the dead JWT is KEPT on the row (it marks account ownership) and the UI
- *   opens the same card for a re-login.
- *
- * resolveSession() refreshes a still-valid JWT via GET /auths/ (sliding
- * expiry) and persists the refreshed token back to the row.
+ * Session kinds:
+ *   - `personal` — auto-minted dedicated session (default for everyone).
+ *     Dead/expired personal tokens are transparently re-minted: a personal
+ *     session is ours, replacing it costs nothing but a fresh quota bucket.
+ *   - `real` — an actual chat.z.ai account session the user attached later
+ *     (token bridge / paste). Silent-downgrade guard: a real token is NEVER
+ *     overwritten by a personal one, and a dead real token surfaces
+ *     `zai_session_expired` instead of being silently swapped.
  */
 
 import { db } from '@/lib/db'
@@ -22,16 +22,20 @@ import { ChatWebError, peekZaiJwtEmail, resolveSession, type ChatWebSession } fr
 
 const GUEST_EMAIL_RE = /^guest-\d+@guest\.com$/i
 
+export type ZaiSessionKind = 'personal' | 'real'
+
 export interface UserZaiSession {
   token: string
   zaiUserId: string
-  role: string
-  /** true when resolveSession refreshed the stored token during this call */
-  refreshed: boolean
+  email: string
+  kind: ZaiSessionKind
 }
 
-async function persist(userId: string | null, session: ChatWebSession): Promise<void> {
-  if (!userId) return
+function isGuestEmail(email: string): boolean {
+  return !email || GUEST_EMAIL_RE.test(email)
+}
+
+async function persist(userId: string, session: ChatWebSession): Promise<void> {
   try {
     await db.user.update({
       where: { id: userId },
@@ -46,43 +50,81 @@ async function persist(userId: string | null, session: ChatWebSession): Promise<
   }
 }
 
-function notLinked(): ChatWebError {
+/** Server cannot reach chat.z.ai right now (WAF / outage / rate limit). */
+export function zaiUnavailable(detail = ''): ChatWebError {
   return new ChatWebError(
-    'Гостевой режим отключён: сообщения идут только с подключённого аккаунта Z.ai. Нажми «Z.ai» внизу слева и подключи свой аккаунт — это твоя личная квота, без капчи в чате.',
-    'zai_not_linked',
+    `Z.ai сейчас недоступен для подключения личной сессии${detail ? ` (${detail})` : ''}. Попробуй ещё раз через минуту — диалоги сохранены.`,
+    'zai_unavailable',
   )
 }
 
 /**
- * Resolve the chat.z.ai session for a site user. Throws (never falls back to
- * a guest session): `zai_not_linked` when no real account is attached,
- * `zai_session_expired` when the stored JWT died.
+ * Resolve (and if needed mint) the chat.z.ai session for a site user.
+ * Never falls back to a shared pool: the returned session belongs to this
+ * user only. Throws ChatWebError with typed codes:
+ *   zai_session_expired (dead REAL account) | zai_unavailable (z.ai unreachable)
  */
-export async function getUserZaiSession(userId: string | null | undefined): Promise<UserZaiSession> {
-  if (!userId) throw notLinked()
+export async function ensureUserZaiSession(
+  userId: string | null | undefined,
+): Promise<UserZaiSession> {
+  if (!userId) throw zaiUnavailable('нет пользователя')
+
   const user = await db.user.findUnique({
     where: { id: userId },
     select: { zaiToken: true },
   })
-  if (!user?.zaiToken) throw notLinked()
-  const storedEmail = peekZaiJwtEmail(user.zaiToken)
-  if (!storedEmail || GUEST_EMAIL_RE.test(storedEmail)) {
-    // a stored guest token is a leftover of the removed guest mode —
-    // it is NOT a linked account
-    throw notLinked()
+  const stored = user?.zaiToken || ''
+  const storedEmail = stored ? peekZaiJwtEmail(stored) : ''
+  const storedIsReal = Boolean(stored) && !isGuestEmail(storedEmail)
+
+  // ---- REAL linked account: use it, never silently downgrade
+  if (storedIsReal) {
+    try {
+      const session = await resolveSession(stored)
+      if (isGuestEmail(session.email))
+        throw new ChatWebError(
+          'Сессия chat.z.ai истекла — аккаунт подключён, но токен устарел. Перелогинься (кнопка «Аккаунт Z.ai»).',
+          'zai_session_expired',
+        )
+      if (session.token !== stored) await persist(userId, session)
+      return { token: session.token, zaiUserId: session.userId, email: session.email, kind: 'real' }
+    } catch (e) {
+      if (e instanceof ChatWebError) throw e
+      throw new ChatWebError(
+        'Сессия chat.z.ai истекла — аккаунт подключён, но токен устарел. Перелогинься (кнопка «Аккаунт Z.ai»).',
+        'zai_session_expired',
+      )
+    }
   }
+
+  // ---- PERSONAL dedicated session: refresh the live one or mint a fresh one
+  if (stored) {
+    try {
+      const session = await resolveSession(stored)
+      if (session.token !== stored) await persist(userId, session)
+      return {
+        token: session.token,
+        zaiUserId: session.userId,
+        email: session.email,
+        kind: 'personal',
+      }
+    } catch {
+      // dead personal token — fall through and mint a new one
+    }
+  }
+
+  let fresh: ChatWebSession
   try {
-    const session = await resolveSession(user.zaiToken)
-    // resolveSession may refresh the token — persist the latest
-    if (session.token !== user.zaiToken) await persist(userId, session)
-    return { token: session.token, zaiUserId: session.userId, role: session.role, refreshed: false }
+    fresh = await resolveSession(null) // no auth -> dedicated anonymous session
   } catch (e) {
-    // stored real JWT died — KEEP it on the row (it marks account ownership
-    // and blocks the silent-downgrade overwrite) and surface a typed error
-    if (e instanceof ChatWebError) throw e
-    throw new ChatWebError(
-      'Сессия chat.z.ai истекла — аккаунт подключён, но токен устарел. Перелогинься (кнопка «Аккаунт Z.ai»).',
-      'zai_session_expired',
-    )
+    if (e instanceof ChatWebError) throw zaiUnavailable(e.code)
+    throw zaiUnavailable()
   }
+  if (!isGuestEmail(fresh.email)) {
+    // sanity: an unauthenticated mint must be guest-class; a non-guest
+    // answer would mean their API changed — do not persist it
+    throw zaiUnavailable('неожиданный ответ auths/')
+  }
+  await persist(userId, fresh)
+  return { token: fresh.token, zaiUserId: fresh.userId, email: fresh.email, kind: 'personal' }
 }

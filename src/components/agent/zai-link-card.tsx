@@ -81,10 +81,9 @@ export function ZaiLinkCard({
     <div className="space-y-3">
       {reason && <p className="text-[12px] leading-relaxed text-amber-600">{reason}</p>}
       <p className="text-[12px] leading-relaxed text-stone-500">
-        Чат работает только с подключённым аккаунтом: <span className="text-stone-800">свой
-        настоящий аккаунт chat.z.ai</span> — это твоя личная квота Z.ai, без капчи на каждое
-        сообщение. Капча Z.ai принимается только на их домене, поэтому аккаунт создаётся на их
-        странице и подключается сюда за один клик.
+        Чат уже работает на твоей <span className="text-stone-800">персональной сессии Z.ai</span>{" "}
+        (подключена автоматически, своя бесплатная квота). Полноценный аккаунт chat.z.ai даёт
+        увеличенную квоту и синхронизацию истории на их стороне — подключается за пару шагов.
       </p>
 
       {/* CREATE — on Z.ai's own page */}
@@ -166,7 +165,13 @@ export function ZaiLinkCard({
       )}
       {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
 
-      {/* guest mode is removed — the account link is required, no dismiss */}
+      {/* guest mode is removed — the account link is OPTIONAL now */}
+      <button
+        onClick={onLinked}
+        className="w-full rounded-xl px-3 py-1.5 text-[12px] text-stone-500 hover:text-stone-800"
+      >
+        Продолжить на персональной сессии
+      </button>
     </div>
   )
 }

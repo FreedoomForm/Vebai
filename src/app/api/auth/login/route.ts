@@ -6,23 +6,20 @@ import {
   sessionCookieHeader,
   verifyPassword,
 } from '@/lib/auth'
-import { isRealZaiToken, resolveSession } from '@/lib/chatweb'
+import { isRealZaiToken } from '@/lib/chatweb'
+import { ensureUserZaiSession } from '@/lib/zai-session'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/auth/login — local credential check, then attach the stored
- * Z.ai session if it is still alive (v4: login is NEVER blocked by Z.ai).
+ * POST /api/auth/login — local credential check, then resolve the user's
+ * Z.ai session (v12: never blocks login).
  *
  * Flow:
  *  1. local scrypt hash check → issue our cookie — the user is in;
- *  2. stored Z.ai JWT still alive? refresh it silently (best-effort);
- *  3. dead JWT → respond with zaiSession:'expired' — the user still enters
- *     the app and sees the reconnect card (their messages continue on a
- *     guest session until they reconnect their own Z.ai account).
- *
- * Re-linking a dead Z.ai session (email+password behind Z.ai's captcha)
- * lives in POST /api/auth/link — one concern, one route.
+ *  2. resolve the Z.ai session: REAL account → sliding refresh (dead real
+ *     JWT surfaces 'expired', the in-app card re-links it); otherwise the
+ *     PERSONAL session is refreshed/minted automatically (own quota).
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -46,22 +43,24 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Неверный email или пароль' }, { status: 401 })
   }
 
-  // silently refresh the stored Z.ai session when possible.
-  // A stored GUEST token is the user's per-user anonymous chat session —
-  // keep it (chat history continuity) but do NOT report it as a linked
-  // account; only a real-account JWT counts as 'linked'.
-  const storedIsReal = isRealZaiToken(user.zaiToken)
-  let zaiSession: 'linked' | 'expired' | 'none' = storedIsReal ? 'expired' : 'none'
-  if (storedIsReal) {
+  // v12: resolve the Z.ai session for this user.
+  // A REAL account JWT refreshes silently; anything else gets/refreshes the
+  // PERSONAL dedicated session (minted server-side, own quota).
+  let zaiSession: 'linked' | 'personal' | 'expired' | 'none' = 'none'
+  if (isRealZaiToken(user.zaiToken)) {
     try {
-      const session = await resolveSession(user.zaiToken)
-      await db.user.update({
-        where: { id: user.id },
-        data: { zaiToken: session.token, zaiUserId: session.userId, zaiSessionAt: new Date() },
-      })
-      zaiSession = 'linked'
+      const s = await ensureUserZaiSession(user.id)
+      zaiSession = s.kind === 'real' ? 'linked' : 'personal'
     } catch {
-      /* dead real JWT — the in-app card will re-link it */
+      zaiSession = 'expired' // dead real JWT — the in-app card re-links it
+    }
+  } else {
+    try {
+      await ensureUserZaiSession(user.id) // refresh/mint the personal session
+      zaiSession = 'personal'
+    } catch {
+      // Z.ai unreachable — lazily retried on the first message
+      zaiSession = 'none'
     }
   }
 

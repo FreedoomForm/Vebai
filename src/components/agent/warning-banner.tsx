@@ -32,8 +32,9 @@ export function WarningBanner() {
       <p className="flex-1 text-[11px] leading-relaxed text-amber-800/90">
         ИИ-запросы выполняет <span className="font-medium text-amber-900">агент chat.z.ai (Z.ai)</span> — режим
         «Агент»: веб-поиск, генерация изображений, работа с файлами и кодом — под{' '}
-        <span className="font-medium text-amber-900">твоим собственным аккаунтом Z.ai</span>, на твою личную квоту
-        (email/пароль работают и на chat.z.ai). Сервис неофициальный и не аффилирован с Z.ai.
+        <span className="font-medium text-amber-900">твоей персональной сессией Z.ai</span>, на твою личную
+        бесплатную квоту. Всё внутри сайта: если Z.ai попросит проверку, она решается во всплывающем окне
+        здесь же. Неофициальный клиент, не аффилирован с Z.ai.
       </p>
       <button
         aria-label="Скрыть предупреждение"

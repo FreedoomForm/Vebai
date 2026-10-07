@@ -13,19 +13,17 @@
  * The public API of this module emits OpenAI-compatible SSE chunks
  * (`choices[0].delta.content`), so the agent loop stays unchanged.
  *
- * Captcha (settled by live probes 2026-10): anonymous guest sessions must
- * pass Z.ai's server captcha — Aliyun Captcha 2.0 — on EVERY chat
- * completions. The server answers with {code: FRONTEND_CAPTCHA_REQUIRED,
- * captcha_error_type: 'missing_param'} until the request carries a one-time
- * `captcha_verify_param`. CRITICAL (v11): Aliyun binds each solve to the
- * domains registered in chat.z.ai's scene config — a param solved on any
- * foreign domain is ALWAYS rejected ("The captcha verification failed"),
- * even when the widget showed green and the same browser re-sent the
- * request with a byte-identical payload. Because of that there is NO
- * captcha relay anywhere in vebai anymore: guest mode is removed, and Z.ai
- * accounts are created/logged-in on chat.z.ai itself and connected via the
- * token bridge (see auth-screen.tsx / zai-link-card.tsx). This module keeps
- * only the server-side session helpers (resolveSession / paste parsing)
+ * Captcha (v12): chat completions for a session the Z.ai risk engine does
+ * not yet trust answer {code: FRONTEND_CAPTCHA_REQUIRED} until the request
+ * carries a one-time `captcha_verify_param`. Z.ai's own frontend solves it
+ * IN-PAGE via Aliyun Captcha 2.0 with a hostname-conditional scene
+ * (chat.z.ai -> didk33e0, any other domain -> xswyjefn); the solve and the
+ * retry happen in the user's browser (see solveChatCaptcha() in
+ * zai-direct.ts). Server-side callers (this module) cannot solve captchas —
+ * structuring calls here are therefore best-effort with graceful fallbacks.
+ * Sessions: every site user owns a PERSONAL session minted server-side
+ * (see zai-session.ts); a REAL chat.z.ai account can optionally be
+ * attached via the token bridge (zai-link-card.tsx).
  * used by /api/auth/google/claim and /api/auth/zai/attach.
  *
  * Agent mode (default): chats are created with type 'general_agent' on an
