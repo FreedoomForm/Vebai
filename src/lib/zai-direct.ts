@@ -1,0 +1,825 @@
+/**
+ * BROWSER-DIRECT chat.z.ai client (v10).
+ *
+ * Byte-level live checks (2026-10) proved chat.z.ai's API answers with
+ * PERMISSIVE CORS: `access-control-allow-origin: <any origin>` +
+ * `access-control-allow-credentials: true` and a preflight whitelist that
+ * includes `authorization, x-signature, x-fe-version`. That means the
+ * USER'S BROWSER can talk to chat.z.ai directly — exactly like chat.z.ai's
+ * own frontend does:
+ *
+ *   - the Aliyun captcha widget runs in the browser AND the request that
+ *     carries its one-time param is sent from the SAME browser/IP —
+ *     the proven same-client flow of chat.z.ai itself (the server relay
+ *     previously mixed a user-browser solve with a Vercel-IP submit);
+ *   - no Vercel datacenter IP in the AI path at all: no WAF blocks, no
+ *     shared rate limits, no 300s function cap on long agent turns;
+ *   - every user's session/quota is naturally their own (their browser,
+ *     their JWT, their limits).
+ *
+ * Signing: chat.z.ai signs completions with a double HMAC-SHA256 whose
+ * secret ships in their public bundle (`key-@@@@...)`). Here it runs via
+ * WebCrypto — same bytes as the server implementation in chatweb.ts.
+ *
+ * Silent-downgrade guard (ported from chatweb.ts): a stale/revoked Bearer
+ * does NOT 401 on GET /auths/ — it silently mints a GUEST session. We
+ * detect that by comparing JWT identities and throw `zai_session_expired`
+ * so a dead session can never masquerade as a linked account.
+ */
+
+export const ZAI_BASE = 'https://chat.z.ai'
+
+/** chat.z.ai's current frontend build — the WAF rejects older versions. */
+const FE_VERSIONS = ['prod-fe-1.1.98', 'prod-fe-1.0.272']
+
+const SIGNING_SECRET = 'key-@@@@)))()((9))-xxxx&&&%%%%%'
+
+const GUEST_EMAIL_RE = /^guest-\d+@guest\.com$/i
+
+/** Agent-capable models (capabilities.agent_mode on chat.z.ai). */
+const AGENT_MODEL_RE = /x-preview|glm-5|GLM-5/i
+export function isAgentModel(model: string): boolean {
+  return AGENT_MODEL_RE.test(model)
+}
+
+/* ------------------------------------------------------------- jwt utils */
+
+export function peekJwtEmail(token: string): string {
+  try {
+    const pl = token.split('.')[1] || ''
+    const json = JSON.parse(atob(pl.replace(/-/g, '+').replace(/_/g, '/')))
+    return String(json.email || '')
+  } catch {
+    return ''
+  }
+}
+
+export function isGuestToken(token: string | null | undefined): boolean {
+  if (!token) return true
+  const email = peekJwtEmail(token)
+  return !email || GUEST_EMAIL_RE.test(email)
+}
+
+/* --------------------------------------------------------------- storage */
+
+const LS_JWT = 'vebai_zai_jwt'
+const LS_DEVICE = 'vebai_zai_device_id'
+
+export function getStoredJwt(): string | null {
+  try {
+    const t = localStorage.getItem(LS_JWT)
+    return t && !isGuestToken(t) ? t : null
+  } catch {
+    return null
+  }
+}
+
+export function setStoredJwt(token: string): void {
+  try {
+    localStorage.setItem(LS_JWT, token)
+  } catch { /* private mode */ }
+}
+
+export function clearStoredJwt(): void {
+  try {
+    localStorage.removeItem(LS_JWT)
+  } catch { /* noop */ }
+}
+
+/** Stable per-browser device id (chat.z.ai sends X-Device-Id per request). */
+export function deviceId(): string {
+  try {
+    let id = localStorage.getItem(LS_DEVICE)
+    if (!id) {
+      id = crypto.randomUUID()
+      localStorage.setItem(LS_DEVICE, id)
+    }
+    return id
+  } catch {
+    return crypto.randomUUID()
+  }
+}
+
+/* ---------------------------------------------------------------- errors */
+
+export class ZaiDirectError extends Error {
+  code: string
+  constructor(message: string, code = 'zai_error') {
+    super(message)
+    this.code = code
+  }
+}
+
+function mapAuthError(status: number, txt: string): ZaiDirectError {
+  let detail = txt
+  try {
+    const j = JSON.parse(txt) as { detail?: unknown }
+    if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+  } catch { /* raw text */ }
+  const short = detail.slice(0, 180)
+  if (/verification token/i.test(detail))
+    return new ZaiDirectError(
+      'Z.ai не принял код из письма (invalid verification token) — проверь код или запроси новый',
+      'bad_code',
+    )
+  if (/not pending/i.test(detail))
+    return new ZaiDirectError(
+      'Z.ai: активной регистрации с этим email нет — сначала реши капчу и нажми «Создать аккаунт»',
+      'signup_not_pending',
+    )
+  if (/captcha/i.test(detail))
+    return new ZaiDirectError(`Z.ai не принял проверку капчи: ${short}`, 'captcha_failed')
+  if (status === 400 && /already|exists|занят/i.test(detail))
+    return new ZaiDirectError(`Этот email уже зарегистрирован на Z.ai (${short})`, 'email_taken')
+  if (status === 401 || /invalid|wrong|incorrect|credential/i.test(detail))
+    return new ZaiDirectError(`Z.ai не принял email/пароль (${short})`, 'bad_credentials')
+  return new ZaiDirectError(`chat.z.ai auth ${status}: ${short}`, 'auth_failed')
+}
+
+/* ---------------------------------------------------------------- session */
+
+export interface ZaiSession {
+  token: string
+  userId: string
+  name: string
+  email: string
+  role: string
+}
+
+function commonHeaders(): Record<string, string> {
+  return {
+    'Accept-Language': navigator.language || 'en-US',
+    Origin: ZAI_BASE,
+    Referer: `${ZAI_BASE}/`,
+  }
+}
+
+/**
+ * Refresh a session JWT (sliding expiry) or mint a guest one.
+ * Guard: a REAL token must never come back as a guest session.
+ */
+export async function refreshSession(userToken: string): Promise<ZaiSession> {
+  const res = await fetch(`${ZAI_BASE}/api/v1/auths/`, {
+    headers: { ...commonHeaders(), Authorization: `Bearer ${userToken}` },
+  })
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '')
+    if (res.status === 401)
+      throw new ZaiDirectError(
+        'Сессия chat.z.ai недействительна (401). Подключи аккаунт заново (кнопка «Z.ai»).',
+        'zai_session_expired',
+      )
+    throw new ZaiDirectError(`chat.z.ai auth ${res.status}: ${txt.slice(0, 160)}`, 'auth_failed')
+  }
+  const data = (await res.json()) as {
+    token: string
+    id: string
+    name?: string
+    email?: string
+    role?: string
+  }
+  if (GUEST_EMAIL_RE.test(String(data.email || ''))) {
+    throw new ZaiDirectError(
+      'Сессия chat.z.ai истекла — аккаунт подключён, но токен устарел. Подключи аккаунт заново (кнопка «Z.ai»).',
+      'zai_session_expired',
+    )
+  }
+  return {
+    token: data.token,
+    userId: data.id,
+    name: data.name || 'User',
+    email: data.email || '',
+    role: data.role || 'user',
+  }
+}
+
+/** Resolve the session for chatting: stored real JWT → refresh → persist. */
+async function resolveChatSession(): Promise<ZaiSession> {
+  const stored = getStoredJwt()
+  if (!stored)
+    throw new ZaiDirectError(
+      'Гостевой режим отключён: сообщения идут только с подключённого аккаунта Z.ai. Нажми «Z.ai» внизу слева и подключи свой аккаунт — это твоя личная квота, без капчи в чате.',
+      'zai_not_linked',
+    )
+  const session = await refreshSession(stored)
+  setStoredJwt(session.token) // sliding refresh
+  return session
+}
+
+/* ---------------------------------------------------------------- signing */
+
+async function hmacRaw(key: string | Uint8Array, msg: string): Promise<string> {
+  const kc = typeof key === 'string' ? new TextEncoder().encode(key) : key
+  const k = await crypto.subtle.importKey(
+    'raw',
+    kc as BufferSource,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sig = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg))
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** base64 (utf-8 safe, chunked — spread on huge prompts overflows the stack) */
+function b64encodeUtf8(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let bin = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+  }
+  return btoa(bin)
+}
+
+/** Double-HMAC prompt signature — byte-identical to chat.z.ai's frontend. */
+async function signPrompt(
+  requestId: string,
+  timestampMs: string,
+  userId: string,
+  prompt: string,
+): Promise<string> {
+  const payload = { requestId, timestamp: timestampMs, user_id: userId }
+  const sortedPayload = Object.keys(payload)
+    .sort()
+    .map((k) => `${k},${payload[k as keyof typeof payload]}`)
+    .join(',')
+  const promptB64 = b64encodeUtf8(prompt)
+  const bucket = String(Math.floor(Number(timestampMs) / (5 * 60 * 1000)))
+  const key1 = await hmacRaw(SIGNING_SECRET, bucket)
+  return hmacRaw(key1, `${sortedPayload}|${promptB64}|${timestampMs}`)
+}
+
+/** Real browser fingerprint (chat.z.ai collects the same fields). */
+function fingerprintQuery(session: ZaiSession, requestId: string, timestampMs: string): string {
+  const now = new Date()
+  const q: Record<string, string> = {
+    requestId,
+    timestamp: timestampMs,
+    user_id: session.userId,
+    version: '0.0.1',
+    platform: 'web',
+    token: session.token,
+    user_agent: navigator.userAgent,
+    language: navigator.language || 'en-US',
+    languages: (navigator.languages || ['en-US']).join(','),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    cookie_enabled: String(navigator.cookieEnabled),
+    screen_width: String(screen.width),
+    screen_height: String(screen.height),
+    screen_resolution: `${screen.width}x${screen.height}`,
+    viewport_height: String(window.innerHeight),
+    viewport_width: String(window.innerWidth),
+    viewport_size: `${window.innerWidth}x${window.innerHeight}`,
+    color_depth: String(screen.colorDepth),
+    pixel_ratio: String(window.devicePixelRatio || 1),
+    current_url: location.href,
+    pathname: location.pathname,
+    search: location.search,
+    hash: location.hash,
+    host: location.host,
+    hostname: location.hostname,
+    protocol: location.protocol,
+    referrer: document.referrer || `${ZAI_BASE}/`,
+    title: document.title,
+    timezone_offset: String(-new Date().getTimezoneOffset()),
+    local_time: now.toUTCString(),
+    utc_time: now.toUTCString(),
+    is_mobile: String(/Mobi|Android/i.test(navigator.userAgent)),
+    is_touch: String('ontouchstart' in window || navigator.maxTouchPoints > 0),
+    max_touch_points: String(navigator.maxTouchPoints || 0),
+    browser_name: /Firefox/i.test(navigator.userAgent)
+      ? 'Firefox'
+      : /Edg/i.test(navigator.userAgent)
+        ? 'Edge'
+        : 'Chrome',
+    os_name: /Windows/i.test(navigator.userAgent)
+      ? 'Windows'
+      : /Mac/i.test(navigator.userAgent)
+        ? 'macOS'
+        : /Android/i.test(navigator.userAgent)
+          ? 'Android'
+          : /iPhone|iPad/i.test(navigator.userAgent)
+            ? 'iOS'
+            : 'Linux',
+  }
+  return new URLSearchParams(q).toString()
+}
+
+/* ----------------------------------------------------------------- prompt */
+
+export interface PlainMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+/** GLM chat-template rendering (same as server: orbitoo/zai2api scheme). */
+export function renderPrompt(messages: PlainMessage[]): string {
+  const parts: string[] = []
+  let firstNonAssistant = true
+  for (const m of messages) {
+    const content = (m.content || '').trim()
+    if (!content) continue
+    if (m.role === 'assistant') {
+      parts.push(`<｜Assistant｜>${content}<｜end▁of▁sentence｜>`)
+      continue
+    }
+    if (firstNonAssistant) {
+      parts.push(content)
+      firstNonAssistant = false
+    } else {
+      parts.push(`<｜User｜>${content}`)
+    }
+  }
+  return parts.join('\n\n').trim()
+}
+
+/* ------------------------------------------------------------ chat record */
+
+async function createChatRecord(session: ZaiSession, model: string, prompt: string): Promise<string> {
+  const userMessageId = crypto.randomUUID()
+  const agent = isAgentModel(model)
+  const body = {
+    chat: {
+      id: '',
+      title: 'New Chat',
+      models: [model],
+      params: {},
+      history: {
+        currentId: userMessageId,
+        messages: {
+          [userMessageId]: {
+            id: userMessageId,
+            parentId: null,
+            childrenIds: [],
+            role: 'user',
+            content: prompt,
+            timestamp: Math.floor(Date.now() / 1000),
+            models: [model],
+          },
+        },
+      },
+      tags: [],
+      flags: [],
+      features: agent ? [{ server: 'tool_selector_h', status: 'hidden', type: 'tool_selector' }] : [],
+      mcp_servers: [],
+      enable_thinking: agent,
+      ...(agent ? { reasoning_effort: 'max' } : {}),
+      auto_web_search: !agent,
+      message_version: 1,
+      extra: {},
+      timestamp: Date.now(),
+      type: agent ? 'general_agent' : 'default',
+    },
+  }
+  const res = await fetch(`${ZAI_BASE}/api/v1/chats/new`, {
+    method: 'POST',
+    headers: {
+      ...commonHeaders(),
+      Authorization: `Bearer ${session.token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '')
+    throw new ZaiDirectError(`chat.z.ai chats/new ${res.status}: ${txt.slice(0, 160)}`, 'chat_new_failed')
+  }
+  const data = (await res.json()) as { id?: string }
+  return data.id || userMessageId
+}
+
+/* ------------------------------------------------------------- completions */
+
+interface UpstreamEventData {
+  phase?: string
+  delta_content?: string
+  edit_content?: string
+  done?: boolean
+  error?: { detail?: unknown; code?: unknown; error_code?: unknown }
+}
+
+export interface StreamHandlers {
+  onDelta: (text: string) => void
+  onActivity: (a: { id: string; name: string; args?: Record<string, unknown>; done: boolean; summary?: string }) => void
+}
+
+function mapUpstreamError(err: { detail?: unknown; code?: unknown; error_code?: unknown }): ZaiDirectError {
+  const code = String(err.code ?? err.error_code ?? '')
+  const detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail ?? err)
+  if (code.includes('FRONTEND_CAPTCHA_REQUIRED'))
+    return new ZaiDirectError('Z.ai требует подтверждение капчи для этой сессии.', 'captcha_required')
+  if (code.includes('CAPTCHA') || /captcha/i.test(detail))
+    return new ZaiDirectError(
+      'Капча Z.ai не прошла проверку. Реши капчу ещё раз и повтори сообщение.',
+      'captcha_failed',
+    )
+  if (/user level/i.test(detail) || code === '403')
+    return new ZaiDirectError(
+      `Модель недоступна для текущего уровня аккаунта Z.ai (${detail.slice(0, 120)}). Выбери другую модель в селекторе.`,
+      'model_level',
+    )
+  return new ZaiDirectError(`chat.z.ai: ${detail.slice(0, 200)}`, 'upstream_error')
+}
+
+function cleanAnswerDelta(text: string): string {
+  let out = text.replace(/<glm_block[\s\S]*?<\/glm_block>/g, '')
+  const detailsIdx = out.lastIndexOf('</details>')
+  if (detailsIdx >= 0) out = out.slice(detailsIdx + '</details>'.length)
+  out = out.replace(/<\/?details[^>]*>/g, '').replace(/<summary[^>]*>[\s\S]*?<\/summary>/g, '')
+  return out
+}
+
+function describeStatus(status: Record<string, unknown>): { name: string; args?: Record<string, unknown> } | null {
+  const action = String(status.action || status.type || '').toLowerCase()
+  const detail = String(status.query || status.keyword || status.title || status.description || '').slice(0, 80)
+  if (/image|picture|photo|изображ/.test(action))
+    return { name: 'generate_image', args: detail ? { title: detail } : {} }
+  if (/search|web/.test(action)) return { name: 'web_search', args: detail ? { query: detail } : {} }
+  if (/knowledge/.test(action)) return { name: 'knowledge_search', args: detail ? { query: detail } : {} }
+  if (/code|python|exec/.test(action)) return { name: 'code_interpreter', args: detail ? { title: detail } : {} }
+  if (/file|document|doc|read/.test(action)) return { name: 'file_qa', args: detail ? { title: detail } : {} }
+  if (/ppt|slide|presentation/.test(action)) return { name: 'ppt_maker', args: detail ? { title: detail } : {} }
+  if (action) return { name: 'Агент: ' + action }
+  return null
+}
+
+function describeToolPhase(
+  phase: string,
+  data: UpstreamEventData,
+): { name: string; args?: Record<string, unknown> } | null {
+  const blocks = (data as { content_blocks?: unknown }).content_blocks
+  if (Array.isArray(blocks)) {
+    for (const b of blocks) {
+      const block = b as { type?: string; content?: unknown }
+      if (block?.type === 'tool_calls' && Array.isArray(block.content)) {
+        for (const c of block.content) {
+          const call = c as { function?: { name?: unknown; arguments?: unknown } }
+          const fn = call?.function?.name
+          if (typeof fn === 'string' && fn)
+            return {
+              name: /search/i.test(fn) ? 'web_search' : /image/i.test(fn) ? 'generate_image' : fn,
+              args:
+                typeof call.function?.arguments === 'object' && call.function?.arguments
+                  ? (call.function.arguments as Record<string, unknown>)
+                  : {},
+            }
+        }
+      }
+    }
+  }
+  const raw = (data.delta_content || '').trim()
+  if (raw.startsWith('{')) {
+    try {
+      const j = JSON.parse(raw) as { name?: unknown; function?: { name?: unknown } }
+      const fn = j.name || j.function?.name
+      if (typeof fn === 'string' && fn) return { name: fn, args: {} }
+    } catch { /* not json */ }
+  }
+  return phase === 'tool_call' ? { name: 'Агент вызывает инструмент' } : null
+}
+
+export interface ChatOptions {
+  messages: PlainMessage[]
+  model?: string
+  webSearch?: boolean
+  effort?: 'high' | 'max'
+  /** one-time captcha param (relay of the user's own solve) */
+  captchaVerifyParam?: string
+  handlers: StreamHandlers
+  /** signal to abort the upstream stream (component unmount / new turn) */
+  signal?: AbortSignal
+}
+
+/**
+ * Run ONE chat turn against chat.z.ai from the browser. Emits deltas and
+ * agent-activity through handlers; resolves with the full answer text.
+ * Throws ZaiDirectError with typed codes:
+ *   zai_not_linked | zai_session_expired | captcha_required | captcha_failed | …
+ */
+export async function chatTurn(opts: ChatOptions): Promise<string> {
+  const model = opts.model || 'x-preview-l'
+  const session = await resolveChatSession()
+  const prompt = renderPrompt(opts.messages)
+  if (!prompt) throw new ZaiDirectError('Пустой промпт', 'empty_prompt')
+
+  const timestampMs = String(Date.now())
+  const requestId = crypto.randomUUID()
+  const signature = await signPrompt(requestId, timestampMs, session.userId, prompt)
+  const recordId = await createChatRecord(session, model, prompt)
+
+  const agent = isAgentModel(model)
+  const body = {
+    stream: true,
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    signature_prompt: prompt,
+    params: {},
+    extra: {},
+    features: agent
+      ? {
+          image_generation: true,
+          web_search: Boolean(opts.webSearch),
+          auto_web_search: false,
+          preview_mode: false,
+          flags: [],
+          enable_thinking: true,
+          reasoning_effort: opts.effort === 'high' ? 'high' : 'max',
+        }
+      : {
+          image_generation: false,
+          web_search: Boolean(opts.webSearch),
+          auto_web_search: !opts.webSearch,
+          preview_mode: false,
+          flags: [],
+          enable_thinking: false,
+        },
+    variables: {
+      '{{USER_NAME}}': session.name,
+      '{{USER_LOCATION}}': 'Unknown',
+      '{{CURRENT_DATETIME}}': new Date().toISOString().slice(0, 19).replace('T', ' '),
+      '{{CURRENT_DATE}}': new Date().toISOString().slice(0, 10),
+      '{{USER_LANGUAGE}}': navigator.language || 'ru-RU',
+    },
+    chat_id: recordId,
+    id: crypto.randomUUID(),
+    session_id: session.userId,
+    current_user_message_id: crypto.randomUUID(),
+    current_user_message_parent_id: null,
+    background_tasks: { title_generation: false, tags_generation: false },
+    ...(opts.captchaVerifyParam ? { captcha_verify_param: opts.captchaVerifyParam } : {}),
+    stream_options: { include_usage: true },
+  }
+
+  const url = `${ZAI_BASE}/api/v2/chat/completions?${fingerprintQuery(session, requestId, timestampMs)}&signature_timestamp=${timestampMs}`
+
+  let res: Response | null = null
+  let lastWaf = false
+  for (const feVersion of FE_VERSIONS) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        ...commonHeaders(),
+        Authorization: `Bearer ${session.token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'X-Signature': signature,
+        'X-FE-Version': feVersion,
+        'X-Device-Id': deviceId(),
+        'X-Region': 'overseas',
+      },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    })
+    if (r.status === 405) {
+      const head = await r.text().catch(() => '')
+      if (/aliyun|errors\.aliyun|<!doctype/i.test(head.slice(0, 400))) {
+        lastWaf = true
+        continue // stale FE version — try the next candidate
+      }
+      res = r
+      break
+    }
+    res = r
+    break
+  }
+  if (!res)
+    throw new ZaiDirectError(
+      'Z.ai обновила защиту своего сайта (WAF) и отклоняет текущую версию клиента. Попробуй ещё раз через несколько минут.',
+      'waf_blocked',
+    )
+  if (!res.ok || !res.body) {
+    const txt = await res.text().catch(() => '')
+    let parsed: { detail?: unknown; code?: unknown } | null = null
+    try {
+      parsed = JSON.parse(txt)
+    } catch { /* raw text */ }
+    if (parsed && (parsed.code || parsed.detail)) throw mapUpstreamError(parsed as never)
+    if (/aliyun|errors\.aliyun|<!doctype/i.test(txt.slice(0, 400)))
+      throw new ZaiDirectError(
+        'Z.ai обновила защиту своего сайта (WAF) и временно отклоняет запросы. Попробуй ещё раз через несколько минут.',
+        'waf_blocked',
+      )
+    throw new ZaiDirectError(`chat.z.ai completions ${res.status}: ${txt.slice(0, 200)}`, 'http_error')
+  }
+
+  // ---- SSE parse with edit_content dedupe (same as server impl) ----
+  const reader = (res.body as ReadableStream<Uint8Array>).getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  let emittedAnswer = ''
+  let openActivity: { id: string; name: string } | null = null
+  const closeActivity = (summary?: string) => {
+    if (!openActivity) return
+    opts.handlers.onActivity({ id: openActivity.id, name: openActivity.name, done: true, summary })
+    openActivity = null
+  }
+  const startActivity = (name: string, args: Record<string, unknown> = {}) => {
+    if (openActivity && openActivity.name === name) return
+    closeActivity()
+    const id = 'z' + crypto.randomUUID().replace(/-/g, '').slice(0, 10)
+    openActivity = { id, name }
+    opts.handlers.onActivity({ id, name, args, done: false })
+  }
+  const emitAnswer = (text: string) => {
+    if (!text) return
+    if (text.startsWith(emittedAnswer) && text.length > emittedAnswer.length) {
+      opts.handlers.onDelta(text.slice(emittedAnswer.length))
+      emittedAnswer = text
+      return
+    }
+    if (emittedAnswer.startsWith(text)) return // stale resend
+    opts.handlers.onDelta(text)
+    emittedAnswer += text
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      let idx: number
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim()
+        buf = buf.slice(idx + 1)
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (!payload || payload === '[DONE]') continue
+        try {
+          const event = JSON.parse(payload) as {
+            type?: string
+            data?: UpstreamEventData & Record<string, unknown>
+          }
+          if (event.type === 'status') {
+            const described = describeStatus((event.data || {}) as Record<string, unknown>)
+            if (described) startActivity(described.name, described.args || {})
+            continue
+          }
+          if (event.type !== 'chat:completion') continue
+          const data = (event.data || {}) as UpstreamEventData
+          if (data.error) throw mapUpstreamError(data.error)
+          const phase = data.phase || 'answer'
+          if (phase === 'thinking') {
+            startActivity('Агент думает')
+            continue
+          }
+          if (phase === 'tool_call' || phase === 'tool_response') {
+            const described = describeToolPhase(phase, data)
+            if (described) startActivity(described.name, described.args || {})
+            continue
+          }
+          if (phase === 'other') continue
+          closeActivity()
+          const raw = data.edit_content ?? data.delta_content ?? ''
+          const text = cleanAnswerDelta(raw)
+          if (text) emitAnswer(text)
+          if (data.done) break
+        } catch (e) {
+          if (e instanceof ZaiDirectError) throw e
+          /* partial JSON line — skip */
+        }
+      }
+    }
+    closeActivity()
+    return emittedAnswer
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch { /* noop */ }
+  }
+}
+
+/* ------------------------------------------------------------------- auth */
+
+/** STEP 1 of Z.ai registration (captcha-gated): Z.ai emails a code. */
+export async function zaiSignUpStart(
+  name: string,
+  email: string,
+  password: string,
+  captchaVerifyParam: string,
+): Promise<void> {
+  const res = await fetch(`${ZAI_BASE}/api/v1/auths/signup`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: name || email.split('@')[0],
+      email,
+      password,
+      profile_image_url: '/static/favicon.png',
+      sso_redirect: '',
+      captcha_verify_param: captchaVerifyParam,
+    }),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+  let data: { detail?: string } = {}
+  try {
+    data = JSON.parse(txt)
+  } catch { /* empty body counts as success */ }
+  if (data?.detail) throw new ZaiDirectError(String(data.detail), 'auth_failed')
+}
+
+/** STEP 2 (no captcha): confirm the emailed code. */
+export async function zaiVerifyEmailCode(email: string, username: string, code: string): Promise<void> {
+  const res = await fetch(`${ZAI_BASE}/api/v1/auths/verify_email`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: username || email.split('@')[0], email, token: code }),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+}
+
+/** STEP 3 (no captcha): finalize; response carries the JWT. */
+export async function zaiFinishSignup(
+  email: string,
+  username: string,
+  code: string,
+  password: string,
+): Promise<ZaiSession> {
+  const res = await fetch(`${ZAI_BASE}/api/v1/auths/finish_signup`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: username || email.split('@')[0],
+      email,
+      token: code,
+      password,
+      profile_image_url: '/static/favicon.png',
+      sso_redirect: '',
+    }),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+  const data = JSON.parse(txt) as {
+    token?: string
+    user?: { token?: string; id?: string; name?: string; email?: string; role?: string }
+    id?: string
+    name?: string
+    email?: string
+    role?: string
+  }
+  const token = data?.user?.token || data?.token
+  if (!token) throw new ZaiDirectError('Z.ai не вернул токен аккаунта', 'auth_failed')
+  const u = data.user || data
+  return {
+    token,
+    userId: u.id || '',
+    name: u.name || username || 'User',
+    email: u.email || email,
+    role: u.role || 'user',
+  }
+}
+
+/** Re-send the signup verification email. */
+export async function zaiResendCode(name: string, email: string): Promise<void> {
+  const res = await fetch(`${ZAI_BASE}/api/v1/auths/resend_email`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name || email.split('@')[0], email, sso_redirect: '' }),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+}
+
+/** Sign in to an EXISTING chat.z.ai account (captcha-gated by Z.ai). */
+export async function zaiSignIn(
+  email: string,
+  password: string,
+  captchaVerifyParam: string,
+): Promise<ZaiSession> {
+  const res = await fetch(`${ZAI_BASE}/api/v1/auths/signin`, {
+    method: 'POST',
+    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, captcha_verify_param: captchaVerifyParam }),
+  })
+  const txt = await res.text().catch(() => '')
+  if (!res.ok) throw mapAuthError(res.status, txt)
+  const data = JSON.parse(txt) as { token?: string; id?: string; name?: string; email?: string; role?: string }
+  if (!data?.token) throw new ZaiDirectError('Z.ai не вернул токен аккаунта', 'auth_failed')
+  return {
+    token: data.token,
+    userId: data.id || '',
+    name: data.name || 'User',
+    email: data.email || email,
+    role: data.role || 'user',
+  }
+}
+
+/**
+ * Attach a freshly obtained REAL session to the site account: persist the
+ * JWT in the browser AND register it server-side (server validates it live
+ * and stores it on the user row — the linked-status source of truth).
+ */
+export async function attachSession(session: ZaiSession): Promise<void> {
+  setStoredJwt(session.token)
+  const res = await fetch('/api/auth/zai/attach', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: session.token }),
+  })
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string }
+    throw new ZaiDirectError(data.error || `attach ${res.status}`, 'attach_failed')
+  }
+}

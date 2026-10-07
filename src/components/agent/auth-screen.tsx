@@ -6,16 +6,26 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ZaiAuthCaptcha, preloadZaiCaptcha } from './zai-captcha'
 import { BookmarkletLink } from './bookmarklet'
+import {
+  zaiSignUpStart,
+  zaiVerifyEmailCode,
+  zaiFinishSignup,
+  zaiResendCode,
+  attachSession,
+  ZaiDirectError,
+} from '@/lib/zai-direct'
 
 /**
- * Landing / auth gate (v7) — z.ai-style welcome card (our own design).
+ * Landing / auth gate (v10) — z.ai-style welcome card (our own design).
  *
  * REGISTRATION is instant and unconditional: the local account is created
- * immediately — nothing Z.ai-side can block it. The Z.ai captcha widget is
- * OPTIONAL: with a solved param we START the user's REAL chat.z.ai account
- * (Z.ai emails a verification code); the user then enters the code on the
- * next step — that completes the real account and links its JWT. Skipping
- * is fine: the account works and can be linked later in-app.
+ * immediately — nothing Z.ai-side can block it. The REAL chat.z.ai account
+ * is then created BY THE BROWSER (browser-direct): the Aliyun captcha widget
+ * runs here, and the signup request carries its param from the SAME
+ * browser/IP — byte-for-byte the flow of chat.z.ai's own signup page. The
+ * emailed code step finishes the account; the JWT is attached via
+ * /api/auth/zai/attach. Skipping is fine: link later in-app (but chat
+ * requires a linked account — guest mode is removed).
  *
  * LOGIN needs no captcha at all: local password first, stored Z.ai session
  * refreshes silently, and a dead session is re-linked inside the app.
@@ -43,9 +53,10 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [error, setError] = useState('')
   const [info, setInfo] = useState('')
 
-  // step 2 of registration: the Z.ai email verification code
+  // step 2 of registration: the Z.ai email verification code (browser-direct)
   const [codeStep, setCodeStep] = useState(false)
   const [code, setCode] = useState('')
+  const [zaiStarted, setZaiStarted] = useState(false)
 
   // google / github bridge state
   const [bridgeRaw, setBridgeRaw] = useState('')
@@ -79,44 +90,47 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     setError('')
     setInfo('')
     try {
-      const body =
-        mode === 'register'
-          ? { email, password, name, zaiCaptchaParam: captchaParam || undefined }
-          : { email, password }
+      // 1) the local site account — instant, unconditional
       const res = await fetch(`/api/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(
+          mode === 'register' ? { email, password, name } : { email, password },
+        ),
       })
       const data = (await res.json().catch(() => ({}))) as {
         error?: string
-        zai?: { linked?: boolean; needsCode?: boolean; code?: string; detail?: string }
+        user?: { id: string; email: string; name: string }
       }
       if (!res.ok) {
         setError(data.error || `Ошибка ${res.status}`)
-        setCaptchaParam('')
-        setCaptchaToken((t) => t + 1)
         return
       }
-      if (mode === 'register' && data.zai?.needsCode) {
-        // Z.ai accepted the captcha and emailed the verification code —
-        // finish the REAL account right here
-        setCodeStep(true)
-        setInfo(
-          'Аккаунт создан. Z.ai отправил код подтверждения на твой email — введи его ниже, ' +
-            'чтобы завершить создание настоящего аккаунта chat.z.ai (своя квота, без капчи в чате). ' +
-            'Без этого шага чат отвечать не будет.',
-        )
-        setTimeout(() => codeRef.current?.focus(), 150)
-        return
-      }
-      if (mode === 'register' && data.zai && !data.zai.linked && captchaParam) {
-        setInfo(
-          `Аккаунт создан, но Z.ai не принял привязку: ${data.zai.detail || 'отверг капчу'}. ` +
-            'Подключи аккаунт в приложении (кнопка «Z.ai» внизу слева) — без него чат не работает.',
-        )
-        setTimeout(onAuthed, 2600)
-        return
+
+      // 2) v10 browser-direct: START the user's REAL chat.z.ai account from
+      //    THIS browser (captcha param solved in this browser + submitted
+      //    from this browser = the exact chat.z.ai signup flow)
+      if (mode === 'register' && captchaParam) {
+        try {
+          await zaiSignUpStart(name || email.split('@')[0], email, password, captchaParam)
+          setZaiStarted(true)
+          setCodeStep(true)
+          setInfo(
+            'Аккаунт создан. Z.ai отправил код подтверждения на твой email — введи его ниже, ' +
+              'чтобы завершить создание настоящего аккаунта chat.z.ai (своя квота, без капчи в чате). ' +
+              'Без этого шага чат отвечать не будет.',
+          )
+          setTimeout(() => codeRef.current?.focus(), 150)
+          return
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : 'Z.ai недоступен'
+          setInfo(
+            `Аккаунт создан, но Z.ai не принял создание аккаунта: ${msg.slice(0, 180)}. ` +
+              'Подключи аккаунт в приложении (кнопка «Z.ai» внизу слева) — без него чат не работает.',
+          )
+          setTimeout(onAuthed, 4200)
+          return
+        }
       }
       onAuthed()
     } catch {
@@ -135,22 +149,13 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     setBusy(true)
     setError('')
     try {
-      const res = await fetch('/api/auth/zai/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, password }),
-      })
-      const data = (await res.json().catch(() => ({}))) as {
-        error?: string
-        zai?: { linked?: boolean }
-      }
-      if (!res.ok || !data.zai?.linked) {
-        setError(data.error || `Ошибка ${res.status}`)
-        return
-      }
+      // v10 browser-direct: verify + finish run from THIS browser
+      await zaiVerifyEmailCode(email, name || email.split('@')[0], code)
+      const session = await zaiFinishSignup(email, name || email.split('@')[0], code, password)
+      await attachSession(session)
       onAuthed()
-    } catch {
-      setError('Сеть недоступна, попробуй ещё раз')
+    } catch (e) {
+      setError(e instanceof ZaiDirectError ? e.message : 'Сеть недоступна, попробуй ещё раз')
     } finally {
       setBusy(false)
     }
@@ -161,12 +166,10 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     setBusy(true)
     setError('')
     try {
-      const res = await fetch('/api/auth/zai/resend', { method: 'POST' })
-      const data = (await res.json().catch(() => ({}))) as { error?: string }
-      if (!res.ok) setError(data.error || `Ошибка ${res.status}`)
-      else setInfo('Новый код отправлен на твой email.')
-    } catch {
-      setError('Сеть недоступна, попробуй ещё раз')
+      await zaiResendCode(name || email.split('@')[0], email)
+      setInfo('Новый код отправлен на твой email.')
+    } catch (e) {
+      setError(e instanceof ZaiDirectError ? e.message : 'Сеть недоступна, попробуй ещё раз')
     } finally {
       setBusy(false)
     }

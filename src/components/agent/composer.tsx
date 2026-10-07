@@ -1,12 +1,14 @@
 'use client'
 
 import { useRef, useState } from 'react'
-import { ArrowUp, Globe, Paperclip, ChevronDown } from 'lucide-react'
+import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export interface SendOptions {
   captchaVerifyParam?: string
   resume?: boolean
+  /** 🎬 toggle: also queue the MiniMax H3 video pipeline for this prompt */
+  videoRequest?: boolean
 }
 
 export type Effort = 'high' | 'max'
@@ -20,9 +22,8 @@ const EFFORT_LABEL: Record<Effort, string> = {
  * Composer in two variants, mirroring z.ai's chat UX with our own design:
  *  - hero: the big centered first-screen box (a new chat IS the landing page)
  *  - dock: the compact bottom box of an ongoing conversation
- * The 🌐 web-search toggle and the effort (Deep-Think) selector are wired
- * through /api/chat into the upstream payload — they are real switches,
- * not decoration.
+ * The 🌐 web-search toggle, the effort (Deep-Think) selector and the 🎬
+ * video toggle are real switches wired into the chat/video pipeline.
  */
 export function Composer({
   onSend,
@@ -35,6 +36,8 @@ export function Composer({
   onWebSearchToggle,
   effort,
   onEffortChange,
+  video,
+  onVideoToggle,
 }: {
   onSend: (content: string, opts?: SendOptions) => void
   disabled: boolean
@@ -46,6 +49,8 @@ export function Composer({
   onWebSearchToggle: () => void
   effort: Effort
   onEffortChange: (e: Effort) => void
+  video: boolean
+  onVideoToggle: () => void
 }) {
   const [effortOpen, setEffortOpen] = useState(false)
   const taRef = useRef<HTMLTextAreaElement | null>(null)
@@ -56,7 +61,7 @@ export function Composer({
     if (!text || disabled) return
     onDraftChange('')
     if (taRef.current) taRef.current.style.height = 'auto'
-    onSend(text, opts)
+    onSend(text, { videoRequest: video, ...opts })
   }
 
   const placeholder =
@@ -129,6 +134,24 @@ export function Composer({
           >
             <Globe className="h-[17px] w-[17px]" />
             {webSearch && <span className="hidden sm:inline">Поиск</span>}
+          </button>
+
+          {/* 🎬 video toggle — queues the MiniMax H3 pipeline (Kaggle GPU) */}
+          <button
+            type="button"
+            aria-label="Сделать видео"
+            aria-pressed={video}
+            onClick={onVideoToggle}
+            title={video ? 'Видео будет создано по запросу (Kaggle GPU)' : 'Создать видео по запросу'}
+            className={cn(
+              'flex h-9 items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors',
+              video
+                ? 'bg-violet-50 text-violet-700 border border-violet-200'
+                : 'text-stone-500 hover:bg-stone-100',
+            )}
+          >
+            <Clapperboard className="h-[17px] w-[17px]" />
+            {video && <span className="hidden sm:inline">Видео</span>}
           </button>
 
           <div className="ml-auto flex items-center gap-2">

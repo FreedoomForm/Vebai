@@ -17,6 +17,7 @@ import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
 import { ZaiLinkCard } from './zai-link-card'
 import { solveZaiCaptcha, preloadZaiCaptcha } from './zai-captcha'
+import { chatTurn, type PlainMessage } from '@/lib/zai-direct'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
 
 interface SessionUser {
@@ -89,6 +90,7 @@ export function AgentApp() {
   const [model, setModel] = useState<string>('x-preview-l')
   const [effort, setEffort] = useState<Effort>('max')
   const [webSearch, setWebSearch] = useState(false)
+  const [video, setVideo] = useState(false)
   const [draft, setDraft] = useState('')
   const [modelOpen, setModelOpen] = useState(false)
 
@@ -126,6 +128,10 @@ export function AgentApp() {
       try { localStorage.setItem('vebai_websearch', v ? '0' : '1') } catch { /* noop */ }
       return !v
     })
+  }, [])
+
+  const toggleVideo = useCallback(() => {
+    setVideo((v) => !v)
   }, [])
 
   const changeEffort = useCallback((e: Effort) => {
@@ -241,10 +247,9 @@ export function AgentApp() {
         break
       }
       case 'captcha_required': {
-        // Z.ai demands its own captcha for this request — solve it invisibly
-        // (smart verification) or via the slider, then retry the same message
-        console.info('[agent] Z.ai captcha required — relaying widget')
-        void resendRef.current?.()
+        // v10: handled inside runTurn (solve in-browser → retry in-place);
+        // legacy socket path may still emit it — nothing to do
+        console.info('[agent] Z.ai captcha required (legacy event)')
         break
       }
       case 'done': {
@@ -283,7 +288,7 @@ export function AgentApp() {
 
   /* -------------------------------------------------------------- socket */
 
-  const { connected, send, subscribe, unsubscribe } = useAgentSocket({ onEvent, onState: onStateUpdate })
+  const { connected, subscribe, unsubscribe } = useAgentSocket({ onEvent, onState: onStateUpdate })
 
   useEffect(() => {
     const prev = activeIdRef.current
@@ -345,6 +350,126 @@ export function AgentApp() {
   const lastSentRef = useRef<{ content: string } | null>(null)
   const resendRef = useRef<(() => void) | null>(null)
 
+  /**
+   * v10 browser-direct chat turn: /api/chat/start (persist + policy) →
+   * chatTurn() streams chat.z.ai FROM THIS BROWSER (same-client captcha,
+   * same-IP signature — byte-for-byte the chat.z.ai frontend flow) →
+   * /api/chat/commit (persist the answer).
+   */
+  const runTurn = useCallback(
+    async (conversationId: string | null, content: string, resume: boolean) => {
+      // 1) persist + policy gate on the server, fetch the transcript
+      let history: PlainMessage[]
+      let convId = conversationId
+      try {
+        const res = await fetch('/api/chat/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ conversationId, content }),
+        })
+        const data = (await res.json().catch(() => ({}))) as {
+          error?: string
+          code?: string
+          conversationId?: string
+          userMessage?: MessageDTO
+          title?: string
+          history?: PlainMessage[]
+        }
+        if (!res.ok || !data.conversationId || !data.userMessage) {
+          const err = new Error(data.error || `chat start ${res.status}`) as Error & { code?: string }
+          err.code = data.code
+          throw err
+        }
+        convId = data.conversationId
+        if (convId !== activeIdRef.current) {
+          setActiveId(convId)
+          activeIdRef.current = convId
+          setMessages([])
+          setTasks([])
+          void loadConversations()
+        }
+        history = data.history || [{ role: 'user', content }]
+        onEvent({ type: 'start', conversationId: convId, userMessage: data.userMessage })
+        if (data.title) onEvent({ type: 'title', conversationId: convId, title: data.title })
+      } catch (e) {
+        const err = e as Error & { code?: string }
+        onEvent({ type: 'error', message: err.message.slice(0, 300), code: err.code })
+        onEvent({ type: 'done' })
+        return
+      }
+
+      // 2) the browser talks to chat.z.ai directly (captcha retried in-place)
+      let answer = ''
+      const activities: { name: string; summary: string }[] = []
+      let captchaParam: string | undefined
+      for (let attempt = 0; attempt < 2; attempt++) {
+        answer = ''
+        try {
+          answer = await chatTurn({
+            messages: history,
+            model,
+            webSearch,
+            effort,
+            captchaVerifyParam: captchaParam,
+            handlers: {
+              onDelta: (text) => onEvent({ type: 'delta', text }),
+              onActivity: (a) => {
+                if (a.done) {
+                  activities.push({ name: a.name, summary: a.summary || '' })
+                  onEvent({ type: 'tool_result', id: a.id, status: 'ok', summary: a.summary || '' })
+                } else {
+                  onEvent({ type: 'tool', id: a.id, call: { name: a.name, args: a.args || {}, status: 'running' } })
+                }
+              },
+            },
+          })
+          break
+        } catch (e) {
+          const err = e as Error & { code?: string }
+          if (err.code === 'captcha_required') {
+            // Z.ai demands its captcha — solve it right here (same browser
+            // that will send the retried request) and retry once
+            try {
+              captchaParam = await solveZaiCaptcha()
+              continue
+            } catch (capErr) {
+              onEvent({
+                type: 'error',
+                message: capErr instanceof Error ? capErr.message.slice(0, 300) : 'капча Z.ai не прошла',
+                code: 'captcha_failed',
+              })
+              onEvent({ type: 'done' })
+              return
+            }
+          }
+          onEvent({ type: 'error', message: err.message.slice(0, 300), code: err.code })
+          onEvent({ type: 'done' })
+          return
+        }
+      }
+
+      // 3) persist the answer
+      try {
+        const res = await fetch('/api/chat/commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            conversationId: convId,
+            content: answer || '[пустой ответ Z.ai]',
+            tools: activities,
+          }),
+        })
+        const data = (await res.json().catch(() => ({}))) as { message?: MessageDTO; error?: string }
+        if (!res.ok || !data.message) throw new Error(data.error || `commit ${res.status}`)
+        onEvent({ type: 'message', message: data.message })
+      } catch (e) {
+        onEvent({ type: 'error', message: e instanceof Error ? e.message.slice(0, 300) : 'не удалось сохранить ответ' })
+      }
+      onEvent({ type: 'done' })
+    },
+    [model, webSearch, effort, onEvent, loadConversations],
+  )
+
   const handleSend = useCallback(
     (content: string, opts?: SendOptions) => {
       if (sendingRef.current || !content.trim()) return
@@ -368,81 +493,43 @@ export function AgentApp() {
         ])
       }
 
-      const extra = { model, webSearch, effort }
-      const viaSocket = send(activeIdRef.current, content, opts)
-      if (!viaSocket) {
-        // HTTP fallback: read the SSE stream directly
+      if (opts?.videoRequest) {
+        // 🎬 composer toggle: also queue the Kaggle H3 video pipeline
         void (async () => {
           try {
-            const res = await fetch('/api/chat', {
+            const res = await fetch('/api/video-request', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                conversationId: activeIdRef.current,
-                content,
-                captchaVerifyParam: opts?.captchaVerifyParam,
-                resume: opts?.resume,
-                ...extra,
-              }),
+              body: JSON.stringify({ conversationId: activeIdRef.current, prompt: content }),
             })
-            const cid = res.headers.get('X-Conversation-Id')
-            if (cid && cid !== activeIdRef.current) {
-              setActiveId(cid)
-              activeIdRef.current = cid
-              void loadConversations()
+            const data = (await res.json().catch(() => ({}))) as {
+              task?: AgentTaskDTO
+              error?: string
+              code?: string
             }
-            if (!res.ok || !res.body) throw new Error(`chat api ${res.status}`)
-            const reader = res.body.getReader()
-            const dec = new TextDecoder()
-            let buf = ''
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-              buf += dec.decode(value, { stream: true })
-              let idx: number
-              while ((idx = buf.indexOf('\n\n')) >= 0) {
-                const block = buf.slice(0, idx)
-                buf = buf.slice(idx + 2)
-                for (const line of block.split('\n')) {
-                  const t = line.trim()
-                  if (!t.startsWith('data:')) continue
-                  try {
-                    onEvent(JSON.parse(t.slice(5).trim()) as AgentEvent)
-                  } catch { /* ignore */ }
-                }
-              }
+            if (!res.ok || !data.task) {
+              onEvent({ type: 'error', message: data.error || `video ${res.status}`, code: data.code })
+            } else {
+              onEvent({ type: 'task', task: data.task })
             }
-          } catch (e) {
-            onEvent({ type: 'error', message: e instanceof Error ? e.message : 'network error' })
-            onEvent({ type: 'done' })
+          } catch {
+            onEvent({ type: 'error', message: 'не удалось поставить видео в очередь' })
           }
         })()
       }
+
+      void runTurn(activeIdRef.current, content, Boolean(opts?.resume))
     },
-    [send, onEvent, loadConversations, model, webSearch, effort],
+    [runTurn, onEvent],
   )
 
   /* ------------------------------------------------- Z.ai captcha relay */
-  // When Z.ai demands its server captcha, solve it in the browser (usually an
-  // invisible smart-pass; worst case a slider) and retry the same message.
+  // v10: the captcha retry runs INSIDE runTurn (solve in this browser →
+  // retry the same turn with the fresh one-time param). Nothing to relay
+  // from event handlers anymore — keep the hook for compatibility.
   useEffect(() => {
-    resendRef.current = () => {
-      const last = lastSentRef.current
-      if (!last) return
-      void (async () => {
-        try {
-          const param = await solveZaiCaptcha()
-          if (param) handleSend(last.content, { captchaVerifyParam: param, resume: true })
-        } catch (e) {
-          onEvent({
-            type: 'error',
-            message: e instanceof Error ? e.message : 'капча Z.ai не прошла',
-          })
-          onEvent({ type: 'done' })
-        }
-      })()
-    }
-  }, [handleSend, onEvent])
+    resendRef.current = null
+  }, [])
 
   useEffect(() => {
     // warm the widget SDK so the first verification starts instantly
@@ -694,6 +781,8 @@ export function AgentApp() {
         onWebSearchToggle={toggleWebSearch}
         effort={effort}
         onEffortChange={changeEffort}
+        video={video}
+        onVideoToggle={toggleVideo}
       />
 
       <div className="flex w-full flex-wrap justify-center gap-2">
@@ -921,6 +1010,8 @@ export function AgentApp() {
               onWebSearchToggle={toggleWebSearch}
               effort={effort}
               onEffortChange={changeEffort}
+              video={video}
+              onVideoToggle={toggleVideo}
             />
             <p className="mt-2 text-center text-[11px] text-stone-400">
               Enter — отправить · Shift+Enter — новая строка · агент работает 24/7, результаты придут в чат

@@ -6,18 +6,28 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ZaiAuthCaptcha } from './zai-captcha'
 import { BookmarkletLink } from './bookmarklet'
+import {
+  zaiSignUpStart,
+  zaiVerifyEmailCode,
+  zaiFinishSignup,
+  zaiSignIn,
+  attachSession,
+  ZaiDirectError,
+} from '@/lib/zai-direct'
 
 /**
- * "Подключить аккаунт Z.ai" card (v5).
+ * "Подключить аккаунт Z.ai" card (v10 — browser-direct).
  *
  * Three ways to attach the user's OWN chat.z.ai account:
  *  1. SIGNUP (captcha → Z.ai emails a code → code step → finish_signup):
- *     creates a real account; the code step completes via /api/auth/zai/verify.
+ *     creates a real account. ALL Z.ai calls run from THIS browser with the
+ *     captcha param solved in THIS browser — the exact chat.z.ai flow, no
+ *     server relay (the old relay mixed browser-solve with Vercel-IP submit).
  *  2. SIGNIN (captcha → immediate JWT): an existing Z.ai account.
  *  3. GOOGLE/GITHUB BRIDGE (no captcha): the user logs in on chat.z.ai with
  *     their Google/GitHub account and pastes the address of the page they
- *     land on — its #hash carries the session token. We validate it live
- *     via /api/auth/google/claim (mode=link) and attach it.
+ *     land on — its #hash carries the session token. Validated live via
+ *     /api/auth/google/claim (mode=link) and attached.
  */
 export function ZaiLinkCard({
   defaultEmail,
@@ -55,32 +65,22 @@ export function ZaiLinkCard({
     setError('')
     setOk('')
     try {
-      const res = await fetch('/api/auth/link', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, mode, zaiCaptchaParam: param }),
-      })
-      const data = (await res.json().catch(() => ({}))) as {
-        error?: string
-        code?: string
-        zai?: { linked?: boolean; needsCode?: boolean }
-      }
-      if (!res.ok) {
-        setError(data.error || `Ошибка ${res.status}`)
-        setParam('')
-        setWidgetToken((t) => t + 1)
-        return
-      }
-      if (mode === 'signup' && data.zai?.needsCode) {
+      // v10 browser-direct: the Z.ai auth request goes from THIS browser
+      if (mode === 'signup') {
+        await zaiSignUpStart(email.split('@')[0], email, password, param)
         setCodeStep(true)
         setOk('Z.ai отправил код на этот email — введи его, чтобы завершить создание аккаунта.')
         return
       }
+      const session = await zaiSignIn(email, password, param)
+      await attachSession(session)
       setOk('Готово — твой аккаунт Z.ai подключён, работаем на твоей квоте.')
       setParam('')
       onLinked()
-    } catch {
-      setError('Сеть недоступна, попробуй ещё раз')
+    } catch (e) {
+      setError(e instanceof ZaiDirectError ? e.message : 'Сеть недоступна, попробуй ещё раз')
+      setParam('')
+      setWidgetToken((t) => t + 1)
     } finally {
       setBusy(null)
     }
@@ -91,23 +91,13 @@ export function ZaiLinkCard({
     setBusy('code')
     setError('')
     try {
-      const res = await fetch('/api/auth/zai/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, password }),
-      })
-      const data = (await res.json().catch(() => ({}))) as {
-        error?: string
-        zai?: { linked?: boolean }
-      }
-      if (!res.ok || !data.zai?.linked) {
-        setError(data.error || `Ошибка ${res.status}`)
-        return
-      }
+      await zaiVerifyEmailCode(email, email.split('@')[0], code)
+      const session = await zaiFinishSignup(email, email.split('@')[0], code, password)
+      await attachSession(session)
       setOk('Готово — аккаунт Z.ai создан и подключён!')
       onLinked()
-    } catch {
-      setError('Сеть недоступна, попробуй ещё раз')
+    } catch (e) {
+      setError(e instanceof ZaiDirectError ? e.message : 'Сеть недоступна, попробуй ещё раз')
     } finally {
       setBusy(null)
     }
