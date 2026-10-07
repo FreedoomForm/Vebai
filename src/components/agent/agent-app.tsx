@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, Circle, ChevronDown, Check, Globe,
+  Loader2, Circle, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -77,6 +77,7 @@ export function AgentApp() {
   const [tasks, setTasks] = useState<AgentTaskDTO[]>([])
   const [stream, setStream] = useState<StreamState | null>(null)
   const [sending, setSending] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<{ message: string; code?: string } | null>(null)
   const [worker, setWorker] = useState({ activeTasks: 0, queued: 0, running: 0 })
   const [navOpen, setNavOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
@@ -96,6 +97,10 @@ export function AgentApp() {
   activeIdRef.current = activeId
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const stickToBottomRef = useRef(true)
+  /** true once the current turn produced a `start` event (server-side
+   * persistence confirmed) — a done/error without it means the temp user
+   * bubble must be dropped, otherwise the message ghosts forever */
+  const startSeenRef = useRef(false)
 
   /* --------------------------------------------------- persisted settings */
 
@@ -165,6 +170,8 @@ export function AgentApp() {
   const onEvent = useCallback((evt: AgentEvent) => {
     switch (evt.type) {
       case 'start': {
+        startSeenRef.current = true
+        setErrorMsg(null)
         if (evt.conversationId !== activeIdRef.current) {
           setActiveId(evt.conversationId)
           activeIdRef.current = evt.conversationId
@@ -216,6 +223,8 @@ export function AgentApp() {
       case 'message': {
         setMessages((prev) => [...prev, evt.message])
         setStream(null)
+        // the persisted turn record replaces the live error bubble
+        setErrorMsg(null)
         break
       }
       case 'title': {
@@ -238,18 +247,15 @@ export function AgentApp() {
         void resendRef.current?.()
         break
       }
-      case 'zai_downgraded': {
-        // the user's own Z.ai session died — the turn continues on a guest
-        // session; surface the reconnect card (non-blocking)
-        setZaiLinked(false)
-        setLinkReason(evt.message)
-        setLinkOpen(true)
-        break
-      }
       case 'done': {
         sendingRef.current = false
         setSending(false)
         setStream((s) => (s && (s.text.trim() || s.tools.length) ? s : null))
+        if (!startSeenRef.current) {
+          // the server never persisted this message (e.g. zai_not_linked,
+          // session error) — drop the optimistic bubble
+          setMessages((prev) => prev.filter((m) => m.id !== 'temp-user'))
+        }
         void loadConversations()
         const id = activeIdRef.current
         if (id) void fetchState(id)
@@ -259,10 +265,15 @@ export function AgentApp() {
         sendingRef.current = false
         setSending(false)
         setStream(null)
+        if (!startSeenRef.current) {
+          setMessages((prev) => prev.filter((m) => m.id !== 'temp-user'))
+        }
         console.error('[agent]', evt.message, evt.code || '')
-        if (evt.code === 'zai_session_expired') {
+        // visible failure — no more silent "nothing happened"
+        setErrorMsg({ message: evt.message, code: evt.code })
+        if (evt.code === 'zai_session_expired' || evt.code === 'zai_not_linked') {
           setZaiLinked(false)
-          setLinkReason(evt.message)
+          setLinkReason(evt.code === 'zai_not_linked' ? '' : evt.message)
           setLinkOpen(true)
         }
         break
@@ -340,6 +351,8 @@ export function AgentApp() {
       sendingRef.current = true
       setSending(true)
       stickToBottomRef.current = true
+      startSeenRef.current = false
+      setErrorMsg(null)
       if (!opts?.resume) lastSentRef.current = { content }
 
       if (!opts?.resume) {
@@ -445,6 +458,7 @@ export function AgentApp() {
       activeIdRef.current = id
       setMessages([])
       setTasks([])
+      setErrorMsg(null)
       void fetchState(id)
       setNavOpen(false)
     },
@@ -458,6 +472,7 @@ export function AgentApp() {
     setMessages([])
     setTasks([])
     setStream(null)
+    setErrorMsg(null)
     setDraft('')
     setNavOpen(false)
   }, [])
@@ -642,7 +657,7 @@ export function AgentApp() {
                 ? 'border-emerald-200 text-emerald-700 hover:bg-emerald-50'
                 : 'border-amber-300 text-amber-700 hover:bg-amber-50',
             )}
-            title={zaiLinked ? 'Аккаунт Z.ai подключён' : 'Аккаунт Z.ai не подключён — гостевой режим'}
+            title={zaiLinked ? 'Аккаунт Z.ai подключён' : 'Аккаунт Z.ai не подключён — нажми и подключи свой аккаунт'}
           >
             {zaiLinked ? 'Z.ai ✓' : 'Z.ai ⚠'}
           </button>
@@ -778,7 +793,7 @@ export function AgentApp() {
           onScroll={onScroll}
           className="flex-1 overflow-y-auto"
         >
-          {messages.length === 0 && !stream && !sending ? (
+          {messages.length === 0 && !stream && !sending && !errorMsg ? (
             heroBlock
           ) : (
             <div className="mx-auto max-w-3xl space-y-6 px-4 py-6">
@@ -835,6 +850,43 @@ export function AgentApp() {
                         {stream.text}
                       </div>
                     )}
+                  </div>
+                </div>
+              )}
+
+              {/* visible error — a turn can fail (captcha rejected, WAF,
+                  account problems); the user must ALWAYS see why */}
+              {errorMsg && (
+                <div className="flex gap-3">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-red-200 bg-red-50">
+                    <AlertCircle className="h-4 w-4 text-red-500" />
+                  </div>
+                  <div className="min-w-0 flex-1 rounded-2xl border border-red-200 bg-red-50/70 px-4 py-3">
+                    <p className="text-[13px] leading-relaxed text-red-700 break-words">
+                      {errorMsg.message}
+                    </p>
+                    <div className="mt-2 flex items-center gap-2">
+                      {!sending && lastSentRef.current && (
+                        <Button
+                          size="sm"
+                          onClick={() => {
+                            const c = lastSentRef.current?.content
+                            if (c) handleSend(c)
+                          }}
+                          className="h-7 gap-1.5 rounded-lg bg-red-600 px-2.5 text-[12px] text-white hover:bg-red-700"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          Повторить
+                        </Button>
+                      )}
+                      <button
+                        onClick={() => setErrorMsg(null)}
+                        aria-label="Закрыть ошибку"
+                        className="flex h-7 items-center gap-1 rounded-lg px-2 text-[12px] text-red-500 hover:bg-red-100"
+                      >
+                        <X className="h-3 w-3" /> Скрыть
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -902,7 +954,7 @@ export function AgentApp() {
             <DialogDescription className="text-[12px] text-stone-500">
               {zaiLinked
                 ? 'Подключён твой аккаунт chat.z.ai — сообщения идут на твоей личной квоте.'
-                : 'Сейчас сообщения идут в гостевом режиме на общей квоте. Подключи свой аккаунт — это твоя личная квота Z.ai.'}
+                : 'Без своего аккаунта Z.ai чат не работает: подключи аккаунт — сообщения пойдут на твоей личной квоте, без капчи.'}
             </DialogDescription>
           </DialogHeader>
           <ZaiLinkCard
@@ -913,7 +965,6 @@ export function AgentApp() {
               setLinkOpen(false)
               setLinkReason('')
             }}
-            onDismiss={() => setLinkOpen(false)}
           />
         </DialogContent>
       </Dialog>

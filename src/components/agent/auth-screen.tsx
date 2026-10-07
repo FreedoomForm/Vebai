@@ -105,7 +105,7 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
         setInfo(
           'Аккаунт создан. Z.ai отправил код подтверждения на твой email — введи его ниже, ' +
             'чтобы завершить создание настоящего аккаунта chat.z.ai (своя квота, без капчи в чате). ' +
-            'Можно пропустить и подключить позже.',
+            'Без этого шага чат отвечать не будет.',
         )
         setTimeout(() => codeRef.current?.focus(), 150)
         return
@@ -113,7 +113,7 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
       if (mode === 'register' && data.zai && !data.zai.linked && captchaParam) {
         setInfo(
           `Аккаунт создан, но Z.ai не принял привязку: ${data.zai.detail || 'отверг капчу'}. ` +
-            'Подключишь позже в приложении — чат уже работает.',
+            'Подключи аккаунт в приложении (кнопка «Z.ai» внизу слева) — без него чат не работает.',
         )
         setTimeout(onAuthed, 2600)
         return

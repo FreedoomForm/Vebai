@@ -65,6 +65,5 @@ export type AgentEvent =
   | { type: 'title'; conversationId: string; title: string }
   | { type: 'conversation'; conversationId: string }
   | { type: 'captcha_required' }
-  | { type: 'zai_downgraded'; message: string }
   | { type: 'done' }
   | { type: 'error'; message: string; code?: string }

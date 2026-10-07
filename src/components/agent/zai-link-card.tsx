@@ -22,12 +22,10 @@ import { BookmarkletLink } from './bookmarklet'
 export function ZaiLinkCard({
   defaultEmail,
   onLinked,
-  onDismiss,
   reason,
 }: {
   defaultEmail: string
   onLinked: () => void
-  onDismiss?: () => void
   /** why the card opened (e.g. "session expired") */
   reason?: string
 }) {
@@ -143,8 +141,9 @@ export function ZaiLinkCard({
     <div className="space-y-3">
       {reason && <p className="text-[12px] leading-relaxed text-amber-600">{reason}</p>}
       <p className="text-[12px] leading-relaxed text-stone-500">
-        Подключи <span className="text-stone-800">свой настоящий аккаунт chat.z.ai</span> — он же
-        даёт личную квоту Z.ai. Этот email и пароль будут работать и на самом chat.z.ai.
+        Чат работает только с подключённым аккаунтом: <span className="text-stone-800">свой настоящий аккаунт chat.z.ai</span> —
+        это твоя личная квота Z.ai, без капчи на каждое сообщение. Этот email и пароль будут
+        работать и на самом chat.z.ai.
       </p>
 
       {codeStep ? (
@@ -309,14 +308,7 @@ export function ZaiLinkCard({
         )}
       </div>
 
-      {onDismiss && (
-        <button
-          onClick={onDismiss}
-          className="w-full rounded-lg px-3 py-1.5 text-[12px] text-stone-500 hover:text-stone-700"
-        >
-          Позже — продолжить в гостевом режиме (своя квота подключится позже)
-        </button>
-      )}
+      {/* guest mode is removed — the account link is required, no dismiss */}
     </div>
   )
 }
