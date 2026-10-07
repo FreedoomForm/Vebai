@@ -13,17 +13,20 @@
  * The public API of this module emits OpenAI-compatible SSE chunks
  * (`choices[0].delta.content`), so the agent loop stays unchanged.
  *
- * Captcha relay (verified live 2026-10): anonymous guest sessions must pass
- * Z.ai's server captcha — Aliyun Captcha 2.0 — on EVERY chat completions.
- * The server answers with {code: FRONTEND_CAPTCHA_REQUIRED, captcha_error_type:
- * 'missing_param'} until the request carries a one-time `captcha_verify_param`.
- * That param is produced by Aliyun's own slider widget which chat.z.ai's
- * frontend loads from o.alicdn.com. SceneId is DOMAIN-SWITCHED in their
- * frontend (prod-fe-1.1.98): 'didk33e0' only on chat.z.ai itself,
- * 'xswyjefn' on every foreign domain — see zai-captcha.ts. We relay Z.ai's
- * OWN captcha to our users: the user solves
- * it, we forward the param, chat.z.ai verifies it — no owner JWT, no homemade
- * captcha. One param = one request (reuse fails with verify_code F018).
+ * Captcha (settled by live probes 2026-10): anonymous guest sessions must
+ * pass Z.ai's server captcha — Aliyun Captcha 2.0 — on EVERY chat
+ * completions. The server answers with {code: FRONTEND_CAPTCHA_REQUIRED,
+ * captcha_error_type: 'missing_param'} until the request carries a one-time
+ * `captcha_verify_param`. CRITICAL (v11): Aliyun binds each solve to the
+ * domains registered in chat.z.ai's scene config — a param solved on any
+ * foreign domain is ALWAYS rejected ("The captcha verification failed"),
+ * even when the widget showed green and the same browser re-sent the
+ * request with a byte-identical payload. Because of that there is NO
+ * captcha relay anywhere in vebai anymore: guest mode is removed, and Z.ai
+ * accounts are created/logged-in on chat.z.ai itself and connected via the
+ * token bridge (see auth-screen.tsx / zai-link-card.tsx). This module keeps
+ * only the server-side session helpers (resolveSession / paste parsing)
+ * used by /api/auth/google/claim and /api/auth/zai/attach.
  *
  * Agent mode (default): chats are created with type 'general_agent' on an
  * agent-capable model (GLM-5.x / x-preview). That mode IS the full Z.ai

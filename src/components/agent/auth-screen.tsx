@@ -1,31 +1,29 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Loader2, ShieldAlert, Sparkles } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { ClipboardCopy, ExternalLink, Loader2, ShieldAlert, Sparkles } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { ZaiAuthCaptcha, preloadZaiCaptcha } from './zai-captcha'
 import { BookmarkletLink } from './bookmarklet'
-import {
-  zaiSignUpStart,
-  zaiVerifyEmailCode,
-  zaiFinishSignup,
-  zaiResendCode,
-  attachSession,
-  ZaiDirectError,
-} from '@/lib/zai-direct'
 
 /**
- * Landing / auth gate (v10) — z.ai-style welcome card (our own design).
+ * Landing / auth gate (v11) — z.ai-style welcome card (our own design).
  *
  * REGISTRATION is instant and unconditional: the local account is created
- * immediately — nothing Z.ai-side can block it. The REAL chat.z.ai account
- * is then created BY THE BROWSER (browser-direct): the Aliyun captcha widget
- * runs here, and the signup request carries its param from the SAME
- * browser/IP — byte-for-byte the flow of chat.z.ai's own signup page. The
- * emailed code step finishes the account; the JWT is attached via
- * /api/auth/zai/attach. Skipping is fine: link later in-app (but chat
- * requires a linked account — guest mode is removed).
+ * immediately — nothing Z.ai-side can block it.
+ *
+ * The REAL chat.z.ai account is created ON chat.z.ai (v11): byte-level live
+ * probes proved Aliyun binds each captcha solve to the domains registered in
+ * chat.z.ai's scene config (verified: their signup payload is identical to
+ * ours, yet a param solved on a foreign domain is always rejected with
+ * "The captcha verification failed" — twice reported in the field). No widget
+ * embedded here can ever pass that check, so we STOP asking for a doomed
+ * captcha and hand the user to Z.ai's own signup page instead:
+ *   1. we copy the email+password to the clipboard,
+ *   2. open https://chat.z.ai/auth in a new tab (their captcha, their
+ *      domain — guaranteed the same experience as their own users),
+ *   3. the user returns and connects the session in one click via the
+ *      ⚡ bookmarklet (or a paste) — the proven token bridge.
  *
  * LOGIN needs no captcha at all: local password first, stored Z.ai session
  * refreshes silently, and a dead session is re-linked inside the app.
@@ -40,35 +38,30 @@ import {
  * server-side and this screen auto-enters the app via the /api/auth/me poll.
  * Manual paste stays as the fallback.
  */
+
+const ZAI_AUTH_URL = 'https://chat.z.ai/auth'
+
 export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('register')
   const [emailOpen, setEmailOpen] = useState(false)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [name, setName] = useState('')
-  // captcha param produced by the embedded auth-scene widget (optional)
-  const [captchaParam, setCaptchaParam] = useState('')
-  const [captchaToken, setCaptchaToken] = useState(0) // force widget re-init
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [info, setInfo] = useState('')
 
-  // step 2 of registration: the Z.ai email verification code (browser-direct)
-  const [codeStep, setCodeStep] = useState(false)
-  const [code, setCode] = useState('')
-  const [zaiStarted, setZaiStarted] = useState(false)
-
-  // google / github bridge state
+  // step 2 of registration: create the REAL Z.ai account on chat.z.ai
+  const [zaiStep, setZaiStep] = useState(false)
+  const [copied, setCopied] = useState(false)
   const [bridgeRaw, setBridgeRaw] = useState('')
   const [bridgeBusy, setBridgeBusy] = useState(false)
   const [bridgeError, setBridgeError] = useState('')
 
-  const codeRef = useRef<HTMLInputElement>(null)
-
-  useEffect(() => {
-    // warm the SDK so the first verification starts instantly
-    preloadZaiCaptcha()
-  }, [])
+  // google / github bridge state (pre-registration block)
+  const [gbRaw, setGbRaw] = useState('')
+  const [gbBusy, setGbBusy] = useState(false)
+  const [gbError, setGbError] = useState('')
 
   // v6: the Google bridge finishes in ANOTHER tab/popup (bookmarklet →
   // /auth/google/catch → claim sets the session cookie). Poll /api/auth/me
@@ -81,7 +74,6 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
       } catch { /* offline — keep polling */ }
     }, 2500)
     return () => clearInterval(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const submit = async () => {
@@ -106,31 +98,11 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
         setError(data.error || `Ошибка ${res.status}`)
         return
       }
-
-      // 2) v10 browser-direct: START the user's REAL chat.z.ai account from
-      //    THIS browser (captcha param solved in this browser + submitted
-      //    from this browser = the exact chat.z.ai signup flow)
-      if (mode === 'register' && captchaParam) {
-        try {
-          await zaiSignUpStart(name || email.split('@')[0], email, password, captchaParam)
-          setZaiStarted(true)
-          setCodeStep(true)
-          setInfo(
-            'Аккаунт создан. Z.ai отправил код подтверждения на твой email — введи его ниже, ' +
-              'чтобы завершить создание настоящего аккаунта chat.z.ai (своя квота, без капчи в чате). ' +
-              'Без этого шага чат отвечать не будет.',
-          )
-          setTimeout(() => codeRef.current?.focus(), 150)
-          return
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : 'Z.ai недоступен'
-          setInfo(
-            `Аккаунт создан, но Z.ai не принял создание аккаунта: ${msg.slice(0, 180)}. ` +
-              'Подключи аккаунт в приложении (кнопка «Z.ai» внизу слева) — без него чат не работает.',
-          )
-          setTimeout(onAuthed, 4200)
-          return
-        }
+      // 2) v11: send the user to Z.ai's OWN signup page — a captcha solved
+      //    anywhere but chat.z.ai is rejected by their risk engine
+      if (mode === 'register') {
+        setZaiStep(true)
+        return
       }
       onAuthed()
     } catch {
@@ -140,42 +112,18 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     }
   }
 
-  const submitCode = async (skip = false) => {
-    if (busy) return
-    if (skip) {
-      onAuthed()
-      return
-    }
-    setBusy(true)
-    setError('')
+  /** Copy the registration credentials and open Z.ai's own signup page. */
+  const openZaiSignup = async () => {
     try {
-      // v10 browser-direct: verify + finish run from THIS browser
-      await zaiVerifyEmailCode(email, name || email.split('@')[0], code)
-      const session = await zaiFinishSignup(email, name || email.split('@')[0], code, password)
-      await attachSession(session)
-      onAuthed()
-    } catch (e) {
-      setError(e instanceof ZaiDirectError ? e.message : 'Сеть недоступна, попробуй ещё раз')
-    } finally {
-      setBusy(false)
-    }
+      await navigator.clipboard.writeText(`Email: ${email}\nПароль: ${password}`)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 4000)
+    } catch { /* clipboard denied — the fields stay visible above */ }
+    window.open(ZAI_AUTH_URL, 'zai_signup', 'width=1180,height=900')
   }
 
-  const resendCode = async () => {
-    if (busy) return
-    setBusy(true)
-    setError('')
-    try {
-      await zaiResendCode(name || email.split('@')[0], email)
-      setInfo('Новый код отправлен на твой email.')
-    } catch (e) {
-      setError(e instanceof ZaiDirectError ? e.message : 'Сеть недоступна, попробуй ещё раз')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const claimGoogle = async () => {
+  /** Paste-claim used on the zaiStep panel — attach to the CURRENT user. */
+  const claimLink = async () => {
     if (bridgeBusy) return
     setBridgeBusy(true)
     setBridgeError('')
@@ -184,7 +132,7 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
       const res = await fetch('/api/auth/google/claim', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ raw: bridgeRaw, mode: 'login' }),
+        body: JSON.stringify({ raw: bridgeRaw, mode: 'link' }),
       })
       const data = (await res.json().catch(() => ({}))) as { error?: string }
       if (!res.ok) {
@@ -199,10 +147,29 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
     }
   }
 
-  const onWidgetParam = useCallback((param: string) => {
-    setCaptchaParam(param)
+  const claimGoogle = async () => {
+    if (gbBusy) return
+    setGbBusy(true)
+    setGbError('')
     setError('')
-  }, [])
+    try {
+      const res = await fetch('/api/auth/google/claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw: gbRaw, mode: 'login' }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { error?: string }
+      if (!res.ok) {
+        setGbError(data.error || `Ошибка ${res.status}`)
+        return
+      }
+      onAuthed()
+    } catch {
+      setGbError('Сеть недоступна, попробуй ещё раз')
+    } finally {
+      setGbBusy(false)
+    }
+  }
 
   const openZaiSso = (provider: 'google' | 'github') => {
     window.open(
@@ -227,48 +194,67 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             </p>
           </div>
 
-          {codeStep ? (
+          {zaiStep ? (
             <div className="mt-6 space-y-4">
-              <p className="text-[13px] font-semibold text-stone-800">Код из письма Z.ai</p>
-              <p className="text-[12px] leading-relaxed text-stone-500">
-                Письмо отправил chat.z.ai на <span className="text-stone-700">{email}</span>. Введи
-                код подтверждения — аккаунт Z.ai станет твоим (как будто регистрировался у них).
+              <p className="text-[13px] font-semibold text-stone-800">
+                Аккаунт Vebai создан ✓ — теперь твой аккаунт Z.ai
               </p>
-              <input
-                ref={codeRef}
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                placeholder="Код из письма"
-                className="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2.5 text-sm tracking-[0.3em] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
-              />
-              {info && <p className="text-[12px] leading-relaxed text-amber-600">{info}</p>}
-              {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
+              <p className="text-[12px] leading-relaxed text-stone-500">
+                Чат работает на твоей личной квоте Z.ai, поэтому нужен настоящий аккаунт chat.z.ai.
+                Капча Z.ai принимается только на их собственном домене, поэтому регистрируем прямо
+                на их странице — это займёт минуту.
+              </p>
+
               <Button
-                onClick={() => void submitCode(false)}
-                disabled={busy || !code}
+                onClick={() => void openZaiSignup()}
                 className="w-full rounded-xl bg-stone-900 text-white hover:bg-stone-700 font-medium"
               >
-                {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-                Подтвердить и войти
+                <ClipboardCopy className="mr-2 h-4 w-4" />
+                {copied ? 'Скопировано — открываю Z.ai…' : 'Скопировать данные и открыть Z.ai'}
               </Button>
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => void resendCode()}
-                  disabled={busy}
-                  className="rounded-xl px-3 py-1.5 text-[12px] text-stone-500 hover:text-stone-800"
-                >
-                  Отправить код снова
-                </button>
-                <button
-                  onClick={() => void submitCode(true)}
-                  disabled={busy}
-                  className="rounded-xl px-3 py-1.5 text-[12px] text-stone-400 hover:text-stone-600"
-                >
-                  Позже — войти сейчас
-                </button>
+
+              <ol className="list-decimal space-y-1 pl-4 text-[11.5px] leading-relaxed text-stone-500">
+                <li>На открытой странице chat.z.ai выбери <span className="text-stone-700">Sign up</span>.</li>
+                <li>Вставь email и пароль из буфера (Ctrl+V) — мы их уже скопировали.</li>
+                <li>Пройди их капчу и введи код из письма — аккаунт готов.</li>
+                <li>
+                  Вернись сюда и нажми закладку <span className="text-stone-700">⚡ Vebai</span> на
+                  вкладке chat.z.ai — сессия подключится автоматически. Или вставь адрес ниже.
+                </li>
+              </ol>
+
+              <div className="rounded-xl border border-dashed border-stone-300 bg-stone-50 p-2.5">
+                <BookmarkletLink className="inline-block cursor-grab rounded-md border border-stone-300 bg-white px-3 py-1.5 text-[12px] font-semibold text-stone-800 hover:border-stone-500" />
               </div>
+
+              <textarea
+                value={bridgeRaw}
+                onChange={(e) => setBridgeRaw(e.target.value)}
+                onPaste={() => setTimeout(() => void claimLink(), 120)}
+                rows={2}
+                placeholder="Вставь сюда скопированный адрес chat.z.ai/auth#token=…"
+                className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
+              />
+              {bridgeError && (
+                <p className="text-[12px] leading-relaxed text-red-500">{bridgeError}</p>
+              )}
+              <Button
+                onClick={() => void claimLink()}
+                disabled={bridgeBusy || !bridgeRaw.trim()}
+                variant="outline"
+                className="w-full rounded-xl border-stone-300 text-stone-800 hover:bg-stone-100 font-medium"
+              >
+                {bridgeBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+                Подключить аккаунт Z.ai
+              </Button>
+
+              <button
+                onClick={() => void onAuthed()}
+                disabled={busy}
+                className="w-full rounded-xl px-3 py-1.5 text-[12px] text-stone-500 hover:text-stone-800"
+              >
+                Позже — войти в приложение (подключить можно кнопкой «Z.ai» внизу слева)
+              </button>
             </div>
           ) : (
             <div className="mt-6 space-y-3">
@@ -316,7 +302,6 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
                           setMode(m)
                           setError('')
                           setInfo('')
-                          setCaptchaParam('')
                         }}
                         className={cn(
                           'rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors',
@@ -355,18 +340,6 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
                     className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
                   />
 
-                  {/* Z.ai's own auth captcha — OPTIONAL: starts the real Z.ai
-                      account creation right here; skipping is fine */}
-                  {mode === 'register' && (
-                    <div className="space-y-1.5">
-                      <p className="text-[11px] leading-relaxed text-stone-500">
-                        Капча Z.ai — запускает создание твоего аккаунта на их стороне (рекомендую,
-                        но не обязательно: можно подключиться позже из приложения).
-                      </p>
-                      <ZaiAuthCaptcha onParam={onWidgetParam} token={captchaToken} />
-                    </div>
-                  )}
-
                   {info && <p className="text-[12px] leading-relaxed text-amber-600">{info}</p>}
                   {error && <p className="text-[12px] leading-relaxed text-red-500">{error}</p>}
 
@@ -403,11 +376,10 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
           <div className="flex items-start gap-2 text-amber-800">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <p className="text-[11.5px] leading-relaxed text-amber-800/90">
-              Прозрачный прокси к Z.ai: регистрация мгновенная. Кнопка Google открывает{' '}
-              <span className="font-medium">настоящий Google-вход chat.z.ai</span>; капча Z.ai (их
-              же виджет Aliyun) нужна только чтобы создать твой настоящий аккаунт chat.z.ai — все
-              запросы пойдут под твоим аккаунтом и на твою личную квоту. Неофициальный клиент, не
-              аффилирован с Z.ai.
+              Прозрачный прокси к Z.ai: регистрация здесь мгновенная, а настоящий аккаунт chat.z.ai
+              создаётся на их собственной странице (капча Z.ai принимается только на их домене) —
+              все запросы пойдут под твоим аккаунтом и на твою личную квоту. Неофициальный клиент,
+              не аффилирован с Z.ai.
             </p>
           </div>
         </div>
@@ -436,23 +408,21 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             </p>
           </div>
           <textarea
-            value={bridgeRaw}
-            onChange={(e) => setBridgeRaw(e.target.value)}
+            value={gbRaw}
+            onChange={(e) => setGbRaw(e.target.value)}
             onPaste={() => setTimeout(() => void claimGoogle(), 120)}
             rows={2}
             placeholder="Вставь сюда скопированный адрес chat.z.ai/auth#token=…"
             className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
           />
-          {bridgeError && (
-            <p className="text-[12px] leading-relaxed text-red-500">{bridgeError}</p>
-          )}
+          {gbError && <p className="text-[12px] leading-relaxed text-red-500">{gbError}</p>}
           <Button
             onClick={() => void claimGoogle()}
-            disabled={bridgeBusy || !bridgeRaw.trim()}
+            disabled={gbBusy || !gbRaw.trim()}
             variant="outline"
             className="w-full rounded-xl border-stone-300 text-stone-800 hover:bg-stone-100 font-medium"
           >
-            {bridgeBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+            {gbBusy && <Loader2 className="h-4 w-4 animate-spin" />}
             Войти через Z.ai-аккаунт Google
           </Button>
           <p className="text-[10.5px] leading-relaxed text-stone-400">
@@ -461,6 +431,12 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
             бесшовный перехват невозможен. Букмарклет сокращает ручной шаг до одного клика.
           </p>
         </div>
+
+        {/* small helper: direct link to Z.ai auth for the SSO popups */}
+        <p className="flex items-center justify-center gap-1 text-[10.5px] text-stone-400">
+          <ExternalLink className="h-3 w-3" />
+          Официальная страница входа: chat.z.ai/auth
+        </p>
       </div>
     </div>
   )

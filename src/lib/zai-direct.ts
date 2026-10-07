@@ -1,5 +1,5 @@
 /**
- * BROWSER-DIRECT chat.z.ai client (v10).
+ * BROWSER-DIRECT chat.z.ai client (v11).
  *
  * Byte-level live checks (2026-10) proved chat.z.ai's API answers with
  * PERMISSIVE CORS: `access-control-allow-origin: <any origin>` +
@@ -8,14 +8,20 @@
  * USER'S BROWSER can talk to chat.z.ai directly — exactly like chat.z.ai's
  * own frontend does:
  *
- *   - the Aliyun captcha widget runs in the browser AND the request that
- *     carries its one-time param is sent from the SAME browser/IP —
- *     the proven same-client flow of chat.z.ai itself (the server relay
- *     previously mixed a user-browser solve with a Vercel-IP submit);
  *   - no Vercel datacenter IP in the AI path at all: no WAF blocks, no
  *     shared rate limits, no 300s function cap on long agent turns;
  *   - every user's session/quota is naturally their own (their browser,
  *     their JWT, their limits).
+ *
+ * CAPTCHA (v11, settled by live probes): Aliyun binds every captcha solve
+ * to the domains registered in chat.z.ai's scene config. A param solved on
+ * a foreign domain (ours) is ALWAYS rejected by their backend with
+ * "The captcha verification failed" — even when the widget showed green in
+ * the same browser that sends the request (payload byte-identical to their
+ * frontend, scene/prefix/region identical). So there is NO captcha flow
+ * here anymore: Z.ai accounts are created/logged-in ON chat.z.ai (their
+ * page, their domain) and connected via the token bridge — see
+ * auth-screen.tsx / zai-link-card.tsx.
  *
  * Signing: chat.z.ai signs completions with a double HMAC-SHA256 whose
  * secret ships in their public bundle (`key-@@@@...)`). Here it runs via
@@ -108,32 +114,6 @@ export class ZaiDirectError extends Error {
     super(message)
     this.code = code
   }
-}
-
-function mapAuthError(status: number, txt: string): ZaiDirectError {
-  let detail = txt
-  try {
-    const j = JSON.parse(txt) as { detail?: unknown }
-    if (j?.detail) detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
-  } catch { /* raw text */ }
-  const short = detail.slice(0, 180)
-  if (/verification token/i.test(detail))
-    return new ZaiDirectError(
-      'Z.ai не принял код из письма (invalid verification token) — проверь код или запроси новый',
-      'bad_code',
-    )
-  if (/not pending/i.test(detail))
-    return new ZaiDirectError(
-      'Z.ai: активной регистрации с этим email нет — сначала реши капчу и нажми «Создать аккаунт»',
-      'signup_not_pending',
-    )
-  if (/captcha/i.test(detail))
-    return new ZaiDirectError(`Z.ai не принял проверку капчи: ${short}`, 'captcha_failed')
-  if (status === 400 && /already|exists|занят/i.test(detail))
-    return new ZaiDirectError(`Этот email уже зарегистрирован на Z.ai (${short})`, 'email_taken')
-  if (status === 401 || /invalid|wrong|incorrect|credential/i.test(detail))
-    return new ZaiDirectError(`Z.ai не принял email/пароль (${short})`, 'bad_credentials')
-  return new ZaiDirectError(`chat.z.ai auth ${status}: ${short}`, 'auth_failed')
 }
 
 /* ---------------------------------------------------------------- session */
@@ -408,10 +388,15 @@ function mapUpstreamError(err: { detail?: unknown; code?: unknown; error_code?: 
   const code = String(err.code ?? err.error_code ?? '')
   const detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail ?? err)
   if (code.includes('FRONTEND_CAPTCHA_REQUIRED'))
-    return new ZaiDirectError('Z.ai требует подтверждение капчи для этой сессии.', 'captcha_required')
+    return new ZaiDirectError(
+      'Z.ai требует капчу для этой сессии. Капча Z.ai проходит только на их домене: открой один раз ' +
+        'chat.z.ai в новой вкладке (можно просто открыть страницу), затем вернись и повтори сообщение.',
+      'captcha_required',
+    )
   if (code.includes('CAPTCHA') || /captcha/i.test(detail))
     return new ZaiDirectError(
-      'Капча Z.ai не прошла проверку. Реши капчу ещё раз и повтори сообщение.',
+      'Z.ai отклонил проверку капчи: капча принимается только на их собственном домене. ' +
+        'Подключи/обнови аккаунт Z.ai (кнопка «Z.ai» внизу слева) — с подключённым аккаунтом капча в чате не нужна.',
       'captcha_failed',
     )
   if (/user level/i.test(detail) || code === '403')
@@ -689,122 +674,7 @@ export async function chatTurn(opts: ChatOptions): Promise<string> {
   }
 }
 
-/* ------------------------------------------------------------------- auth */
-
-/** STEP 1 of Z.ai registration (captcha-gated): Z.ai emails a code. */
-export async function zaiSignUpStart(
-  name: string,
-  email: string,
-  password: string,
-  captchaVerifyParam: string,
-): Promise<void> {
-  const res = await fetch(`${ZAI_BASE}/api/v1/auths/signup`, {
-    method: 'POST',
-    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name: name || email.split('@')[0],
-      email,
-      password,
-      profile_image_url: '/static/favicon.png',
-      sso_redirect: '',
-      captcha_verify_param: captchaVerifyParam,
-    }),
-  })
-  const txt = await res.text().catch(() => '')
-  if (!res.ok) throw mapAuthError(res.status, txt)
-  let data: { detail?: string } = {}
-  try {
-    data = JSON.parse(txt)
-  } catch { /* empty body counts as success */ }
-  if (data?.detail) throw new ZaiDirectError(String(data.detail), 'auth_failed')
-}
-
-/** STEP 2 (no captcha): confirm the emailed code. */
-export async function zaiVerifyEmailCode(email: string, username: string, code: string): Promise<void> {
-  const res = await fetch(`${ZAI_BASE}/api/v1/auths/verify_email`, {
-    method: 'POST',
-    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: username || email.split('@')[0], email, token: code }),
-  })
-  const txt = await res.text().catch(() => '')
-  if (!res.ok) throw mapAuthError(res.status, txt)
-}
-
-/** STEP 3 (no captcha): finalize; response carries the JWT. */
-export async function zaiFinishSignup(
-  email: string,
-  username: string,
-  code: string,
-  password: string,
-): Promise<ZaiSession> {
-  const res = await fetch(`${ZAI_BASE}/api/v1/auths/finish_signup`, {
-    method: 'POST',
-    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      username: username || email.split('@')[0],
-      email,
-      token: code,
-      password,
-      profile_image_url: '/static/favicon.png',
-      sso_redirect: '',
-    }),
-  })
-  const txt = await res.text().catch(() => '')
-  if (!res.ok) throw mapAuthError(res.status, txt)
-  const data = JSON.parse(txt) as {
-    token?: string
-    user?: { token?: string; id?: string; name?: string; email?: string; role?: string }
-    id?: string
-    name?: string
-    email?: string
-    role?: string
-  }
-  const token = data?.user?.token || data?.token
-  if (!token) throw new ZaiDirectError('Z.ai не вернул токен аккаунта', 'auth_failed')
-  const u = data.user || data
-  return {
-    token,
-    userId: u.id || '',
-    name: u.name || username || 'User',
-    email: u.email || email,
-    role: u.role || 'user',
-  }
-}
-
-/** Re-send the signup verification email. */
-export async function zaiResendCode(name: string, email: string): Promise<void> {
-  const res = await fetch(`${ZAI_BASE}/api/v1/auths/resend_email`, {
-    method: 'POST',
-    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name || email.split('@')[0], email, sso_redirect: '' }),
-  })
-  const txt = await res.text().catch(() => '')
-  if (!res.ok) throw mapAuthError(res.status, txt)
-}
-
-/** Sign in to an EXISTING chat.z.ai account (captcha-gated by Z.ai). */
-export async function zaiSignIn(
-  email: string,
-  password: string,
-  captchaVerifyParam: string,
-): Promise<ZaiSession> {
-  const res = await fetch(`${ZAI_BASE}/api/v1/auths/signin`, {
-    method: 'POST',
-    headers: { ...commonHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password, captcha_verify_param: captchaVerifyParam }),
-  })
-  const txt = await res.text().catch(() => '')
-  if (!res.ok) throw mapAuthError(res.status, txt)
-  const data = JSON.parse(txt) as { token?: string; id?: string; name?: string; email?: string; role?: string }
-  if (!data?.token) throw new ZaiDirectError('Z.ai не вернул токен аккаунта', 'auth_failed')
-  return {
-    token: data.token,
-    userId: data.id || '',
-    name: data.name || 'User',
-    email: data.email || email,
-    role: data.role || 'user',
-  }
-}
+/* ------------------------------------------------------------------ attach */
 
 /**
  * Attach a freshly obtained REAL session to the site account: persist the

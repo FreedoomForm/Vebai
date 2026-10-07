@@ -16,7 +16,6 @@ import { Composer, type Effort, type SendOptions } from './composer'
 import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
 import { ZaiLinkCard } from './zai-link-card'
-import { solveZaiCaptcha, preloadZaiCaptcha } from './zai-captcha'
 import { chatTurn, type PlainMessage } from '@/lib/zai-direct'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
 
@@ -398,54 +397,34 @@ export function AgentApp() {
         return
       }
 
-      // 2) the browser talks to chat.z.ai directly (captcha retried in-place)
+      // 2) the browser talks to chat.z.ai directly (v11: no captcha retry —
+      //    a param solved on our domain is always rejected by their risk
+      //    engine, so a captcha demand is surfaced as an honest error)
       let answer = ''
       const activities: { name: string; summary: string }[] = []
-      let captchaParam: string | undefined
-      for (let attempt = 0; attempt < 2; attempt++) {
-        answer = ''
-        try {
-          answer = await chatTurn({
-            messages: history,
-            model,
-            webSearch,
-            effort,
-            captchaVerifyParam: captchaParam,
-            handlers: {
-              onDelta: (text) => onEvent({ type: 'delta', text }),
-              onActivity: (a) => {
-                if (a.done) {
-                  activities.push({ name: a.name, summary: a.summary || '' })
-                  onEvent({ type: 'tool_result', id: a.id, status: 'ok', summary: a.summary || '' })
-                } else {
-                  onEvent({ type: 'tool', id: a.id, call: { name: a.name, args: a.args || {}, status: 'running' } })
-                }
-              },
+      try {
+        answer = await chatTurn({
+          messages: history,
+          model,
+          webSearch,
+          effort,
+          handlers: {
+            onDelta: (text) => onEvent({ type: 'delta', text }),
+            onActivity: (a) => {
+              if (a.done) {
+                activities.push({ name: a.name, summary: a.summary || '' })
+                onEvent({ type: 'tool_result', id: a.id, status: 'ok', summary: a.summary || '' })
+              } else {
+                onEvent({ type: 'tool', id: a.id, call: { name: a.name, args: a.args || {}, status: 'running' } })
+              }
             },
-          })
-          break
-        } catch (e) {
-          const err = e as Error & { code?: string }
-          if (err.code === 'captcha_required') {
-            // Z.ai demands its captcha — solve it right here (same browser
-            // that will send the retried request) and retry once
-            try {
-              captchaParam = await solveZaiCaptcha()
-              continue
-            } catch (capErr) {
-              onEvent({
-                type: 'error',
-                message: capErr instanceof Error ? capErr.message.slice(0, 300) : 'капча Z.ai не прошла',
-                code: 'captcha_failed',
-              })
-              onEvent({ type: 'done' })
-              return
-            }
-          }
-          onEvent({ type: 'error', message: err.message.slice(0, 300), code: err.code })
-          onEvent({ type: 'done' })
-          return
-        }
+          },
+        })
+      } catch (e) {
+        const err = e as Error & { code?: string }
+        onEvent({ type: 'error', message: err.message.slice(0, 300), code: err.code })
+        onEvent({ type: 'done' })
+        return
       }
 
       // 3) persist the answer
@@ -529,11 +508,6 @@ export function AgentApp() {
   // from event handlers anymore — keep the hook for compatibility.
   useEffect(() => {
     resendRef.current = null
-  }, [])
-
-  useEffect(() => {
-    // warm the widget SDK so the first verification starts instantly
-    preloadZaiCaptcha()
   }, [])
 
   /* --------------------------------------------------------- conversation */
