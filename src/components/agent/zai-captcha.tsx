@@ -25,8 +25,15 @@ import { useEffect, useRef, useState } from 'react'
 const SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js'
 const REGION = 'sgp'
 const PREFIX = 'no8xfe'
-const SCENE_ID = 'didk33e0'
-/** chat.z.ai's signup/login scene (embed mode, visible in-form widget) */
+/** chat.z.ai's OWN chat-scene logic (byte-verified from prod-fe-1.1.98):
+ * `get SCENE_ID(){ return hostname === 'chat.z.ai' ? 'didk33e0' : 'xswyjefn' }`.
+ * The main scene 'didk33e0' is domain-bound to chat.z.ai — a param solved
+ * from a FOREIGN domain on that scene is rejected by their risk engine
+ * (the "green captcha, but verification failed" report). Their own code
+ * uses the alternate scene 'xswyjefn' everywhere else — so do we. */
+const CHAT_SCENE_ID = typeof window !== 'undefined' && window.location?.hostname === 'chat.z.ai' ? 'didk33e0' : 'xswyjefn'
+/** chat.z.ai's signup/login scene (embed mode, visible in-form widget; static
+ * in their frontend — no domain switch for this one) */
 export const AUTH_SCENE_ID = '36qgs6xb'
 const ELEMENT_ID = 'zai-captcha-element'
 const BUTTON_ID = 'zai-captcha-trigger'
@@ -194,7 +201,7 @@ export function solveZaiCaptcha(): Promise<string> {
         try {
           // fresh widget per verification (same as chat.z.ai's frontend)
           window.initAliyunCaptcha!({
-            SceneId: SCENE_ID,
+            SceneId: CHAT_SCENE_ID,
             mode: 'popup',
             element: `#${ELEMENT_ID}`,
             button: `#${BUTTON_ID}`,

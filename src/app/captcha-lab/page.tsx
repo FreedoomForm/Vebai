@@ -11,7 +11,13 @@ import { useEffect, useRef, useState } from 'react'
  */
 
 const SDK_URL = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js'
-const SCENES: Record<string, string> = { chat: 'didk33e0', auth: '36qgs6xb' }
+/** chat.z.ai prod-fe-1.1.98: chat scene is domain-switched — didk33e0 only
+ * on chat.z.ai itself, xswyjefn everywhere else. */
+const SCENES: Record<string, string> = {
+  chat: 'xswyjefn',
+  'chat-main-scene': 'didk33e0',
+  auth: '36qgs6xb',
+}
 
 type LabCaptchaWindow = Window & {
   AliyunCaptchaConfig?: { region: string; prefix: string }

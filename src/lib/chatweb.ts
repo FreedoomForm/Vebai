@@ -18,10 +18,10 @@
  * The server answers with {code: FRONTEND_CAPTCHA_REQUIRED, captcha_error_type:
  * 'missing_param'} until the request carries a one-time `captcha_verify_param`.
  * That param is produced by Aliyun's own slider widget which chat.z.ai's
- * frontend loads from o.alicdn.com with SceneId 'didk33e0' (their main scene;
- * Aliyun does NOT bind it to the chat.z.ai domain — verified: the widget
- * renders and passes on foreign domains, and chat.z.ai accepts the resulting
- * param). We therefore relay Z.ai's OWN captcha to our users: the user solves
+ * frontend loads from o.alicdn.com. SceneId is DOMAIN-SWITCHED in their
+ * frontend (prod-fe-1.1.98): 'didk33e0' only on chat.z.ai itself,
+ * 'xswyjefn' on every foreign domain — see zai-captcha.ts. We relay Z.ai's
+ * OWN captcha to our users: the user solves
  * it, we forward the param, chat.z.ai verifies it — no owner JWT, no homemade
  * captcha. One param = one request (reuse fails with verify_code F018).
  *
