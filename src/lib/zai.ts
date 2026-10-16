@@ -8,7 +8,7 @@
  * owner's free-model quota.
  *
  * Models (free on this platform):
- *   - glm-4.7-flash  — default (ZAI_MODEL), a thinking model
+ *   - glm-4.7-flash  — default (ZAI_MODEL), a thinking model (owner request)
  *   - glm-4.5-flash  — automatic fallback when 4.7-flash is overloaded
  * Image generation: cogview-3-flash (free) via ZAI_IMAGE_MODEL.
  *
