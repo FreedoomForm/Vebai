@@ -120,9 +120,13 @@ def _dir_signature(d):
     try:
         for p in d.rglob("*"):
             try:
-                if p.is_file() and "__pycache__" not in str(p):
-                    n += 1
-                    s += p.stat().st_size
+                if not p.is_file() or "__pycache__" in str(p):
+                    continue
+                parts = set(p.parts)
+                if parts & {".cache", ".npm", ".cargo", ".rustup", ".conda"}:
+                    continue  # tool caches never survive the snapshot anyway
+                n += 1
+                s += p.stat().st_size
             except Exception:
                 pass
     except Exception:
@@ -170,6 +174,8 @@ def _upload_new_files(ws, t_start, tid, tag, limit=5):
             try:
                 if not p.is_file() or "__pycache__" in str(p):
                     continue
+                if set(p.parts) & {".cache", ".npm", ".cargo", ".rustup", ".conda"}:
+                    continue
                 if p.name.endswith(".tgz"):
                     continue
                 st = p.stat()
@@ -203,10 +209,13 @@ class PersistentShell:
         self._spawn()
 
     def _spawn(self):
+        # HOME points INTO the workspace: the agent naturally writes to ~, and
+        # only the workspace tree gets snapshotted to Telegram
+        env = {**os.environ, "HOME": self.cwd}
         self.p = subprocess.Popen(
             ["bash", "--noprofile", "--norc"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=self.cwd,
-            preexec_fn=os.setsid, text=True, bufsize=1)
+            preexec_fn=os.setsid, text=True, bufsize=1, env=env)
         self.sel = _selectors.DefaultSelector()
         self.sel.register(self.p.stdout, _selectors.EVENT_READ)
 
