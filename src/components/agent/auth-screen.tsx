@@ -17,7 +17,6 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('register')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
@@ -40,9 +39,7 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
       const res = await fetch(`/api/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(
-          mode === 'register' ? { email, password, name } : { email, password },
-        ),
+        body: JSON.stringify({ email, password }),
       })
       const data = (await res.json().catch(() => ({}))) as {
         error?: string
@@ -94,14 +91,6 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
               ))}
             </div>
 
-            {mode === 'register' && (
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Имя (необязательно)"
-                className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-sm text-stone-800 placeholder:text-stone-400 outline-none focus:border-stone-400"
-              />
-            )}
             <input
               value={email}
               onChange={(e) => setEmail(e.target.value)}

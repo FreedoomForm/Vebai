@@ -15,7 +15,9 @@ export async function GET(
 
   const { id } = await params
   const conv = await db.conversation.findUnique({ where: { id } })
-  if (!conv || (user && conv.userId && conv.userId !== user.id))
+  // strict per-account isolation: a conversation is readable only by its owner
+  // (in open/sandbox mode user is null and the gate stays pass-through)
+  if (!conv || (user ? !conv.userId || conv.userId !== user.id : false))
     return NextResponse.json({ error: 'conversation not found' }, { status: 404 })
 
   const [messages, tasks] = await Promise.all([
