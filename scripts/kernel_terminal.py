@@ -40,16 +40,22 @@ def _requests():
 
 
 def _load_telegram_cfg(base):
-    """lazy one-time read of config.json shipped with the jobs batch; restores
-    workspace snapshots pushed by earlier worker sessions."""
-    if TG["restored"]:
+    """lazy read of config.json shipped with the jobs batch; re-reads on every
+    batch until token+chat_id are known (the first batch can race the server's
+    chat_id discovery). Workspace snapshot restore happens once per session."""
+    need_cfg = not (TG["token"] and TG["chat_id"])
+    if not need_cfg and TG["restored"]:
         return
-    TG["restored"] = True
     try:
         cfg = json.loads((Path(base) / "config.json").read_text(encoding="utf-8"))
-        TG["token"] = cfg.get("telegram_token") or None
-        TG["chat_id"] = str(cfg.get("telegram_chat_id")) if cfg.get("telegram_chat_id") else None
+        if not TG["token"]:
+            TG["token"] = cfg.get("telegram_token") or None
+        if not TG["chat_id"] and cfg.get("telegram_chat_id"):
+            TG["chat_id"] = str(cfg.get("telegram_chat_id"))
         snaps = cfg.get("term_snapshots") or {}
+        if TG["restored"] or not (TG["token"] and TG["chat_id"]):
+            return
+        TG["restored"] = True
         if TG["token"] and TG["chat_id"]:
             for tid, fid in snaps.items():
                 try:
