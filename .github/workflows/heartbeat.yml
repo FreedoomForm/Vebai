@@ -1,0 +1,19 @@
+name: vebai heartbeat
+# Drives the Vercel agent worker: /api/agent/tick picks up queued terminal
+# commands and video batches and delivers finished Kaggle jobs even when no
+# browser is open. GitHub Actions cron floor is 5 minutes; UI-open clients
+# additionally tick via /api/agent/state polls.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ping agent tick
+        run: |
+          for i in 1 2 3; do
+            curl -s -m 120 "https://vebai-six.vercel.app/api/agent/tick" && echo
+            sleep 5
+          done
