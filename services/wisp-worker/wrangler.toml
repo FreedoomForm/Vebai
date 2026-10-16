@@ -2,6 +2,10 @@ name = "vebai-wisp"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
+# every 5 minutes: ping /api/agent/tick on production (24/7 job delivery)
+[triggers]
+crons = ["*/5 * * * *"]
+
 # Deploy (needs a free Cloudflare account + `npx wrangler login`):
 #   cd services/wisp-worker && npx wrangler deploy
 # Then set in Vercel:

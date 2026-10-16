@@ -47,6 +47,18 @@ class FrameReader {
 }
 
 export default {
+  // Cron trigger: 24/7 pinger for the Vercel agent worker. GitHub Actions
+  // cron proved unreliable (1 scheduled run ever), so the always-on delivery
+  // of finished Kaggle jobs rides on this schedule instead. Every 5 minutes:
+  // /api/agent/tick -> agentTick() -> syncStudio() -> pick up clips + merges.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      fetch('https://vebai-six.vercel.app/api/agent/tick')
+        .then((r) => r.text())
+        .catch(() => {}),
+    )
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url)
     if (!url.pathname.endsWith('/')) {
