@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, Circle, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X,
+  Loader2, Circle, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -73,6 +73,7 @@ export function AgentApp() {
   const [sending, setSending] = useState(false)
   const [errorMsg, setErrorMsg] = useState<{ message: string; code?: string } | null>(null)
   const [worker, setWorker] = useState({ activeTasks: 0, queued: 0, running: 0 })
+  const [pendingVterm, setPendingVterm] = useState(0)
   const [navOpen, setNavOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
 
@@ -96,6 +97,23 @@ export function AgentApp() {
   const startSeenRef = useRef(false)
 
   /* --------------------------------------------------- persisted settings */
+
+  useEffect(() => {
+    if (!session.user) return
+    let stop = false
+    const pollVterm = async () => {
+      try {
+        const r = await fetch('/api/terminal/pending')
+        if (r.ok && !stop) setPendingVterm(((await r.json()) as { pending: number }).pending || 0)
+      } catch { /* ignore */ }
+    }
+    setTimeout(pollVterm, 400)
+    const t = setInterval(pollVterm, 25_000)
+    return () => {
+      stop = true
+      clearInterval(t)
+    }
+  }, [session.user])
 
   useEffect(() => {
     try {
@@ -674,6 +692,20 @@ export function AgentApp() {
           <MessageSquarePlus className="h-4 w-4" />
           Новый чат
         </Button>
+        <a
+          href="/terminal"
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 flex w-full items-center justify-start gap-2 rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-100"
+        >
+          <SquareTerminal className="h-4 w-4 text-stone-500" />
+          Терминал (Linux)
+          {pendingVterm > 0 && (
+            <span className="ml-auto rounded-full bg-emerald-600 px-1.5 text-[10px] font-semibold text-white">
+              {pendingVterm}
+            </span>
+          )}
+        </a>
       </div>
       <div className="mt-3 flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
         {conversations.map((c) => (

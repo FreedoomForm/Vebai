@@ -20,8 +20,8 @@ function systemPrompt(): string {
     '- Отвечай по делу: структурируй ответы заголовками и списками, используй markdown; код — в блоках с указанием языка.',
     '- Инструмент видео: сайт умеет генерировать короткие клипы (5 или 10 секунд) через свой фоновый пайплайн на Kaggle (модель MiniMax H3, постоянный GPU-воркер). Если пользователь просит видео — предложи включить кнопку «Сделать видео» в поле ввода и кратко опиши задуманные кадры (сюжет, движение камеры, свет). Видео появляется в чате автоматически, когда готово; генерация может занять несколько минут.',
     '- ДЛИННОЕ ВИДЕО — это НЕ проблема: один клип максимум 10 секунд, но клипы автоматически склеиваются в ОДИН готовый файл (ffmpeg). Поэтому, если просят видео длиннее 10 секунд (например «1 минута: человек играет на пианино»), НЕ отказывайся и не проси сокращать: предложи раскадровку из нужного числа клипов по 10 секунд (1 минута = 6 клипов) с описанием каждого кадра, а сайт сам сгенерирует их и склеит в единый ролик.',
-    '- У тебя есть инструмент terminal: настоящий Linux-терминал (Ubuntu на серверном воркере: python3, pip, ffmpeg, git, curl). Он СОСТОЯТЕЛЬНЫЙ — текущая папка, файлы, export-переменные и venv сохраняются между командами и между сессиями. Файлы, созданные в терминале, сохраняются в Telegram-канал владельца с пометкой ID терминала, а рабочее пространство переживает перезапуски. Команда выполняется 1-5 минут, вывод придёт отдельным сообщением. Используй его, когда пользователь просит выполнить код, установить пакет, обработать файл или что-то посчитать; длинные команды (дольше 15 минут) — не запускай.',
-    '- ПРОТОКОЛ ВЫПОЛНЕНИЯ КОМАНД: если пользователь просит ВЫПОЛНИТЬ/ЗАПУСТИТЬ команду или код (а не просто показать), в конце ответа добавь блок вида:\n```run-terminal\nкоманда\n``` — по одной команде на блок, максимум 3 блока на ответ (для серии команд используй `cmd1 && cmd2` или мини-скрипт). ОБЫЧНЫЕ примеры кода в этот формат НЕ заворачивай — только реальное исполнение. Результат выполнения придёт в чат отдельным сообщением.',
+    '- У тебя есть ДВА терминала. (1) terminal (блоки ```run-terminal```): фоновый Linux-воркер (Ubuntu на Kaggle: python3, pip, ffmpeg, git, curl) — работает 24/7 даже при закрытом браузере, но команда выполняется 1-5 минут. (2) ИНТЕРАКТИВНЫЙ терминал (блоки ```run-vterm```): настоящий Alpine Linux в браузере пользователя (v86) — мгновенный отклик, нужен только пользователь, стейт-файлы в Telegram, но медленный CPU и вкладка должна быть открыта; если она закрыта, владелец получит уведомление в Telegram. Для быстрых команд (посчитать, создать файл, посмотреть систему) предпочитай run-vterm; для тяжёлых/долгих (pip с компиляцией, видео, длинные скрипты) — run-terminal.',
+    '- ПРОТОКОЛ ВЫПОЛНЕНИЯ КОМАНД: если пользователь просит ВЫПОЛНИТЬ/ЗАПУСТИТЬ команду или код (а не просто показать), в конце ответа добавь блок вида:\n```run-terminal\nкоманда\n``` (фоновый воркер) ИЛИ \n```run-vterm\nкоманда\n``` (интерактивный терминал в браузере) — по одной команде на блок, максимум 3 блока на ответ (для серии команд используй `cmd1 && cmd2` или мини-скрипт). ОБЫЧНЫЕ примеры кода в этот формат НЕ заворачивай — только реальное исполнение. Результат выполнения придёт в чат отдельным сообщением.',
     '- Создание изображений НЕДОСТУПНО (генерация картинок на сайте отключена). Если просят нарисовать/сгенерировать изображение — честно скажи, что генерация изображений на сайте сейчас отключена, и предложи альтернативу: короткое видео по этому же описанию (кнопка «Сделать видео»), либо подробное текстовое описание/промпт, который пользователь сможет использовать в любом внешнем генераторе картинок.',
     '- Не выдумывай факты; если не уверен — честно скажи об этом.',
     `- Текущая дата и время (UTC): ${now.toISOString().slice(0, 19).replace('T', ' ')}`,
@@ -53,6 +53,41 @@ async function launchTerminalBlocks(text: string, conversationId: string): Promi
         payload: JSON.stringify({ command, terminalId: conversationId, timeoutS: 240 }),
       },
     })
+    n++
+  }
+  return n
+}
+
+/** the model can also target the INTERACTIVE browser terminal (v86 VM in the
+ * user's tab): ```run-vterm\n<cmd>\n``` — queued as TerminalCommand; the page
+ * executes it and the output is posted back to this chat + Telegram. If no
+ * terminal page is open (stale heartbeat) the owner gets a Telegram nudge. */
+async function launchVtermBlocks(text: string, conversationId: string, userId: string | null): Promise<number> {
+  const re = /```run-vterm\s*\n([\s\S]*?)```/g
+  let n = 0
+  for (let m = re.exec(text); m && n < 3; m = re.exec(text)) {
+    const command = m[1].trim().slice(0, 3400)
+    if (!command) continue
+    let session = await db.terminalSession.findFirst({
+      where: { kind: 'browser', status: 'active', userId: userId ?? undefined },
+      orderBy: { updatedAt: 'desc' },
+    })
+    if (!session) {
+      session = await db.terminalSession.create({
+        data: { kind: 'browser', userId: userId, title: 'Терминал агента', secret: crypto.randomUUID().replace(/-/g, '') },
+      })
+    }
+    await db.terminalCommand.create({
+      data: { sessionId: session.id, conversationId, command, source: 'agent' },
+    })
+    await db.terminalSession.update({ where: { id: session.id }, data: { updatedAt: new Date() } })
+    const stale = !session.lastSeenAt || Date.now() - session.lastSeenAt.getTime() > 90_000
+    if (stale) {
+      const { sendTelegramText } = await import('@/lib/telegram')
+      void sendTelegramText(
+        `🧠 Агенту нужен твой компьютер: команда ждёт в очереди браузерного терминала.\nОткрой вкладку «Терминал»: ${process.env.NEXT_PUBLIC_SITE_URL || 'https://vebai-six.vercel.app'}/terminal\n$ ${command.slice(0, 200)}`,
+      ).catch(() => {})
+    }
     n++
   }
   return n
@@ -322,7 +357,14 @@ export async function POST(req: NextRequest) {
               if (n > 0) {
                 controller.enqueue(sse({
                   type: 'notice',
-                  text: `⌨️ ${n} команда(ы) отправлены в Linux-терминал — вывод придёт отдельным сообщением через 1-5 минут`,
+                  text: `⌨️ ${n} команда(ы) отправлены в фоновый Linux-воркер — вывод придёт отдельным сообщением через 1-5 минут`,
+                }))
+              }
+              const nv = await launchVtermBlocks(fullAnswer, conversationId, conv.userId)
+              if (nv > 0) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: `🖥 ${nv} команда(ы) в очереди интерактивного терминала (/terminal) — вывод придёт, как только вкладка терминала их выполнит`,
                 }))
               }
             }

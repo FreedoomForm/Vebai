@@ -105,3 +105,58 @@ model StudioState {
   data      String // JSON of StudioState shape
   updatedAt DateTime @updatedAt
 }
+
+// Browser terminal (v86 in-tab VM) session. The VM itself lives in the
+// user's browser; the DB keeps the queue, the files and the session secret
+// so the agent (Vercel) and the page can cooperate and resume work.
+model TerminalSession {
+  id         String   @id @default(cuid())
+  userId     String?
+  kind       String   @default("browser") // browser | kaggle
+  title      String   @default("")
+  status     String   @default("active") // active | archived
+  secret     String // random hex; guest scripts use it to upload files
+  lastSeenAt DateTime? // page heartbeat: VM alive in some browser tab
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  commands   TerminalCommand[]
+  files      TerminalFile[]
+
+  @@index([userId, status])
+}
+
+// One queued command for a TerminalSession. The browser page polls pending
+// commands, types them into the VM and posts the captured output back.
+model TerminalCommand {
+  id             String          @id @default(cuid())
+  sessionId      String
+  session        TerminalSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  conversationId String? // when set, the result is posted back to this chat
+  command        String
+  status         String          @default("pending") // pending | running | done | failed
+  output         String?
+  exitCode       Int?
+  source         String          @default("agent") // agent | user
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([sessionId, status])
+}
+
+// Files produced inside the browser VM (synced by the guest daemon).
+// Small files are kept in Postgres for restore; everything is mirrored to
+// the owner's Telegram channel with the terminal id in the caption.
+model TerminalFile {
+  id        String          @id @default(cuid())
+  sessionId String
+  session   TerminalSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  path      String
+  size      Int             @default(0)
+  mime      String?
+  data      Bytes? // only for files <= 3.5MB (restore without Telegram)
+  tgOk      Boolean         @default(false)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@unique([sessionId, path])
+}
