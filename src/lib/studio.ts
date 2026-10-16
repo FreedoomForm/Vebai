@@ -462,11 +462,51 @@ async function pollWorker() {
   const st = await readState()
   const slug = st.workerType === 'test' ? WORKER_TEST_KERNEL : WORKER_KERNEL
   const status = await kernelStatus(slug)
+  const alive = status === 'RUNNING' || status === 'QUEUED'
   await writeState({
     kernelStatus: status,
     kernelStatusAt: new Date().toISOString(),
     activeBatchId: st.activeBatchId,
+    // worker confirmed alive -> a submit failure note from an earlier attempt
+    // (or a token-less run on a foreign machine sharing the DB) is stale
+    ...(alive ? { lastError: undefined } : {}),
   })
+
+  // zombie watchdog: the worker self-limits to 8.4h and Kaggle hard-kills at
+  // 9h -- a session still claiming RUNNING/QUEUED past ~8.7h is a lie (silent
+  // livelock). Re-push the kernel: Kaggle cancels the old session, the fresh
+  // one re-picks pending jobs (done_ids prevents regenerating finished ones).
+  const ageMs = st.workerEventAt ? Date.now() - Date.parse(st.workerEventAt) : 0
+  if (alive && ageMs > 8.7 * 3_600_000) {
+    const restarts = st.workerRestarts ?? 0
+    if (restarts < MAX_WORKER_RESTARTS) {
+      const wanted = st.workerType === 'test' ? 'workerTest' : 'workerReal'
+      await pushKernel(kernelDefs()[wanted])
+      await writeState({
+        kernelStatus: 'QUEUED',
+        kernelStatusAt: new Date().toISOString(),
+        workerRestarts: restarts + 1,
+        workerEventAt: new Date().toISOString(),
+        lastError: undefined,
+      })
+      console.warn(
+        `[studio] zombie worker: ${Math.round(ageMs / 3_600_000)}h ${status} with no output -> re-pushed ${wanted}`,
+      )
+    } else {
+      const remaining = await db.job.findMany({ where: { status: 'generating' } })
+      for (const job of remaining) {
+        await db.job.update({
+          where: { id: job.id },
+          data: {
+            status: 'failed',
+            error: `воркер Kaggle завис (${Math.round(ageMs / 3_600_000)} ч без результата), лимит перезапусков исчерпан`,
+          },
+        })
+      }
+      await writeState({ activeBatchId: null, workerRestarts: 0 })
+    }
+    return readState()
+  }
 
   // incremental delivery: the worker pushes the outputs dataset after every job
   const lu = await datasetLatestFileTime(OUTPUTS_DATASET)
