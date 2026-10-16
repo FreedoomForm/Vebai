@@ -216,7 +216,7 @@ export class BrowserTerminal {
     }
 
     const snapshot = await idbGet(SNAPSHOT_KEY_PREFIX + this.sid)
-    const cdrom = { url: '/v86/alpine-virt.iso', async: true, size: 62_914_560 }
+    const cdrom = { url: '/v86/alpine-virt.iso', async: true, size: 48_234_496 }
 
     const config: Record<string, unknown> = {
       wasm_path: '/v86/v86.wasm',
@@ -227,6 +227,9 @@ export class BrowserTerminal {
       cdrom,
       autostart: true,
       disable_speaker: true,
+      // v86's browser build requires a structured screen container (text div
+      // + canvas) or the CPU loop stalls silently; we keep it hidden — the
+      // user-facing console is the SERIAL terminal rendered into xterm.
       screen: { container: this.hiddenScreenContainer() },
     }
     if (this.wispUrl) config.network_relay_url = this.wispUrl
@@ -238,7 +241,7 @@ export class BrowserTerminal {
     } else {
       config.bzimage = { url: '/v86/vmlinuz-virt' }
       config.initrd = { url: '/v86/initramfs-virt' }
-      config.cmdline = 'modules=loop,squashfs,sd-mod,usb-storage quiet console=ttyS0,115200'
+      config.cmdline = 'modules=loop,squashfs,sd-mod,usb-storage console=ttyS0,115200'
     }
 
     try {
@@ -247,6 +250,17 @@ export class BrowserTerminal {
       this.setStatus('error', e instanceof Error ? e.message : 'v86 init failed')
       return
     }
+    ;(window as any).__vbtEmu = this.emu
+    for (const ev of ['emulator-loaded', 'emulator-ready', 'emulator-started']) {
+      this.emu.add_listener(ev, () => this.cb.onNotice(`v86: ${ev}`))
+    }
+    // debug: keep the last VGA text chars around for headless diagnostics
+    ;(window as any).__vbtScreenTail = ''
+    this.emu.add_listener('screen-put-char', (...args: number[]) => {
+      const chr = args[2]
+      const c = chr >= 32 && chr < 127 ? String.fromCharCode(chr) : ''
+      if (c) (window as any).__vbtScreenTail = ((window as any).__vbtScreenTail + c).slice(-200)
+    })
 
     this.emu.add_listener('serial0-output-byte', this.handleSerialByte)
     this.sendSerial = (d: string) => this.emu.serial0_send(d)
@@ -277,7 +291,8 @@ export class BrowserTerminal {
           this.afterReady()
         } else {
           this.restoredSnapshot = false
-          this.cb.onNotice('Снапшот не содержит живого шелла — захожу заново')
+          this.cb.onNotice('Снапшот не содержит живого шелла — перезагружаюсь заново')
+          void this.restartFresh()
         }
       }, 7000)
     }
@@ -290,9 +305,40 @@ export class BrowserTerminal {
     return /V8# /.test(this.serialTail)
   }
 
+  /** snapshot turned out to be dead: drop it and boot from scratch */
+  private async restartFresh() {
+    try {
+      const db = await idbOpen()
+      if (db) {
+        const tx = db.transaction('kv', 'readwrite')
+        tx.objectStore('kv').delete(SNAPSHOT_KEY_PREFIX + this.sid)
+      }
+    } catch { /* ignore */ }
+    try {
+      this.emu?.destroy()
+    } catch { /* noop */ }
+    this.emu = null
+    this.bootDoneSetup = false
+    this.loginPoll = null
+    if (this.queueTimer) { clearInterval(this.queueTimer); this.queueTimer = null }
+    if (this.beatTimer) { clearInterval(this.beatTimer); this.beatTimer = null }
+    if (this.saveTimer) { clearInterval(this.saveTimer); this.saveTimer = null }
+    this.term.reset()
+    this.term.writeln('\x1b[33mПересоздаю VM (снапшот был повреждён)…\x1b[0m')
+    await this.start()
+  }
+
   private hiddenScreenContainer(): HTMLElement {
+    // exact structure v86's ScreenAdapter expects (see v86 basic.html):
+    // container -> [text_screen div, canvas]
     const div = document.createElement('div')
-    div.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;left:-9999px'
+    div.style.cssText = 'position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none'
+    const text = document.createElement('div')
+    text.style.cssText = 'white-space:pre;font:14px monospace;line-height:14px'
+    const canvas = document.createElement('canvas')
+    canvas.style.display = 'none'
+    div.appendChild(text)
+    div.appendChild(canvas)
     document.body.appendChild(div)
     return div
   }
@@ -358,7 +404,8 @@ export class BrowserTerminal {
   }
 
   async saveSnapshot() {
-    if (this.destroyed || !this.emu || this.busy) return
+    // never snapshot a half-booted/dead VM — restore would wedge the session
+    if (this.destroyed || !this.emu || this.busy || this.stage !== 'ready') return
     try {
       const state = await this.emu.save_state()
       const ok = await idbPut(SNAPSHOT_KEY_PREFIX + this.sid, state)

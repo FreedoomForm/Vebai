@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>v86 isolation test</title></head>
+<body>
+<div id="screen" style="white-space:pre;font:14px monospace;line-height:14px">
+  <div></div><canvas style="display:none"></canvas>
+</div>
+<pre id="term"></pre>
+<script src="/v86/libv86.js"></script>
+<script>
+window.addEventListener('load', function() {
+  try {
+    var emulator = new V86({
+      wasm_path: "/v86/v86.wasm",
+      screen_container: document.getElementById("screen"),
+      bios: { url: "/v86/seabios.bin" },
+      vga_bios: { url: "/v86/vgabios.bin" },
+      bzimage: { url: "/v86/vmlinuz-virt" },
+      initrd: { url: "/v86/initramfs-virt" },
+      cmdline: "console=ttyS0 tsc=reliable",
+      cdrom: { url: "/v86/alpine-virt.iso", async: true, size: 62914560 },
+      autostart: true,
+      memory_size: 512 * 1024 * 1024,
+    });
+    window.__emu = emulator;
+    var term = document.getElementById("term");
+    emulator.add_listener("serial0-output-byte", function(b) { term.textContent += String.fromCharCode(b); });
+    emulator.add_listener("emulator-started", function() { term.textContent += "\n[v86 started]\n"; });
+    emulator.add_listener("download-error", function(e) { term.textContent += "\n[download-error] " + JSON.stringify(e) + "\n"; });
+  } catch (e) {
+    document.getElementById("term").textContent = "ERROR: " + e.message;
+  }
+});
+</script>
+</body></html>
