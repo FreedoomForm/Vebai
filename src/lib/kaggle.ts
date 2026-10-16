@@ -179,9 +179,25 @@ export async function downloadOutputFile(file: OutputFile, timeoutMs = 300_000):
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
+    // stream (not arrayBuffer): undici intermittently kills the buffered body
+    // with a bogus "Array buffer allocation failed"
     const res = await fetch(file.url, { signal: ctrl.signal, redirect: 'follow' })
-    if (!res.ok) throw new KaggleError(`output download ${res.status} for ${file.fileName}`, res.status)
-    return Buffer.from(await res.arrayBuffer())
+    if (!res.ok || !res.body) {
+      throw new KaggleError(`output download ${res.status} for ${file.fileName}`, res.status)
+    }
+    const reader = res.body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      total += value.byteLength
+    }
+    const out = new Uint8Array(total)
+    let off = 0
+    for (const c of chunks) { out.set(c, off); off += c.byteLength }
+    return Buffer.from(out)
   } finally {
     clearTimeout(t)
   }
@@ -342,22 +358,53 @@ export async function datasetLatestFileTime(slug: string): Promise<string> {
 /** download the whole latest dataset version as a zip (Buffer) */
 export async function datasetDownloadZip(slug = OUTPUTS_DATASET, timeoutMs = 600_000): Promise<Buffer> {
   const [ownerSlug, dsSlug] = slug.split('/')
-  const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), timeoutMs)
-  try {
-    const res = await fetch(`${BASE}/datasets.DatasetApiService/DownloadDataset`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ ownerSlug, datasetSlug: dsSlug }),
-      redirect: 'follow', // 302 -> signed bucket URL
-      signal: ctrl.signal,
-    })
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '')
-      throw new KaggleError(`dataset download ${res.status}: ${txt.slice(0, 200)}`, res.status)
+  // NOTE: res.arrayBuffer() on the followed redirect intermittently dies with
+  // a misleading "Array buffer allocation failed" (undici drops the stream
+  // mid-buffer). Download manually: 302 -> GET signed URL -> stream to chunks,
+  // and retry a couple of times; Kaggle/GCS flakiness here is real.
+  let lastErr: unknown
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ctrl = new AbortController()
+    const t = setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      const r1 = await fetch(`${BASE}/datasets.DatasetApiService/DownloadDataset`, {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ ownerSlug, datasetSlug: dsSlug }),
+        redirect: 'manual',
+        signal: ctrl.signal,
+      })
+      if (r1.status === 404) throw new KaggleError(`dataset download 404 (${slug})`, 404)
+      const loc = r1.headers.get('location')
+      if (!loc) {
+        const txt = await r1.text().catch(() => '')
+        throw new KaggleError(`dataset download ${r1.status}: no redirect, ${txt.slice(0, 160)}`, r1.status)
+      }
+      const res = await fetch(loc, { signal: ctrl.signal })
+      if (!res.ok || !res.body) {
+        throw new KaggleError(`dataset download signed ${res.status}`, res.status)
+      }
+      const reader = res.body.getReader()
+      const chunks: Uint8Array[] = []
+      let total = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        chunks.push(value)
+        total += value.byteLength
+        if (total > 256 * 1024 * 1024) throw new KaggleError('dataset zip > 256MB', 413)
+      }
+      const out = new Uint8Array(total)
+      let off = 0
+      for (const c of chunks) { out.set(c, off); off += c.byteLength }
+      return Buffer.from(out)
+    } catch (e) {
+      lastErr = e
+      if (e instanceof KaggleError && (e.status === 404 || e.status === 413)) throw e
+      await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)))
+    } finally {
+      clearTimeout(t)
     }
-    return Buffer.from(await res.arrayBuffer())
-  } finally {
-    clearTimeout(t)
   }
+  throw lastErr instanceof Error ? lastErr : new KaggleError('dataset download failed', 502)
 }

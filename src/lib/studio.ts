@@ -1,4 +1,4 @@
-import { unzipSync } from 'fflate'
+import AdmZip from 'adm-zip'
 import { db } from '@/lib/db'
 import {
   JOBS_DATASET,
@@ -367,10 +367,13 @@ function mapFromFileEntries(entries: { name: string; data: Buffer }[]): FileMap 
 }
 
 function unzipToEntries(zip: Buffer): { name: string; data: Buffer }[] {
-  const unzipped = unzipSync(new Uint8Array(zip))
-  return Object.entries(unzipped)
-    .filter(([name]) => !name.startsWith('__MACOSX') && !name.endsWith('/'))
-    .map(([name, data]) => ({ name, data: Buffer.from(data) }))
+  // NOTE: fflate's unzipSync crashes with "Array buffer allocation failed" on
+  // Kaggle-built zips (misparsed sizes -> huge alloc); adm-zip reads them fine.
+  const az = new AdmZip(zip)
+  return az
+    .getEntries()
+    .filter((e) => !e.isDirectory && !e.entryName.startsWith('__MACOSX'))
+    .map((e) => ({ name: e.entryName, data: e.getData() }))
 }
 
 /** worker outputs carry job_<id>.mp4 files; deliver them into Job.videoData.
