@@ -35,18 +35,18 @@ interface StreamState {
 
 /* --------------------------------------------------------------- models */
 // free models on the official Z.ai API (whitelisted server-side);
-// owner request: glm-4.5-flash is the default, 4.7-flash is the fallback
+// owner request (2026-10-16): glm-4.7-flash is the default, 4.5-flash is the fallback
 const MODEL_OPTIONS = [
-  {
-    id: 'glm-4.5-flash',
-    label: 'GLM-4.5-Flash',
-    sub: 'Быстрая и стабильная — основной выбор',
-    badge: 'FREE',
-  },
   {
     id: 'glm-4.7-flash',
     label: 'GLM-4.7-Flash',
-    sub: 'Глубокое мышление — резерв при перегрузке 4.5',
+    sub: 'Глубокое мышление — основной выбор',
+    badge: 'FREE',
+  },
+  {
+    id: 'glm-4.5-flash',
+    label: 'GLM-4.5-Flash',
+    sub: 'Быстрая и стабильная — резерв при перегрузке 4.7',
   },
 ] as const
 
@@ -78,7 +78,7 @@ export function AgentApp() {
   const [activityOpen, setActivityOpen] = useState(false)
 
   // composer / selector state (persisted)
-  const [model, setModel] = useState<string>('glm-4.5-flash')
+  const [model, setModel] = useState<string>('glm-4.7-flash')
   const [effort, setEffort] = useState<Effort>('max')
   const [webSearch, setWebSearch] = useState(false)
   const [video, setVideo] = useState(false)

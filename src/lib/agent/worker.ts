@@ -52,6 +52,15 @@ interface ShotSpec {
 async function startVideoTask(taskId: string) {
   const task = await db.agentTask.findUnique({ where: { id: taskId } })
   if (!task || task.status !== 'queued') return
+  // ATOMIC CLAIM: two ticks can run concurrently (browser-driven + GitHub
+  // heartbeat). Both used to pass the queued check and create duplicate Jobs
+  // (2x GPU spend). updateMany ... WHERE status='queued' lets exactly one
+  // tick win; the loser sees count=0 and exits.
+  const claim = await db.agentTask.updateMany({
+    where: { id: taskId, status: 'queued' },
+    data: { status: 'running' },
+  })
+  if (claim.count !== 1) return
   let payload: { shots?: ShotSpec[]; testMode?: boolean } = {}
   try { payload = JSON.parse(task.payload || '{}') } catch { /* ignore */ }
   const shots = payload.shots || []
@@ -70,7 +79,7 @@ async function startVideoTask(taskId: string) {
       if (img && (img.status === 'queued' || img.status === 'running')) {
         await db.agentTask.update({
           where: { id: task.id },
-          data: { progress: 'Жду первый кадр от генерации изображений…' },
+          data: { status: 'queued', progress: 'Жду первый кадр от генерации изображений…' },
         })
         return // retry on the next tick
       }
@@ -318,6 +327,12 @@ interface TerminalPayload {
 async function startTerminalTask(taskId: string) {
   const task = await db.agentTask.findUnique({ where: { id: taskId } })
   if (!task || task.status !== 'queued') return
+  // ATOMIC CLAIM (same race as video tasks — see startVideoTask)
+  const claim = await db.agentTask.updateMany({
+    where: { id: taskId, status: 'queued' },
+    data: { status: 'running' },
+  })
+  if (claim.count !== 1) return
   let payload: TerminalPayload = {}
   try { payload = JSON.parse(task.payload || '{}') } catch { /* ignore */ }
   const command = String(payload.command || '').trim()
