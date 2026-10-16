@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server'
 import { requireAuth } from '@/lib/auth'
+import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 
@@ -18,6 +19,9 @@ function systemPrompt(): string {
     '- Отвечай на языке пользователя (по умолчанию — русский).',
     '- Отвечай по делу: структурируй ответы заголовками и списками, используй markdown; код — в блоках с указанием языка.',
     '- Инструмент видео: сайт умеет генерировать короткие клипы (5 или 10 секунд) через свой фоновый пайплайн на Kaggle (модель MiniMax H3, постоянный GPU-воркер). Если пользователь просит видео — предложи включить кнопку «Сделать видео» в поле ввода и кратко опиши задуманные кадры (сюжет, движение камеры, свет). Видео появляется в чате автоматически, когда готово; генерация может занять несколько минут.',
+    '- ДЛИННОЕ ВИДЕО — это НЕ проблема: один клип максимум 10 секунд, но клипы автоматически склеиваются в ОДИН готовый файл (ffmpeg). Поэтому, если просят видео длиннее 10 секунд (например «1 минута: человек играет на пианино»), НЕ отказывайся и не проси сокращать: предложи раскадровку из нужного числа клипов по 10 секунд (1 минута = 6 клипов) с описанием каждого кадра, а сайт сам сгенерирует их и склеит в единый ролик.',
+    '- У тебя есть инструмент terminal: настоящий Linux-терминал (Ubuntu на серверном воркере: python3, pip, ffmpeg, git, curl). Он СОСТОЯТЕЛЬНЫЙ — текущая папка, файлы, export-переменные и venv сохраняются между командами и между сессиями. Файлы, созданные в терминале, сохраняются в Telegram-канал владельца с пометкой ID терминала, а рабочее пространство переживает перезапуски. Команда выполняется 1-5 минут, вывод придёт отдельным сообщением. Используй его, когда пользователь просит выполнить код, установить пакет, обработать файл или что-то посчитать; длинные команды (дольше 15 минут) — не запускай.',
+    '- ПРОТОКОЛ ВЫПОЛНЕНИЯ КОМАНД: если пользователь просит ВЫПОЛНИТЬ/ЗАПУСТИТЬ команду или код (а не просто показать), в конце ответа добавь блок вида:\n```run-terminal\nкоманда\n``` — по одной команде на блок, максимум 3 блока на ответ (для серии команд используй `cmd1 && cmd2` или мини-скрипт). ОБЫЧНЫЕ примеры кода в этот формат НЕ заворачивай — только реальное исполнение. Результат выполнения придёт в чат отдельным сообщением.',
     '- Создание изображений НЕДОСТУПНО (генерация картинок на сайте отключена). Если просят нарисовать/сгенерировать изображение — честно скажи, что генерация изображений на сайте сейчас отключена, и предложи альтернативу: короткое видео по этому же описанию (кнопка «Сделать видео»), либо подробное текстовое описание/промпт, который пользователь сможет использовать в любом внешнем генераторе картинок.',
     '- Не выдумывай факты; если не уверен — честно скажи об этом.',
     `- Текущая дата и время (UTC): ${now.toISOString().slice(0, 19).replace('T', ' ')}`,
@@ -26,6 +30,32 @@ function systemPrompt(): string {
 
 function sse(payload: Record<string, unknown>): Uint8Array {
   return new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+/* ---- terminal dispatch ------------------------------------------------- */
+
+/** the model marks commands to ACTUALLY execute with fenced blocks:
+ * ```run-terminal\n<cmd>\n``` — queue each as a terminal AgentTask; the agent
+ * worker ships it to the Kaggle Linux worker and posts the output back. */
+async function launchTerminalBlocks(text: string, conversationId: string): Promise<number> {
+  const re = /```run-terminal\s*\n([\s\S]*?)```/g
+  let n = 0
+  for (let m = re.exec(text); m && n < 3; m = re.exec(text)) {
+    const command = m[1].trim().slice(0, 3400)
+    if (!command) continue
+    await db.agentTask.create({
+      data: {
+        conversationId,
+        type: 'terminal',
+        title: `$ ${command.replace(/\s+/g, ' ').slice(0, 90)}`,
+        status: 'queued',
+        progress: 'Команда в очереди Linux-воркера…',
+        payload: JSON.stringify({ command, terminalId: conversationId, timeoutS: 240 }),
+      },
+    })
+    n++
+  }
+  return n
 }
 
 /* ---- free web search (shared with the worker's tools) -------------------- */
@@ -155,12 +185,14 @@ export async function POST(req: NextRequest) {
   let webSearch = false
   let model = ''
   let effort: 'high' | 'max' = 'max'
+  let conversationId = ''
   try {
     const body = (await req.json()) as {
       messages?: { role?: string; content?: string }[]
       webSearch?: boolean
       model?: string
       effort?: string
+      conversationId?: string
     }
     rawMessages = Array.isArray(body.messages) ? body.messages : []
     webSearch = Boolean(body.webSearch)
@@ -168,6 +200,7 @@ export async function POST(req: NextRequest) {
     const requested = String(body.model || '').trim()
     if (requested === DEFAULT_CHAT_MODEL || requested === FALLBACK_CHAT_MODEL) model = requested
     effort = body.effort === 'high' ? 'high' : 'max'
+    conversationId = String(body.conversationId || '').trim()
   } catch {
     return new Response(JSON.stringify({ error: 'invalid JSON body' }), { status: 400 })
   }
@@ -232,6 +265,7 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let buf = ''
+      let fullAnswer = ''
       const reader = upstream.getReader()
       try {
         for (;;) {
@@ -273,8 +307,26 @@ export async function POST(req: NextRequest) {
             if (!delta) continue
             if (delta.reasoning_content)
               controller.enqueue(sse({ type: 'reasoning', text: delta.reasoning_content.slice(0, 400) }))
-            if (delta.content) controller.enqueue(sse({ type: 'delta', text: delta.content }))
+            if (delta.content) {
+              fullAnswer += delta.content
+              controller.enqueue(sse({ type: 'delta', text: delta.content }))
+            }
           }
+        }
+        // ---- terminal dispatch: fenced run-terminal blocks -> Linux worker
+        if (conversationId) {
+          try {
+            const conv = await db.conversation.findUnique({ where: { id: conversationId } })
+            if (conv && (!conv.userId || conv.userId === user.id)) {
+              const n = await launchTerminalBlocks(fullAnswer, conversationId)
+              if (n > 0) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: `⌨️ ${n} команда(ы) отправлены в Linux-терминал — вывод придёт отдельным сообщением через 1-5 минут`,
+                }))
+              }
+            }
+          } catch { /* terminal dispatch is best-effort */ }
         }
         controller.enqueue(sse({ type: 'done' }))
       } catch (e) {

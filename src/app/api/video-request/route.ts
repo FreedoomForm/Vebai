@@ -52,11 +52,12 @@ export async function POST(req: NextRequest) {
           role: 'user',
           content:
             `Разбей идею на короткие видеокадры для генеративной модели (MiniMax H3). Идея: «${prompt.slice(0, 900)}».\n` +
-            `Ответь ТОЛЬКО JSON без пояснений: {"title": "короткое название видео", "shots": [{"title": "название кадра", "h3_prompt": "eng prompt: subject, motion, camera, lighting", "seconds": 5}]}.\n` +
-            `Максимум 4 кадра, каждый 5 секунд. h3_prompt — на английском, кинематографично, без текста на экране.`,
+            `Если в идее есть длительность (например «1 минута»), подбери кадры так, чтобы СУММА длин была близка к ней: один кадр 5 или 10 секунд, максимум 6 кадров (1 минута = 6 кадров по 10 секунд). Если длительность не указана — 2-3 кадра по 5 секунд.\n` +
+            `Ответь ТОЛЬКО JSON без пояснений: {"title": "короткое название видео", "shots": [{"title": "название кадра", "h3_prompt": "eng prompt: subject, motion, camera, lighting", "seconds": 10}]}.\n` +
+            `Максимум 6 кадров, каждый 5 или 10 секунд. h3_prompt — на английском, кинематографично, без текста на экране; кадры должны продолжать друг друга (единый сюжет).`,
         },
       ],
-      max_tokens: 1024,
+      max_tokens: 1536,
     })
     const txt = res.choices?.[0]?.message?.content || ''
     const m = txt.match(/\{[\s\S]*\}/)
@@ -68,7 +69,7 @@ export async function POST(req: NextRequest) {
       if (parsed.title) title = String(parsed.title).slice(0, 80)
       shots = (parsed.shots || [])
         .filter((s) => s && typeof s.h3_prompt === 'string' && s.h3_prompt.trim())
-        .slice(0, 4)
+        .slice(0, 6)
         .map((s) => ({
           title: String(s.title || 'Кадр').slice(0, 120),
           h3_prompt: String(s.h3_prompt).trim().slice(0, 1500),

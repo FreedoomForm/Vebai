@@ -18,6 +18,7 @@ export const TOOL_NAMES = [
   'web_search',
   'read_page',
   'generate_video',
+  'terminal',
 ] as const
 
 export type ToolName = (typeof TOOL_NAMES)[number]
@@ -138,9 +139,6 @@ async function execReadPage(args: Record<string, unknown>): Promise<ToolExecResu
   return { summary: `Страница «${title}» прочитана (${text.length} симв. передано модели)`, data: { title, text } }
 }
 
-/* NOTE: image generation was removed (CogView became a paid API — owner
- * request). Videos use a neutral canvas first frame via prepFrameData(null). */
-
 /* ------------------------------------------------------------------ video */
 
 async function execGenerateVideo(
@@ -189,6 +187,44 @@ async function execGenerateVideo(
   }
 }
 
+/* --------------------------------------------------------------- terminal */
+
+/**
+ * terminal — real Linux shell on the site's persistent worker container
+ * (Ubuntu on the Kaggle GPU/CPU worker: ffmpeg, python3, pip, git, curl…).
+ * Commands run in a per-conversation workspace that survives between calls;
+ * the worker snapshots it to storage + Telegram, so state survives restarts.
+ * Output is delivered to the chat as a task_result message when done.
+ */
+async function execTerminal(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolExecResult> {
+  const command = String(args.command || '').trim()
+  if (!command) throw new Error('terminal: пустая команда')
+  const terminalId = String(args.terminal_id || ctx.conversationId)
+  const timeoutS = Math.min(Math.max(Number(args.timeout_s) || 240, 10), 900)
+  const task = await db.agentTask.create({
+    data: {
+      conversationId: ctx.conversationId,
+      type: 'terminal',
+      title: `$ ${command.slice(0, 90)}`,
+      status: 'queued',
+      progress: 'Команда в очереди Linux-воркера…',
+      payload: JSON.stringify({ command, terminalId, timeoutS }),
+    },
+  })
+  await db.conversation.update({
+    where: { id: ctx.conversationId },
+    data: { updatedAt: new Date() },
+  })
+  return {
+    summary: `Команда отправлена в Linux-контейнер (терминал ${terminalId.slice(0, 8)}…): $ ${command.slice(0, 120)}. Вывод придёт в чат отдельным сообщением через 1-3 минуты.`,
+    taskId: task.id,
+    data: { taskId: task.id, terminalId },
+  }
+}
+
 /* --------------------------------------------------------------- dispatch */
 
 export async function executeTool(
@@ -205,6 +241,8 @@ export async function executeTool(
       return await execReadPage(args)
     case 'generate_video':
       return await execGenerateVideo(args, ctx)
+    case 'terminal':
+      return await execTerminal(args, ctx)
   }
 }
 

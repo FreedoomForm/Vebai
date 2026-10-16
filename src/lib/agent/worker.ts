@@ -127,6 +127,9 @@ async function syncVideoTask(taskId: string) {
   try { jobIds = JSON.parse(task.jobIds || '[]') as string[] } catch { /* ignore */ }
   if (jobIds.length === 0) return
 
+  let payload: { shots?: ShotSpec[]; testMode?: boolean; mergeJobId?: string } = {}
+  try { payload = JSON.parse(task.payload || '{}') } catch { /* ignore */ }
+
   const jobs = await db.job.findMany({ where: { id: { in: jobIds } } })
   const done = jobs.filter((j) => j.status === 'complete')
   const failed = jobs.filter((j) => j.status === 'failed')
@@ -160,6 +163,78 @@ async function syncVideoTask(taskId: string) {
     .sort((a, b) => jobIds.indexOf(a.id) - jobIds.indexOf(b.id))
     .map((j) => ({ kind: 'video' as const, url: `/api/video/${j.id}`, title: `Кадр: ${j.prompt.slice(0, 60)}` }))
 
+  // ---- auto-merge phase: stitch all shots into ONE file on the worker (ffmpeg)
+  if (freshDone.length === fresh.length && fresh.length > 1) {
+    if (!payload.mergeJobId) {
+      const totalSec = Math.min(freshDone.reduce((s, j) => s + (j.seconds || 0), 0), 120)
+      const orderedIds = freshDone
+        .sort((a, b) => jobIds.indexOf(a.id) - jobIds.indexOf(b.id))
+        .map((j) => j.id)
+        .join(',')
+      const merge = await db.job.create({
+        data: {
+          prompt: `MERGE:${orderedIds}`,
+          seconds: totalSec,
+          testMode: payload.testMode === true,
+          status: 'queued',
+        },
+      })
+      await db.agentTask.update({
+        where: { id: task.id },
+        data: {
+          payload: JSON.stringify({ ...payload, mergeJobId: merge.id }),
+          progress: 'Склеиваю кадры в один файл (ffmpeg на Linux-воркере)…',
+        },
+      })
+      globalForWorker.__agentLastVideoSync = 0
+      return
+    }
+    const mergeJob = await db.job.findUnique({ where: { id: payload.mergeJobId } })
+    if (mergeJob && mergeJob.status === 'queued') {
+      // merge job waiting for the next syncStudio batch push
+      const now2 = Date.now()
+      if (now2 - (globalForWorker.__agentLastVideoSync || 0) > 15_000) {
+        globalForWorker.__agentLastVideoSync = now2
+        await syncStudio()
+      }
+      return
+    }
+    if (mergeJob && (mergeJob.status === 'generating')) {
+      const progress = 'Склейка кадров на Linux-воркере (ffmpeg)…'
+      if (progress !== task.progress) {
+        await db.agentTask.update({ where: { id: task.id }, data: { progress } })
+      }
+      const now3 = Date.now()
+      if (now3 - (globalForWorker.__agentLastVideoSync || 0) > 15_000) {
+        globalForWorker.__agentLastVideoSync = now3
+        await syncStudio()
+      }
+      return
+    }
+    if (mergeJob && mergeJob.status === 'complete' && mergeJob.videoData) {
+      const mergedArtifacts = [
+        { kind: 'video' as const, url: `/api/video/${mergeJob.id}`, title: `Итоговое видео (${fresh.length} кадр(ов) склеено)` },
+        ...artifacts.map((a, i) => ({ ...a, title: `Кадр ${i + 1}` })),
+      ]
+      await db.agentTask.update({
+        where: { id: task.id },
+        data: {
+          status: 'completed',
+          progress: null,
+          result: JSON.stringify({ artifacts: mergedArtifacts, summary: `Видео готово: ${fresh.length} кадр(ов) склеены в один файл` }),
+        },
+      })
+      await postResultMessage(
+        task.conversationId,
+        `Видео «${task.title}» готово — ${fresh.length} кадр(ов) сгенерированы и автоматически склеены в один файл (сверху). Ниже — отдельные кадры.`,
+        { artifacts: mergedArtifacts, taskId: task.id },
+      )
+      await mirrorVideoTask(task, mergeJob, freshDone)
+      return
+    }
+    // merge failed -> fall back to clips-only completion
+  }
+
   if (freshDone.length === fresh.length) {
     await db.agentTask.update({
       where: { id: task.id },
@@ -174,6 +249,7 @@ async function syncVideoTask(taskId: string) {
       `Видео «${task.title}» готово — все ${fresh.length} кадр(ов) сгенерированы и уже в чате. Скажи, если нужно перегенерировать какой-то кадр или собрать следующую серию.`,
       { artifacts, taskId: task.id },
     )
+    await mirrorVideoTask(task, null, freshDone)
   } else if (freshDone.length > 0) {
     await db.agentTask.update({
       where: { id: task.id },
@@ -206,6 +282,136 @@ async function syncVideoTask(taskId: string) {
   }
 }
 
+/* -------------------------------------------------------------- telegram */
+
+/** mirror a finished video task: merged file + individual clips -> channel */
+async function mirrorVideoTask(
+  task: { id: string; conversationId: string; title: string },
+  merged: { id: string; videoData: Uint8Array<ArrayBuffer> | null } | null,
+  clips: { id: string; videoData: Uint8Array<ArrayBuffer> | null; seconds: number }[],
+): Promise<void> {
+  try {
+    const { uploadToTelegram } = await import('@/lib/telegram')
+    const files: { name: string; data: Buffer; mime?: string }[] = []
+    if (merged?.videoData) {
+      files.push({ name: `vebai-${task.id}-merged.mp4`, data: Buffer.from(merged.videoData), mime: 'video/mp4' })
+    }
+    clips.forEach((c, i) => {
+      if (c.videoData) files.push({ name: `vebai-${task.id}-shot${String(i + 1).padStart(2, '0')}.mp4`, data: Buffer.from(c.videoData), mime: 'video/mp4' })
+    })
+    const n = await uploadToTelegram(files, `🎬 «${task.title}» | vebai task ${task.id} | терминал/чат ${task.conversationId}`)
+    if (n > 0) console.log(`[telegram] mirrored ${n} file(s) for task ${task.id}`)
+  } catch (e) {
+    console.error('[telegram] video mirror failed:', e instanceof Error ? e.message : e)
+  }
+}
+
+/* ------------------------------------------------------------ terminal tasks */
+
+interface TerminalPayload {
+  command?: string
+  terminalId?: string
+  timeoutS?: number
+  testMode?: boolean
+}
+
+async function startTerminalTask(taskId: string) {
+  const task = await db.agentTask.findUnique({ where: { id: taskId } })
+  if (!task || task.status !== 'queued') return
+  let payload: TerminalPayload = {}
+  try { payload = JSON.parse(task.payload || '{}') } catch { /* ignore */ }
+  const command = String(payload.command || '').trim()
+  if (!command) {
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: { status: 'failed', error: 'терминал: пустая команда' },
+    })
+    return
+  }
+  await db.agentTask.update({
+    where: { id: task.id },
+    data: { status: 'running', progress: 'Выполняется в Linux-контейнере…' },
+  })
+  try {
+    const job = await db.job.create({
+      data: {
+        prompt: `CMD:${payload.terminalId || task.conversationId}|${payload.timeoutS || 240}|${command.slice(0, 3400)}`,
+        seconds: 0,
+        testMode: payload.testMode !== false, // CPU worker by default
+        status: 'queued',
+      },
+    })
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: { jobIds: JSON.stringify([job.id]) },
+    })
+    globalForWorker.__agentLastVideoSync = 0
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: { status: 'failed', error: `очередь команды: ${msg.slice(0, 250)}` },
+    })
+  }
+}
+
+async function syncTerminalTask(taskId: string) {
+  const task = await db.agentTask.findUnique({ where: { id: taskId } })
+  if (!task || task.status !== 'running') return
+  let jobIds: string[] = []
+  try { jobIds = JSON.parse(task.jobIds || '[]') as string[] } catch { /* ignore */ }
+  if (jobIds.length === 0) return
+  const job = await db.job.findUnique({ where: { id: jobIds[0] } })
+  if (!job) return
+
+  if (job.status === 'queued' || job.status === 'generating') {
+    const now = Date.now()
+    if (now - (globalForWorker.__agentLastVideoSync || 0) > 15_000) {
+      globalForWorker.__agentLastVideoSync = now
+      await syncStudio()
+    }
+    return
+  }
+
+  if (job.status === 'complete' && job.videoData) {
+    let rec: { cmd?: string; exit_code?: number; output?: string } = {}
+    try { rec = JSON.parse(Buffer.from(job.videoData).toString('utf8')) } catch { /* raw text */ }
+    const output = (rec.output || Buffer.from(job.videoData).toString('utf8') || '(пустой вывод)').slice(0, 6000)
+    const exit = typeof rec.exit_code === 'number' ? rec.exit_code : 0
+    const content = `Терминал: $ ${rec.cmd || task.title}\n\`\`\`\n${output}\n\`\`\`\nexit code: ${exit}`
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: {
+        status: 'completed',
+        progress: null,
+        result: JSON.stringify({ summary: `Команда выполнена (exit ${exit})`, output: output.slice(0, 2000) }),
+      },
+    })
+    await postResultMessage(task.conversationId, content, { taskId: task.id })
+    try {
+      const { sendTelegramText } = await import('@/lib/telegram')
+      await sendTelegramText(`🖥 терминал ${task.conversationId}\n$ ${rec.cmd || command0(task)}\nexit ${exit}\n\n${output.slice(0, 2500)}`)
+    } catch { /* non-fatal */ }
+    return
+  }
+
+  if (job.status === 'failed') {
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: { status: 'failed', error: (job.error || 'воркер не смог выполнить команду').slice(0, 280) },
+    })
+    await postResultMessage(
+      task.conversationId,
+      `Терминал: команда «${task.title}» не выполнена: ${(job.error || 'ошибка воркера').slice(0, 200)}`,
+      { taskId: task.id },
+    )
+  }
+}
+
+function command0(task: { title: string }): string {
+  return task.title.replace(/^\$ /, '')
+}
+
 /* -------------------------------------------------------------- main worker */
 
 async function tick() {
@@ -221,6 +427,18 @@ async function tick() {
       orderBy: { createdAt: 'asc' },
     })
     for (const t of vidRunning) await syncVideoTask(t.id)
+
+    const termQueued = await db.agentTask.findFirst({
+      where: { type: 'terminal', status: 'queued' },
+      orderBy: { createdAt: 'asc' },
+    })
+    if (termQueued) await startTerminalTask(termQueued.id)
+
+    const termRunning = await db.agentTask.findMany({
+      where: { type: 'terminal', status: 'running' },
+      orderBy: { createdAt: 'asc' },
+    })
+    for (const t of termRunning) await syncTerminalTask(t.id)
   } catch (e) {
     console.error('[agent-worker] tick error:', e instanceof Error ? e.message : e)
   }

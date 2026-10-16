@@ -386,7 +386,7 @@ export function AgentApp() {
         const res = await fetch('/api/chat/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: history, webSearch, effort, model }),
+          body: JSON.stringify({ messages: history, webSearch, effort, model, conversationId: convId }),
           signal: ac.signal,
         })
         if (!res.ok || !res.body) {
@@ -415,6 +415,8 @@ export function AgentApp() {
             } catch { continue }
             if (evt.type === 'start') {
               onEvent({ type: 'notice', text: `Модель: ${evt.model || model}` })
+            } else if (evt.type === 'notice') {
+              onEvent({ type: 'notice', text: evt.text || '' })
             } else if (evt.type === 'reasoning') {
               if (!thinkingNoted) {
                 thinkingNoted = true

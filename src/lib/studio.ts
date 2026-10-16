@@ -190,6 +190,50 @@ async function buildJobsFiles(jobs: {
   for (let i = 0; i < jobs.length; i++) {
     const j = jobs[i]
     const num = i + 1
+    if (j.prompt.startsWith('CMD:')) {
+      // terminal command: CMD:<terminalId>|<timeoutS>|<command>
+      const rest = j.prompt.slice(4)
+      const sep1 = rest.indexOf('|')
+      const sep2 = sep1 >= 0 ? rest.indexOf('|', sep1 + 1) : -1
+      manifest.push({
+        num,
+        mode: 'cmd',
+        terminal_id: sep1 >= 0 ? rest.slice(0, sep1) : 'default',
+        timeout_s: sep2 >= 0 ? Number(rest.slice(sep1 + 1, sep2)) || 240 : 240,
+        cmd: sep2 >= 0 ? rest.slice(sep2 + 1) : rest,
+        seconds: 0,
+        job_id: j.id,
+      })
+      continue
+    }
+    if (j.prompt.startsWith('MERGE:')) {
+      // stitch job: MERGE:<jobId1>,<jobId2>,... — input clips ship as files
+      // (unique per-merge names: two merges can share one batch)
+      const inputIds = j.prompt.slice(6).split(',').filter(Boolean)
+      const inputFiles: string[] = []
+      for (let k = 0; k < inputIds.length; k++) {
+        const src = await db.job.findUnique({ where: { id: inputIds[k] } })
+        if (src?.videoData && src.videoData.byteLength > 0) {
+          const name = `mergein_${j.id}_${k + 1}.mp4`
+          files.push({
+            name,
+            data: Buffer.from(src.videoData),
+            contentType: 'video/mp4',
+          })
+          inputFiles.push(name)
+        }
+      }
+      manifest.push({
+        num,
+        mode: 'merge',
+        inputs: inputIds,
+        input_files: inputFiles,
+        title: `merge ${inputIds.length}`,
+        seconds: j.seconds,
+        job_id: j.id,
+      })
+      continue
+    }
     const frameName = `shot_${String(num).padStart(2, '0')}.jpg`
     files.push({
       name: frameName,
@@ -211,6 +255,33 @@ async function buildJobsFiles(jobs: {
   files.push({ name: 'shots.json', data: Buffer.from(JSON.stringify(manifest, null, 1)), contentType: 'application/json' })
   if (jobs[0].testMode)
     files.push({ name: 'test_mode.txt', data: Buffer.from('studio test batch\n') })
+  // worker config: telegram mirror credentials (files the agent produces in
+  // the terminal are uploaded straight from the container)
+  try {
+    const { botToken, resolveChatId } = await import('@/lib/telegram')
+    const chatId = await resolveChatId()
+    // terminal workspaces: latest telegram snapshot file_id per terminal id
+    // (the worker restores the workspace from it on a fresh Kaggle session)
+    let termSnapshots: Record<string, string> = {}
+    try {
+      const snaps = await db.studioState.findMany({ where: { key: { startsWith: 'term:' } } })
+      for (const s of snaps) {
+        try {
+          const rec = JSON.parse(s.data) as { fileId?: string }
+          if (rec.fileId) termSnapshots[s.key.slice(5)] = rec.fileId
+        } catch { /* skip broken record */ }
+      }
+    } catch { /* non-fatal */ }
+    files.push({
+      name: 'config.json',
+      data: Buffer.from(JSON.stringify({
+        telegram_token: botToken() || null,
+        telegram_chat_id: chatId,
+        term_snapshots: termSnapshots,
+      })),
+      contentType: 'application/json',
+    })
+  } catch { /* config optional */ }
   // cumulative completed ids: the worker uses them to skip finished jobs
   // after a restart without regenerating anything
   const dones = await db.job.findMany({
@@ -302,22 +373,42 @@ function unzipToEntries(zip: Buffer): { name: string; data: Buffer }[] {
     .map(([name, data]) => ({ name, data: Buffer.from(data) }))
 }
 
-/** worker outputs carry job_<id>.mp4 files; deliver them into Job.videoData */
+/** worker outputs carry job_<id>.mp4 files; deliver them into Job.videoData.
+ * CMD jobs deliver cmd_<id>.txt (JSON record of the shell run) instead. */
 async function tryDeliverWorker(sources: FileMap[]): Promise<number> {
   let delivered = 0
   const jobs = await db.job.findMany({ where: { status: 'generating' } })
   for (const job of jobs) {
-    const fname = `job_${job.id}.mp4`
+    const isCmd = job.prompt.startsWith('CMD:')
+    const fname = isCmd ? `cmd_${job.id}.txt` : `job_${job.id}.mp4`
+    const minSize = isCmd ? 2 : 30_000
     let data: Buffer | null = null
     for (const src of sources) {
       const c = src.get(`out/${fname}`) || src.get(fname)
-      if (c && c.byteLength > 30_000) { data = c; break }
+      if (c && c.byteLength > minSize) { data = c; break }
     }
     if (!data) continue
     await db.job.update({
       where: { id: job.id },
       data: { status: 'complete', videoData: toBytes(data) },
     })
+    // terminal command: remember the workspace snapshot file_id so the next
+    // worker session can restore the terminal state (cd, files, venv)
+    if (isCmd) {
+      try {
+        const rec = JSON.parse(data.toString('utf8')) as {
+          terminal_id?: string; snapshot_file_id?: string | null
+        }
+        if (rec.terminal_id && rec.snapshot_file_id) {
+          const key = `term:${rec.terminal_id}`
+          await db.studioState.upsert({
+            where: { key },
+            create: { key, data: JSON.stringify({ fileId: rec.snapshot_file_id, at: new Date().toISOString() }) },
+            update: { data: JSON.stringify({ fileId: rec.snapshot_file_id, at: new Date().toISOString() }) },
+          })
+        }
+      } catch { /* non-fatal */ }
+    }
     delivered++
   }
   return delivered
