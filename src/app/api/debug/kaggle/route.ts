@@ -23,7 +23,7 @@ export async function GET(req: NextRequest) {
     jobs: await db.job.findMany({
       where: { batchId: 'bmvb4ju66' },
       select: { shotNum: true, status: true, error: true, updatedAt: true },
-      orderBy: { shotNum: true },
+      orderBy: { shotNum: 'asc' },
     }),
   }
   try {
