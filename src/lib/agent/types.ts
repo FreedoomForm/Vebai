@@ -54,7 +54,7 @@ export interface ConversationDTO {
   updatedAt: string
 }
 
-/** Events streamed from POST /api/chat through the socket relay to the browser */
+/** Events streamed to the browser during a chat turn */
 export type AgentEvent =
   | { type: 'start'; conversationId: string; userMessage: MessageDTO }
   | { type: 'delta'; text: string }
@@ -64,7 +64,6 @@ export type AgentEvent =
   | { type: 'message'; message: MessageDTO }
   | { type: 'title'; conversationId: string; title: string }
   | { type: 'conversation'; conversationId: string }
-  | { type: 'captcha_required' }
   | { type: 'notice'; text: string }
   | { type: 'done' }
   | { type: 'error'; message: string; code?: string }

@@ -2,8 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
 import { messageToDTO } from '@/lib/agent/tools'
-import { ensureUserZaiSession } from '@/lib/zai-session'
-import type { PlainMessage } from '@/lib/zai-direct'
+import type { ChatMessage } from '@/lib/zai'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,17 +10,11 @@ const HISTORY_LIMIT = 40
 
 /**
  * POST /api/chat/start — persist the user's turn and hand the transcript
- * PLUS the user's OWN Z.ai session to the browser, which then talks to
- * chat.z.ai DIRECTLY (v10 browser-direct, v12 personal sessions).
- *
- * The server stays out of the AI path: no proxying, no captcha relay, no
- * 300s cap. Its job: resolve/refresh the user's PERSONAL Z.ai session
- * (minted automatically at registration — own quota, zero navigation),
- * conversation/message persistence, history.
+ * back to the browser, which then streams the answer from OUR server
+ * (POST /api/chat/stream → official Z.ai API, site owner's key).
  *
  * Body: { conversationId?, content }
- * -> { conversationId, userMessage, history, zai: { token, kind, email } }
- * Errors: 400 zai_unavailable | zai_session_expired (typed)
+ * -> { conversationId, userMessage, history, title? }
  */
 export async function POST(req: NextRequest) {
   const { user, unauthorized } = await requireAuth(req)
@@ -40,19 +33,6 @@ export async function POST(req: NextRequest) {
   if (!content)
     return NextResponse.json({ error: 'content is required' }, { status: 400 })
 
-  // ---- policy (v12): every user owns a PERSONAL Z.ai session — resolve it
-  // (refreshed sliding; minted automatically when missing/expired)
-  let zaiSession: Awaited<ReturnType<typeof ensureUserZaiSession>>
-  try {
-    zaiSession = await ensureUserZaiSession(user.id)
-  } catch (e) {
-    const code = e instanceof Error && 'code' in e ? String((e as { code?: string }).code) : 'zai_unavailable'
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message.slice(0, 300) : 'Z.ai сессия недоступна', code },
-      { status: 400 },
-    )
-  }
-
   // ---- scope + adopt legacy conversations
   if (conversationId) {
     const exists = await db.conversation.findUnique({ where: { id: conversationId } })
@@ -61,7 +41,7 @@ export async function POST(req: NextRequest) {
       await db.conversation.update({ where: { id: exists.id }, data: { userId: user.id } })
   }
 
-  // ---- persist the user message (transaction-ish: create conv if needed)
+  // ---- persist the user message (create conv if needed)
   let convId = conversationId
   if (!convId) {
     const conv = await db.conversation.create({ data: { userId: user.id } })
@@ -80,13 +60,13 @@ export async function POST(req: NextRequest) {
   }
   await db.conversation.update({ where: { id: convId }, data: { updatedAt: new Date() } })
 
-  // ---- transcript for the browser (recent, non-empty)
+  // ---- transcript for the stream call (recent, non-empty)
   const history = await db.message.findMany({
     where: { conversationId: convId },
     orderBy: { createdAt: 'asc' },
   })
   const trimmed = history.slice(-HISTORY_LIMIT)
-  const plain: PlainMessage[] = []
+  const plain: ChatMessage[] = []
   for (const m of trimmed) {
     const c = (m.content || '').trim()
     if (!c) continue
@@ -99,7 +79,5 @@ export async function POST(req: NextRequest) {
     userMessage: messageToDTO(userMsg),
     ...(titleEmitted ? { title: titleEmitted } : {}),
     history: plain,
-    // the user's own session — the browser chats under THEIR quota
-    zai: { token: zaiSession.token, kind: zaiSession.kind, email: zaiSession.email },
   })
 }

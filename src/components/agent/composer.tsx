@@ -5,7 +5,6 @@ import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown } from 'lucide-rea
 import { cn } from '@/lib/utils'
 
 export interface SendOptions {
-  captchaVerifyParam?: string
   resume?: boolean
   /** 🎬 toggle: also queue the MiniMax H3 video pipeline for this prompt */
   videoRequest?: boolean

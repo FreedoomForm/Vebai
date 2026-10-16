@@ -6,20 +6,12 @@ import {
   sessionCookieHeader,
   verifyPassword,
 } from '@/lib/auth'
-import { isRealZaiToken } from '@/lib/chatweb'
-import { ensureUserZaiSession } from '@/lib/zai-session'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/auth/login — local credential check, then resolve the user's
- * Z.ai session (v12: never blocks login).
- *
- * Flow:
- *  1. local scrypt hash check → issue our cookie — the user is in;
- *  2. resolve the Z.ai session: REAL account → sliding refresh (dead real
- *     JWT surfaces 'expired', the in-app card re-links it); otherwise the
- *     PERSONAL session is refreshed/minted automatically (own quota).
+ * POST /api/auth/login — plain local credential check.
+ * No Z.ai sessions, no captchas: AI runs server-side on the owner's key.
  */
 export async function POST(req: NextRequest) {
   if (!AUTH_REQUIRED)
@@ -43,30 +35,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Неверный email или пароль' }, { status: 401 })
   }
 
-  // v12: resolve the Z.ai session for this user.
-  // A REAL account JWT refreshes silently; anything else gets/refreshes the
-  // PERSONAL dedicated session (minted server-side, own quota).
-  let zaiSession: 'linked' | 'personal' | 'expired' | 'none' = 'none'
-  if (isRealZaiToken(user.zaiToken)) {
-    try {
-      const s = await ensureUserZaiSession(user.id)
-      zaiSession = s.kind === 'real' ? 'linked' : 'personal'
-    } catch {
-      zaiSession = 'expired' // dead real JWT — the in-app card re-links it
-    }
-  } else {
-    try {
-      await ensureUserZaiSession(user.id) // refresh/mint the personal session
-      zaiSession = 'personal'
-    } catch {
-      // Z.ai unreachable — lazily retried on the first message
-      zaiSession = 'none'
-    }
-  }
-
   const res = NextResponse.json({
     user: { id: user.id, email: user.email, name: user.name },
-    zaiSession,
   })
   res.headers.append('Set-Cookie', sessionCookieHeader(createSessionToken(user.id)))
   return res
