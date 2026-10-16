@@ -35,26 +35,26 @@ interface StreamState {
 
 /* --------------------------------------------------------------- models */
 // free models on the official Z.ai API (whitelisted server-side);
-// glm-4.5-flash is also the automatic fallback when 4.7-flash overloads
+// owner request: glm-4.5-flash is the default, 4.7-flash is the fallback
 const MODEL_OPTIONS = [
-  {
-    id: 'glm-4.7-flash',
-    label: 'GLM-4.7-Flash',
-    sub: 'Бесплатная модель с глубоким мышлением — основной выбор',
-    badge: 'FREE',
-  },
   {
     id: 'glm-4.5-flash',
     label: 'GLM-4.5-Flash',
-    sub: 'Лёгкая и быстрая — хороша для коротких ответов',
+    sub: 'Быстрая и стабильная — основной выбор',
+    badge: 'FREE',
+  },
+  {
+    id: 'glm-4.7-flash',
+    label: 'GLM-4.7-Flash',
+    sub: 'Глубокое мышление — резерв при перегрузке 4.5',
   },
 ] as const
 
 const SUGGESTIONS = [
   { icon: '🎬', text: 'Сделай план и обучающее видео про физику электронов' },
-  { icon: '🖼', text: 'Сгенерируй обложку для научного YouTube-канала' },
   { icon: '🌐', text: 'Найди свежие данные о модели MiniMax H3 и перескажи' },
-  { icon: '🎨', text: 'Придумай и нарисуй маскота для IT-блога' },
+  { icon: '🎥', text: 'Сгенерируй короткое видео: закат над городом с пролетающим дроном' },
+  { icon: '✨', text: 'Помоги придумать сценарий трейлера для IT-блога' },
 ]
 
 const GALLERY = [
@@ -77,7 +77,7 @@ export function AgentApp() {
   const [activityOpen, setActivityOpen] = useState(false)
 
   // composer / selector state (persisted)
-  const [model, setModel] = useState<string>('glm-4.7-flash')
+  const [model, setModel] = useState<string>('glm-4.5-flash')
   const [effort, setEffort] = useState<Effort>('max')
   const [webSearch, setWebSearch] = useState(false)
   const [video, setVideo] = useState(false)

@@ -142,9 +142,9 @@ export function AuthScreen({ onAuthed }: { onAuthed: () => void }) {
           <div className="flex items-start gap-2 text-emerald-800">
             <Sparkles className="mt-0.5 h-4 w-4 shrink-0" />
             <p className="text-[11.5px] leading-relaxed text-emerald-800/90">
-              Чат работает на официальном API Z.ai с бесплатными моделями GLM-4.7-Flash и
-              GLM-4.5-Flash. Никаких внешних логинов и капч — просто регистрируйся и работай:
-              веб-поиск, генерация изображений и фоновое создание видео включены.
+              Чат работает на официальном API Z.ai с бесплатными моделями GLM-4.5-Flash (по
+              умолчанию) и GLM-4.7-Flash (резерв). Никаких внешних логинов и капч — просто
+              регистрируйся и работай: веб-поиск и фоновое создание видео включены.
             </p>
           </div>
         </div>

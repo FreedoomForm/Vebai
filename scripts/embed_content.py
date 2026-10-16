@@ -32,8 +32,9 @@ print("h3-content.ts written")
 
 kernel_dir = os.path.join(ROOT, "kernels")
 os.makedirs(kernel_dir, exist_ok=True)
-# notebooks come from the proven sandbox pipeline
-SRC_KERNELS = "/home/z/my-project/studio-data/kernel-src"
+# notebooks live IN THE REPO (kernels/*.ipynb) — edit them there, then re-run
+# this script to regenerate src/lib/kernels.ts
+SRC_KERNELS = kernel_dir
 names = [
     "rmc_studio_real.ipynb",
     "rmc_studio_test.ipynb",

@@ -1,4 +1,3 @@
-import { zai } from '@/lib/zai'
 import { db } from '@/lib/db'
 import { syncStudio, prepFrameData } from '@/lib/studio'
 import { imageArtifactData, messageToDTO, taskToDTO } from './tools'
@@ -38,64 +37,8 @@ async function postResultMessage(
   return messageToDTO(m)
 }
 
-/* -------------------------------------------------------------- image tasks */
-
-async function runImageTask(taskId: string) {
-  const task = await db.agentTask.findUnique({ where: { id: taskId } })
-  if (!task || task.status !== 'queued') return
-  let payload: { prompt?: string; size?: string; title?: string } = {}
-  try { payload = JSON.parse(task.payload || '{}') } catch { /* ignore */ }
-  const prompt = payload.prompt || task.title
-  const SIZES = ['1024x1024', '768x1344', '864x1152', '1344x768', '1152x864', '1440x720', '720x1440'] as const
-  type ImgSize = (typeof SIZES)[number]
-  const size: ImgSize = (SIZES as readonly string[]).includes(payload.size || '')
-    ? (payload.size as ImgSize)
-    : '1344x768'
-
-  await db.agentTask.update({
-    where: { id: task.id },
-    data: { status: 'running', progress: 'Генерация изображения…' },
-  })
-
-  try {
-    const res = await zai.images.generations.create({ prompt, size })
-    const b64 = res?.data?.[0]?.base64
-    if (!b64) throw new Error('пустой ответ генератора изображений')
-    const png = Buffer.from(b64, 'base64')
-
-    await db.agentTask.update({
-      where: { id: task.id },
-      data: {
-        status: 'completed',
-        progress: null,
-        imageData: toBytes(png),
-        result: JSON.stringify({
-          artifacts: [{ kind: 'image', url: `/api/image/${task.id}`, title: task.title }],
-          summary: 'Изображение готово',
-        }),
-      },
-    })
-    await postResultMessage(
-      task.conversationId,
-      `Изображение «${task.title}» готово — можно смотреть выше. Если нужно что-то поправить (стиль, ракурс, детали) — скажи, сгенерирую новый вариант.`,
-      {
-        artifacts: [{ kind: 'image', url: `/api/image/${task.id}`, title: task.title }],
-        taskId: task.id,
-      },
-    )
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    await db.agentTask.update({
-      where: { id: task.id },
-      data: { status: 'failed', error: msg.slice(0, 400) },
-    })
-    await postResultMessage(
-      task.conversationId,
-      `Не получилось сгенерировать изображение «${task.title}»: ${msg.slice(0, 200)}. Могу повторить попытку — просто скажи.`,
-      { taskId: task.id },
-    )
-  }
-}
+/* NOTE: image tasks were removed (CogView became a paid API — owner request).
+ * The background worker only handles video tasks now. */
 
 /* -------------------------------------------------------------- video tasks */
 
@@ -267,12 +210,6 @@ async function syncVideoTask(taskId: string) {
 
 async function tick() {
   try {
-    const img = await db.agentTask.findFirst({
-      where: { type: 'image', status: 'queued' },
-      orderBy: { createdAt: 'asc' },
-    })
-    if (img) await runImageTask(img.id)
-
     const vidQueued = await db.agentTask.findFirst({
       where: { type: 'video', status: 'queued' },
       orderBy: { createdAt: 'asc' },

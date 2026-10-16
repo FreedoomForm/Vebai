@@ -15,9 +15,9 @@ OpenAI-совместимом API** с ключом владельца сайт�
 
 | Модель | Статус | Назначение |
 |---|---|---|
-| `glm-4.7-flash` | бесплатная | основной чат (thinking-модель) |
-| `glm-4.5-flash` | бесплатная | автофолбэк при перегрузке 4.7 |
-| `cogview-3-flash` | бесплатная | генерация изображений (фон) |
+| `glm-4.5-flash` | бесплатная | основной чат (быстрая и стабильная — по умолчанию) |
+| `glm-4.7-flash` | бесплатная | автофолбэк при перегрузке 4.5 (thinking-модель) |
+| ~~`cogview-3-flash`~~ | стал платным | **генерация изображений отключена** (владелец) |
 
 - Ключ хранится **только на сервере** (`ZAI_API_KEY`): браузер общается с
   нашим backend'ом, backend — с `ZAI_BASE_URL`
@@ -28,7 +28,8 @@ OpenAI-совместимом API** с ключом владельца сайт�
   следующая в цепочке.
 - Регистрация/вход — обычные локальные аккаунты (email + пароль, scrypt-хэши,
   подписанные HttpOnly cookie). Ничего внешнего.
-- Фоновые задачи (изображения, видео на Kaggle) работают как раньше 24/7.
+- Фоновые задачи (видео на Kaggle) работают как раньше 24/7; генерация
+  изображений удалена (CogView стал платным).
 
 ## Что адаптировано под Vercel
 
@@ -68,10 +69,12 @@ OpenAI-совместимом API** с ключом владельца сайт�
    DATABASE_URL      = postgresql://...?sslmode=require
    ZAI_API_KEY       = <ключ z.ai / bigmodel.cn>       (обязательно)
    ZAI_BASE_URL      = https://open.bigmodel.cn/api/paas/v4
-   ZAI_MODEL         = glm-4.7-flash
-   ZAI_IMAGE_MODEL   = cogview-3-flash
+   ZAI_MODEL         = glm-4.5-flash
    KAGGLE_API_TOKEN  = KGAT_...                        (kaggle.com → Settings → API)
    KAGGLE_ACCOUNT    = freedomform
+   # ускоритель Kaggle-воркера (опционально):
+   KAGGLE_ENABLE_TPU = false        # true — только после порта пайплайна на XLA
+   KAGGLE_MACHINE_SHAPE = NvidiaTeslaT4   # либо TpuV5E8 для TPU v5e-8
    APP_SECRET        = (случайная строка, опционально)
    CRON_SECRET       = (опционально)
    ```

@@ -17,7 +17,6 @@ export const TOOL_NAMES = [
   'generate_plan',
   'web_search',
   'read_page',
-  'generate_image',
   'generate_video',
 ] as const
 
@@ -139,36 +138,8 @@ async function execReadPage(args: Record<string, unknown>): Promise<ToolExecResu
   return { summary: `Страница «${title}» прочитана (${text.length} симв. передано модели)`, data: { title, text } }
 }
 
-/* ------------------------------------------------------------------ image */
-
-async function execGenerateImage(
-  args: Record<string, unknown>,
-  ctx: ToolContext,
-): Promise<ToolExecResult> {
-  const prompt = String(args.prompt || '').trim()
-  if (!prompt) throw new Error('generate_image: пустой prompt')
-  const size = String(args.size || '1344x768')
-  const title = String(args.title || prompt.slice(0, 60))
-  const task = await db.agentTask.create({
-    data: {
-      conversationId: ctx.conversationId,
-      type: 'image',
-      title: title.slice(0, 120),
-      status: 'queued',
-      progress: 'В очереди генерации',
-      payload: JSON.stringify({ prompt, size }),
-    },
-  })
-  await db.conversation.update({
-    where: { id: ctx.conversationId },
-    data: { updatedAt: new Date() },
-  })
-  return {
-    summary: `Изображение «${title}» поставлено в фоновую генерацию`,
-    taskId: task.id,
-    data: { taskId: task.id, title, size },
-  }
-}
+/* NOTE: image generation was removed (CogView became a paid API — owner
+ * request). Videos use a neutral canvas first frame via prepFrameData(null). */
 
 /* ------------------------------------------------------------------ video */
 
@@ -232,8 +203,6 @@ export async function executeTool(
       return await execWebSearch(args)
     case 'read_page':
       return await execReadPage(args)
-    case 'generate_image':
-      return await execGenerateImage(args, ctx)
     case 'generate_video':
       return await execGenerateVideo(args, ctx)
   }

@@ -29,8 +29,8 @@ export function WarningBanner() {
       <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
       <p className="flex-1 text-[11px] leading-relaxed text-emerald-800/90">
         Чат работает на <span className="font-medium text-emerald-900">официальном API Z.ai</span> с
-        бесплатной моделью <span className="font-medium text-emerald-900">GLM-4.7-Flash</span> (автофолбэк —
-        GLM-4.5-Flash при перегрузке). Веб-поиск, генерация изображений и фоновое видео — внутри сайта,
+        бесплатной моделью <span className="font-medium text-emerald-900">GLM-4.5-Flash</span> (автофолбэк —
+        GLM-4.7-Flash при перегрузке). Веб-поиск и фоновая генерация видео — внутри сайта,
         без внешних логинов и капч.
       </p>
       <button

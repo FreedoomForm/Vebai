@@ -86,6 +86,11 @@ export interface KernelPushMeta {
   notebook: string // full .ipynb JSON text
   isPrivate?: boolean
   enableGpu?: boolean
+  /** TPU instead of GPU (KAGGLE_ENABLE_TPU=true). Kaggle's only documented
+   * TPU shapes: Tpu1VmV38 (v3-8, being phased out) and the newer v5e-8 —
+   * see the product announcement. The exact machineShape string for v5e-8
+   * is not in the SDK docs yet; override via KAGGLE_MACHINE_SHAPE. */
+  enableTpu?: boolean
   enableInternet?: boolean
   machineShape?: string // e.g. "NvidiaTeslaT4" (the 2xT4 accelerator)
   datasetSources?: string[]
@@ -108,6 +113,10 @@ export async function kernelPush(meta: KernelPushMeta): Promise<SaveKernelResult
   }
   if (meta.enableGpu) {
     body.enableGpu = true
+    if (meta.machineShape) body.machineShape = meta.machineShape
+  }
+  if (meta.enableTpu) {
+    body.enableTpu = true
     if (meta.machineShape) body.machineShape = meta.machineShape
   }
   const res = await call<SaveKernelResult & { error?: string; invalidDatasetSources?: string[] }>(
