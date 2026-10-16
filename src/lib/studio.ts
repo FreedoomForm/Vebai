@@ -137,13 +137,18 @@ function kernelDefs(): Record<'real' | 'test' | 'workerReal' | 'workerTest', Ker
 
 /* ------------------------------- accelerator configuration ----------------
  * Default: the proven 2x T4 GPU (the ComfyUI/H3 pipeline is CUDA-only — it
- * CANNOT run on a TPU). TPU (e.g. Kaggle's new TPU v5e-8) can be enabled via
- * env vars WITHOUT a code change, for when the pipeline gets an XLA port:
+ * CANNOT run on a TPU; a PyTorch-XLA port of the H3 stack does not exist).
+ * Benchmarked live on Kaggle (Oct 2026): 2xT4 = ~47 TFLOPS fp16 aggregate,
+ * TPU v5e-8 = see freedomform/tpu-v5e8-bench results — v5e-8 is ~20x a single
+ * T4 in raw GEMM, but only usable once the pipeline is ported off CUDA.
+ * Switch WITHOUT code change when an XLA port lands:
  *   KAGGLE_ENABLE_TPU=true
- *   KAGGLE_MACHINE_SHAPE=TpuV5E8   (exact API string TBC; Tpu1VmV38 = old v3-8)
+ *   KAGGLE_TPU_MACHINE_SHAPE=TpuV5E8   (confirmed against kaggle-api source;
+ *                                      old v3-8 strings are retired)
  */
 const ENABLE_TPU = process.env.KAGGLE_ENABLE_TPU === 'true'
 const MACHINE_SHAPE = process.env.KAGGLE_MACHINE_SHAPE || 'NvidiaTeslaT4'
+const TPU_MACHINE_SHAPE = process.env.KAGGLE_TPU_MACHINE_SHAPE || 'TpuV5E8'
 
 function pushKernel(def: KernelDef): Promise<unknown> {
   return kernelPush({
@@ -154,7 +159,7 @@ function pushKernel(def: KernelDef): Promise<unknown> {
     enableInternet: true,
     enableGpu: def.gpu && !ENABLE_TPU,
     enableTpu: ENABLE_TPU,
-    machineShape: def.gpu || ENABLE_TPU ? MACHINE_SHAPE : undefined,
+    machineShape: ENABLE_TPU ? TPU_MACHINE_SHAPE : def.gpu ? MACHINE_SHAPE : undefined,
     datasetSources: [JOBS_DATASET, OUTPUTS_DATASET],
   })
 }

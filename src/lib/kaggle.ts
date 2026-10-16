@@ -86,13 +86,14 @@ export interface KernelPushMeta {
   notebook: string // full .ipynb JSON text
   isPrivate?: boolean
   enableGpu?: boolean
-  /** TPU instead of GPU (KAGGLE_ENABLE_TPU=true). Kaggle's only documented
-   * TPU shapes: Tpu1VmV38 (v3-8, being phased out) and the newer v5e-8 —
-   * see the product announcement. The exact machineShape string for v5e-8
-   * is not in the SDK docs yet; override via KAGGLE_MACHINE_SHAPE. */
+  /** TPU instead of GPU (KAGGLE_ENABLE_TPU=true). CONFIRMED against the
+   * official kaggle-api CLI source (_RETIRED_ACCELERATORS, kaggle_api_extended.py):
+   * the current default TPU shape is "TpuV5E8" (v5e-8); "Tpu1VmV38"/"tpuv38"
+   * (old v3-8) and "NvidiaTeslaP100" are RETIRED and silently substituted.
+   * Kaggle allows max 1 concurrent TPU session per account. */
   enableTpu?: boolean
   enableInternet?: boolean
-  machineShape?: string // e.g. "NvidiaTeslaT4" (the 2xT4 accelerator)
+  machineShape?: string // "NvidiaTeslaT4" (2xT4 GPU) | "TpuV5E8" (TPU v5e-8)
   datasetSources?: string[]
 }
 

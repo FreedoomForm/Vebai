@@ -58,12 +58,92 @@ async function post(cfg: ZaiConfig, urlPath: string, body: unknown, timeoutMs = 
   return res
 }
 
-/** Is this upstream answer worth retrying on the next model of the chain? */
-function isRetryableError(status: number, payload: string): boolean {
-  if (status === 429 || status === 503 || status === 504) return true
+/* ------------------------------------------------------- upstream retries *
+ * Z.ai free models regularly answer 429 / «负载已饱和» / «模型调用过高» when the
+ * shared quota is busy. Instead of failing the user's turn, we retry the SAME
+ * model with exponential backoff + jitter (honoring Retry-After when sent),
+ * and only then fall through to the next model of the chain. */
+
+/** backoff schedule BEFORE each retry of the same model (ms); overridable via
+ * ZAI_RETRY_DELAYS_MS="900,2600,6500" for ops tuning and offline tests */
+const RETRY_DELAYS_MS: readonly number[] = (
+  process.env.ZAI_RETRY_DELAYS_MS || '900,2600,6500'
+)
+  .split(',')
+  .map((s) => Number(s.trim()))
+  .filter((n) => Number.isFinite(n) && n >= 0)
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+function jitter(base: number): number {
+  return Math.round(base * (0.75 + Math.random() * 0.5))
+}
+
+/** wait time before the next attempt, honoring a sane Retry-After header */
+function backoffMs(attempt: number, res?: Response): number {
+  const ra = Number(res?.headers?.get?.('retry-after'))
+  if (Number.isFinite(ra) && ra > 0) return Math.min(jitter(ra * 1000), 15_000)
+  return jitter(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)])
+}
+
+/** Is this upstream answer worth retrying on the same model? */
+export function isRetryableError(status: number, payload: string): boolean {
+  if (status === 429 || status === 502 || status === 503 || status === 504) return true
   if (status === 500 && /operation failed|internal/i.test(payload)) return true
-  // 1305 — «модель перегружена», 1113 — «нет баланса», 1302 — rate limit
-  return /"code"\s*:\s*"(1305|1302|1113)"/.test(payload)
+  // Zhipu numeric codes: 1302/1303 — rate & concurrency limit, 1305 — «модель
+  // перегружена/высокая нагрузка», 1113 — «нет баланса» (бесполезно ждать, но
+  // фолбэк-модель бесплатна — пробуем её тоже)
+  if (/"code"\s*:\s*"?(1302|1303|1305|1113)"?/.test(payload)) return true
+  // free-quota wording in the human-readable message (any of the known phrasings)
+  if (
+    /rate.?limit|too many requests|concurrency|высокая нагрузк|перегружен|调用过高|负载已饱和|算力不足|并发/.test(
+      payload,
+    )
+  )
+    return true
+  return false
+}
+
+/** network-level failures (timeouts, reset sockets) are also worth a retry */
+function isRetryableException(e: unknown): boolean {
+  const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+  return /timeout|abort|network|ECONNRESET|ETIMEDOUT|socket|fetch failed/i.test(msg)
+}
+
+export interface RetryStats {
+  attempts: number
+  retries: number
+  modelUsed?: string
+}
+
+/** Run `fn` for one model with the retry/backoff policy. `fn` returns either
+ * `{ok:true,value}` or `{ok:false,status,payload,res}`; network exceptions are
+ * retried too. Throws the last error once the schedule is exhausted. */
+async function withModelRetries<T>(
+  fn: (attempt: number, lastRes?: Response) => Promise<{ ok: true; value: T } | { ok: false; status: number; payload: string; res?: Response }>,
+  onRetry?: (info: { attempt: number; delayMs: number; status: number | 'network'; payload: string }) => void,
+): Promise<T> {
+  let lastErr: Error | null = null
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const r = await fn(attempt)
+      if (r.ok) return r.value
+      const retryable = isRetryableError(r.status, r.payload)
+      lastErr = new Error(`${r.status}: ${r.payload.slice(0, 300)}`)
+      if (!retryable || attempt === RETRY_DELAYS_MS.length) throw lastErr
+      const delay = backoffMs(attempt, r.res)
+      onRetry?.({ attempt, delayMs: delay, status: r.status, payload: r.payload.slice(0, 160) })
+      await sleep(delay)
+    } catch (e) {
+      // a thrown non-Error from fn means it already decided to give up
+      if (e instanceof Error && lastErr === e) throw e
+      if (!isRetryableException(e) || attempt === RETRY_DELAYS_MS.length) throw e
+      const delay = backoffMs(attempt)
+      onRetry?.({ attempt, delayMs: delay, status: 'network', payload: (e as Error).message.slice(0, 160) })
+      await sleep(delay)
+    }
+  }
+  throw lastErr || new Error('upstream retries exhausted')
 }
 
 /* ------------------------------------------------------------------ types */
@@ -93,26 +173,38 @@ export interface ChatCompletion {
 async function officialComplete(cfg: ZaiConfig, body: ChatBody): Promise<ChatCompletion> {
   let lastError = ''
   for (const model of chatModels(body.model)) {
-    const res = await post(cfg, '/chat/completions', {
-      model,
-      messages: body.messages,
-      stream: false,
-      temperature: body.temperature,
-      max_tokens: body.max_tokens,
-      thinking: body.thinking || { type: 'disabled' },
-    })
-    const text = await res.text()
-    if (res.ok) {
-      try {
-        return JSON.parse(text) as ChatCompletion
-      } catch {
-        lastError = `bad JSON from ${model}: ${text.slice(0, 160)}`
-        continue
-      }
+    try {
+      return await withModelRetries(async () => {
+        const res = await post(cfg, '/chat/completions', {
+          model,
+          messages: body.messages,
+          stream: false,
+          temperature: body.temperature,
+          max_tokens: body.max_tokens,
+          thinking: body.thinking || { type: 'disabled' },
+        })
+        const text = await res.text()
+        if (res.ok) {
+          try {
+            return { ok: true as const, value: JSON.parse(text) as ChatCompletion }
+          } catch {
+            // undecodable 200 answer — pointless on the same model
+            throw new Error(`bad JSON from ${model}: ${text.slice(0, 160)}`)
+          }
+        }
+        return { ok: false as const, status: res.status, payload: text, res }
+      })
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e)
+      // keep walking the chain only for overload/limit-style failures
+      // (status codes, known wording, or network timeouts)
+      const chainWorthy =
+        isRetryableError(Number(lastError.match(/^(\d{3}):/)?.[1] || 0), lastError) ||
+        /rate|нагрузк|перегруж|调用过高|算力|timeout|abort|fetch failed/i.test(lastError) ||
+        /bad JSON/.test(lastError)
+      if (!chainWorthy) break
+      // overloaded / rate-limited after all retries — try the next model
     }
-    lastError = `${res.status}: ${text.slice(0, 300)}`
-    if (!isRetryableError(res.status, text)) break
-    // overloaded / rate-limited — try the next model of the chain
   }
   throw new Error(`Z.ai chat/completions не удалось: ${lastError}`)
 }
@@ -137,7 +229,7 @@ export async function officialStream(
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
 
-  const tryModel = async (model: string): Promise<Response> => {
+  const tryModelOnce = async (model: string) => {
     const res = await post(cfg, '/chat/completions', {
       model,
       messages: body.messages,
@@ -148,18 +240,19 @@ export async function officialStream(
     })
     if (res.ok) return res
     const text = await res.text().catch(() => '')
-    const err = new Error(`${res.status}: ${text.slice(0, 300)}`) as Error & { retryable?: boolean; payload?: string }
-    err.retryable = isRetryableError(res.status, text)
-    err.payload = text
-    throw err
+    return { status: res.status, payload: text, res } as const
   }
 
-  // resolve the first working model, then stream from it
+  // resolve the first working model (with per-model retry/backoff), then stream
   let upstream: Response | null = null
   let lastError: Error | null = null
   for (const model of chatModels(body.model)) {
     try {
-      upstream = await tryModel(model)
+      upstream = await withModelRetries(async () => {
+        const r = await tryModelOnce(model)
+        if (r instanceof Response) return { ok: true as const, value: r }
+        return { ok: false as const, status: r.status, payload: r.payload, res: r.res }
+      })
       // stash the model name for the first SSE payload
       const src = upstream.body as ReadableStream<Uint8Array>
       return new ReadableStream<Uint8Array>({
