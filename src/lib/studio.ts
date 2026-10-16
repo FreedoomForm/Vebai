@@ -138,9 +138,12 @@ function kernelDefs(): Record<'real' | 'test' | 'workerReal' | 'workerTest', Ker
 /* ------------------------------- accelerator configuration ----------------
  * Default: the proven 2x T4 GPU (the ComfyUI/H3 pipeline is CUDA-only — it
  * CANNOT run on a TPU; a PyTorch-XLA port of the H3 stack does not exist).
- * Benchmarked live on Kaggle (Oct 2026): 2xT4 = ~47 TFLOPS fp16 aggregate,
- * TPU v5e-8 = see freedomform/tpu-v5e8-bench results — v5e-8 is ~20x a single
- * T4 in raw GEMM, but only usable once the pipeline is ported off CUDA.
+ * Benchmarked live on Kaggle (Oct 2026): 2xT4 = ~47 TFLOPS fp16 aggregate
+ * (freedomform/t4x2-bench). TPU v5e-8 paper peak = 8x197 = 1576 TFLOPS bf16
+ * (~24x a single T4, ~12x vs 2xT4); live v5e-8 GEMM numbers land in
+ * freedomform/tpu-v5e8-bench once the session leaves Kaggle's TPU queue
+ * (max 1 concurrent TPU session, queue is long). Only usable once the
+ * pipeline is ported off CUDA.
  * Switch WITHOUT code change when an XLA port lands:
  *   KAGGLE_ENABLE_TPU=true
  *   KAGGLE_TPU_MACHINE_SHAPE=TpuV5E8   (confirmed against kaggle-api source;
