@@ -29,6 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
+      - name: Checkout (executor script lives in the repo)
+        uses: actions/checkout@v4
+
       - name: Execute queued terminal commands
         env:
           SITE: ${{ secrets.VEBAI_SITE_URL }}
