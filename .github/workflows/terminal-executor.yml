@@ -38,6 +38,14 @@ jobs:
       - name: Checkout (executor script lives in the repo)
         uses: actions/checkout@v4
 
+      - name: Preinstall common agent libraries (once per shift)
+        run: |
+          pip install -q --disable-pip-version-check \
+            reportlab matplotlib python-docx openpyxl python-pptx \
+            pillow pandas beautifulsoup4 lxml qrcode pypdf requests \
+            || true
+          python3 -c "import reportlab, matplotlib, docx, openpyxl, pptx, pypdf; print('agent libs OK')" || true
+
       - name: Execute queued terminal commands
         env:
           SITE: ${{ secrets.VEBAI_SITE_URL }}

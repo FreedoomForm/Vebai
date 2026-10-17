@@ -23,9 +23,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import zai_client  # noqa: E402
 
 WS = "/tmp/ws"
+MEMORY = "/tmp/agent_memory.md"   # outside WS: must NOT be collected as an attachment
 SITE = (os.environ.get("SITE") or "https://vebai-six.vercel.app").rstrip("/")
 SECRET = os.environ.get("SECRET") or ""
 SESSION = os.environ.get("SESSION") or ""
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
 MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS") or "30")
 BUDGET_MIN = float(os.environ.get("AGENT_BUDGET_MIN") or "45")
@@ -148,11 +150,51 @@ def compact(history: list) -> None:
 
 # ---------------------------------------------------------------------- main
 
+def list_new_files(since_ts: float) -> list:
+    """files created/modified in WS since the task started (for the final note)."""
+    out = []
+    for root, _, names in os.walk(WS):
+        for n in names:
+            p = os.path.join(root, n)
+            try:
+                st = os.stat(p)
+                if st.st_mtime >= since_ts and st.st_size > 0:
+                    out.append((os.path.relpath(p, WS), st.st_size))
+            except OSError:
+                continue
+    return sorted(out, key=lambda x: -x[1])[:10]
+
+
+def load_memory() -> str:
+    try:
+        with open(MEMORY, encoding="utf-8") as f:
+            data = f.read().strip()
+        return data[-1500:]
+    except OSError:
+        return "(память пуста — это первая задача в смене)"
+
+
+def save_memory(task: str, final: str) -> None:
+    try:
+        prev = ""
+        try:
+            with open(MEMORY, encoding="utf-8") as f:
+                prev = f.read()
+        except OSError:
+            pass
+        line = f"- {time.strftime('%d.%m %H:%M')}: {task.strip()[:90]} → {final.strip()[:200]}\n"
+        with open(MEMORY, "w", encoding="utf-8") as f:
+            f.write((prev + line)[-4000:])
+    except OSError:
+        pass
+
+
 def run_agent(task, budget_min=None) -> str:
     """run one agent task end-to-end; returns the final answer text."""
     global _last_progress
     _last_progress = 0.0
     os.makedirs(WS, exist_ok=True)
+    started_ts = time.time()
 
     try:
         with open(AGENT_MD, encoding="utf-8") as f:
@@ -160,15 +202,23 @@ def run_agent(task, budget_min=None) -> str:
     except OSError:
         system = "Ты автономный агент на Ubuntu. Отвечай блоками <cmd> или <final>."
 
-    budget = min(budget_min if budget_min else BUDGET_MIN, BUDGET_MIN)
+    try:
+        skills = ", ".join(sorted(os.listdir(SKILLS_DIR))) or "нет"
+    except OSError:
+        skills = "нет"
+
+    budget = BUDGET_MIN if not budget_min else min(budget_min, BUDGET_MIN)
     deadline = time.time() + budget * 60
     started = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
     header = (
         f"# Задача от владельца (поступила {started})\n\n{task.strip()}\n\n"
         "# Окружение прямо сейчас\n"
-        f"- cwd: {WS} (сохрани состояние здесь)\n"
+        f"- cwd: {WS} (все файлы-результаты сюда)\n"
         f"- utcnow: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n"
+        f"- скиллы (плейбуки): {SKILLS_DIR} — там есть: {skills}\n"
+        "  перед задачей типа pdf/charts/docx/xlsx/pptx/media/web прочитай нужный плейбук\n"
+        f"- память смены (итоги прошлых задач):\n{load_memory()}\n"
     )
     history = [{"role": "user", "content": header}]
     final_text = ""
@@ -188,9 +238,25 @@ def run_agent(task, budget_min=None) -> str:
                           if RE_FINAL.search(reply) else reply[:3000])
             break
 
-        reply, model = zai_client.chat(
-            [{"role": "system", "content": system}] + history,
-            temperature=0.3, max_tokens=4000)
+        # ---- ask the model (resilient: one retry, then graceful exit)
+        reply = None
+        for attempt in range(2):
+            try:
+                reply, model = zai_client.chat(
+                    [{"role": "system", "content": system}] + history,
+                    temperature=0.3, max_tokens=4000)
+                break
+            except Exception as e:
+                if attempt == 1:
+                    files_note = list_new_files(started_ts)
+                    note = ("\n\n⚠️ Связь с моделью потерялась на шаге %d (%s). "
+                            "Всё, что успело сделаться, — в файлах." % (step, str(e)[:120]))
+                    if files_note:
+                        note += "\n📎 Файлы: " + ", ".join(
+                            f"{p} ({s // 1024} КБ)" for p, s in files_note)
+                    save_memory(task, "ОШИБКА СВЯЗИ на шаге %d" % step)
+                    return (final_text or "") + note
+                time.sleep(15)
         final, actions = parse_actions(reply)
 
         if not actions:
@@ -237,6 +303,13 @@ def run_agent(task, budget_min=None) -> str:
         except Exception as e:
             final_text = f"Лимит шагов исчерпан, финал не получен: {e}"
 
+    # ---- self-check: attach the real file list (runner-side verification)
+    files = list_new_files(started_ts)
+    if files:
+        listing = ", ".join(f"{p} ({s // 1024} КБ)" if s >= 1024 else f"{p} ({s} Б)"
+                            for p, s in files)
+        final_text += f"\n\n📎 Файлы: {listing}"
+    save_memory(task, final_text)
     return final_text or "(агент закончил без финального ответа)"
 
 

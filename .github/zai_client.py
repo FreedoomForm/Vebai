@@ -47,21 +47,25 @@ def _retryable(status: int, body: str) -> bool:
     return bool(re.search(r"负载已饱和|调用过高|并发|算力不足|rate.?limit", body, re.I))
 
 
-def chat(messages, temperature: float = 0.3, max_tokens: int = 4000,
-         timeout: int = 180):
-    """One chat completion with retries + model fallback -> (text, model)."""
+def chat(messages, temperature: float = 0.3, max_tokens: int = 4000):
+    """One chat completion with retries + model fallback -> (text, model).
+
+    Primary (glm-4.7-flash) is a thinking model that occasionally hangs:
+    give it short timeouts so the agent never stalls; the fallback
+    (glm-4.5-flash) is fast and stable."""
     if not API_KEY:
         raise ZaiError("ZAI_API_KEY не задан (добавь secret ZAI_API_KEY в репозиторий)")
     last = ""
-    for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        for attempt in range(4):
+    plan = [(PRIMARY_MODEL, 45, 2), (FALLBACK_MODEL, 120, 3)]
+    for model, tmo, attempts in plan:
+        for attempt in range(attempts):
             try:
                 d = _post_json(
                     BASE_URL + "/chat/completions",
                     {"model": model, "messages": messages, "stream": False,
                      "temperature": temperature, "max_tokens": max_tokens,
                      "thinking": {"type": "disabled"}},
-                    key=API_KEY, timeout=timeout)
+                    key=API_KEY, timeout=tmo)
                 text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
                 if text.strip():
                     return text.strip(), model
@@ -76,7 +80,7 @@ def chat(messages, temperature: float = 0.3, max_tokens: int = 4000,
                     raise ZaiError(last)
             except Exception as e:
                 last = f"{type(e).__name__}: {e}"
-            time.sleep(min(2 ** attempt * 1.5 + 1.0, 20))
+            time.sleep(min(2 ** attempt * 1.5 + 1.0, 15))
     raise ZaiError("GLM недоступен: " + last[:300])
 
 
