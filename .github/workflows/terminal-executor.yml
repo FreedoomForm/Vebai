@@ -45,4 +45,9 @@ jobs:
           SESSION: ${{ github.event.inputs.session }}
           CMDID: ${{ github.event.inputs.cmd }}
           TMO: ${{ github.event.inputs.timeout }}
+          # agent mode ('#!agent' tasks): GLM brain + budget knobs
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_BASE_URL: ${{ secrets.ZAI_BASE_URL }}
+          AGENT_MAX_STEPS: '30'
+          AGENT_BUDGET_MIN: '45'
         run: python3 .github/terminal_executor.py

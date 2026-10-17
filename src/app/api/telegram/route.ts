@@ -76,6 +76,56 @@ async function statusText(): Promise<string> {
   return `📡 Vebai status\n${lines.join('\n')}`
 }
 
+/** conversation id of the Telegram chat (create if missing) */
+async function ensureConv(cache: BotCache): Promise<string> {
+  const existing = cache.convId || ''
+  if (existing) {
+    const row = await db.conversation.findUnique({ where: { id: existing } })
+    if (row) return existing
+  }
+  const conv = await db.conversation.create({ data: { title: 'Telegram' } })
+  await writeCache({ convId: conv.id })
+  return conv.id
+}
+
+/** fast conversational answer via the site LLM (the "?вопрос" escape) */
+async function chatAnswer(convId: string, q: string): Promise<string> {
+  await db.message.create({
+    data: { conversationId: convId, role: 'user', kind: 'text', content: q.slice(0, 4000) },
+  })
+  const history = await db.message.findMany({
+    where: { conversationId: convId },
+    orderBy: { createdAt: 'desc' },
+    take: 20,
+  })
+  const messages: ChatMessage[] = [
+    {
+      role: 'system',
+      content:
+        systemPrompt() +
+        '\nПользователь пишет из Telegram в быстрый режим: отвечай сжато, без markdown-таблиц, без блоков run-terminal. Если для ответа нужно что-то выполнить на сервере — скажи отправить задачу без «?» и агент сделает.',
+    },
+  ]
+  for (const m of history.reverse()) {
+    if (m.role !== 'user' && m.role !== 'assistant') continue
+    const c = (m.content || '').trim()
+    if (c) messages.push({ role: m.role, content: c.slice(0, 6000) })
+  }
+  try {
+    const cc = await zai.chat.completions({
+      messages,
+      thinking: { type: 'disabled' }, // fast mode: Telegram waits
+    })
+    const answer = cc.choices?.[0]?.message?.content || '(пустой ответ модели)'
+    await db.message.create({
+      data: { conversationId: convId, role: 'assistant', kind: 'text', content: answer },
+    })
+    return answer.slice(0, 3800)
+  } catch (e) {
+    return '⚠️ Модель недоступна: ' + (e instanceof Error ? e.message.slice(0, 140) : 'ошибка')
+  }
+}
+
 export async function GET() {
   return NextResponse.json({ ok: true, bot: 'vebai', mode: 'webhook' })
 }
@@ -116,9 +166,12 @@ export async function POST(req: NextRequest) {
       await tgSend(
         chatId,
         '✅ Привязано. Это пульт Vebai — пиши задачи прямо сюда.\n\n' +
-          '• «создай PDF …» / команды — выполнятся на GitHub Actions (Ubuntu), даже если сайт и Telegram закрыты\n' +
+          '🤖 обычный текст — задача АГЕНТУ на GitHub Actions (Ubuntu): он сам спланирует команды, доведёт дело до конца и пришлёт файлы (PDF, отчёты, код…), даже если сайт и Telegram закрыты\n' +
+          '❓ «?текст» — быстрый вопрос модели без запуска задач\n' +
+          '❗ «!команда» — одна прямая shell-команда на сервере\n' +
           '• видео — уйдёт на Kaggle (кнопка «Сделать видео» на сайте запускает то же самое)\n' +
-          '• /status — состояние конвейера\n\nРезультаты и файлы приходят в этот чат.',
+          '• /status — состояние конвейера\n\n' +
+          'Результаты, шаги работы и файлы приходят в этот чат.',
       )
     } else {
       await tgSend(chatId, 'Бот персональный. Отправь /start для привязки.')
@@ -140,58 +193,28 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true })
   }
 
-  // ---- chat turn (persistent "Telegram" conversation)
-  let convId = cache.convId || ''
-  if (convId) {
-    const exists = await db.conversation.findUnique({ where: { id: convId } })
-    if (!exists) convId = ''
-  }
-  if (!convId) {
-    const conv = await db.conversation.create({ data: { title: 'Telegram' } })
-    convId = conv.id
-    await writeCache({ convId })
-  }
-  await db.message.create({
-    data: { conversationId: convId, role: 'user', kind: 'text', content: text.slice(0, 4000) },
-  })
-
-  const history = await db.message.findMany({
-    where: { conversationId: convId },
-    orderBy: { createdAt: 'desc' },
-    take: 20,
-  })
-  const messages: ChatMessage[] = [
-    { role: 'system', content: systemPrompt() + '\nПользователь пишет из Telegram: отвечай сжато, без markdown-таблиц; команды для исполнения — в блоках ```run-terminal```.' },
-  ]
-  for (const m of history.reverse()) {
-    if (m.role !== 'user' && m.role !== 'assistant') continue
-    const c = (m.content || '').trim()
-    if (c) messages.push({ role: m.role, content: c.slice(0, 6000) })
-  }
-  if (messages[messages.length - 1]?.role !== 'user') {
-    await tgSend(chatId, '⚠️ Не смог обработать сообщение.')
+  // ---- fast conversational escape: "?вопрос" -> site LLM answers right away
+  if (text.startsWith('?')) {
+    const q = text.slice(1).trim()
+    if (!q) {
+      await tgSend(chatId, 'Напиши вопрос после знака «?». А обычные задачи (без «?») уходят агенту на GitHub Actions.')
+      return NextResponse.json({ ok: true })
+    }
+    await tgSend(chatId, await chatAnswer(await ensureConv(cache), q))
     return NextResponse.json({ ok: true })
   }
 
-  let answer = ''
-  try {
-    const cc = await zai.chat.completions({
-      messages,
-      thinking: { type: 'disabled' }, // fast mode: Telegram waits
+  // ---- shell escape: "!команда" -> one plain command (old direct mode)
+  if (text.startsWith('!')) {
+    const command = text.slice(1).trim()
+    if (!command) {
+      await tgSend(chatId, 'Напиши команду после «!», например: !uptime')
+      return NextResponse.json({ ok: true })
+    }
+    const convId = await ensureConv(cache)
+    await db.message.create({
+      data: { conversationId: convId, role: 'user', kind: 'text', content: `! ${command.slice(0, 4000)}` },
     })
-    answer = cc.choices?.[0]?.message?.content || ''
-  } catch (e) {
-    await tgSend(chatId, '⚠️ Модель недоступна: ' + (e instanceof Error ? e.message.slice(0, 140) : 'ошибка'))
-    return NextResponse.json({ ok: true })
-  }
-  if (!answer) answer = '(пустой ответ модели)'
-
-  // ---- queue real execution: run-terminal blocks -> GitHub Actions
-  let queued = 0
-  const re = /```run-terminal\s*\n([\s\S]*?)```/g
-  for (let m = re.exec(answer); m && queued < 3; m = re.exec(answer)) {
-    const command = m[1].trim().slice(0, 20_000)
-    if (!command) continue
     await db.agentTask.create({
       data: {
         conversationId: convId,
@@ -199,23 +222,38 @@ export async function POST(req: NextRequest) {
         title: `$ ${command.replace(/\s+/g, ' ').slice(0, 90)}`,
         status: 'queued',
         progress: 'Команда в очереди GitHub Actions…',
-        payload: JSON.stringify({ command, terminalId: convId, timeoutS: 240 }),
+        payload: JSON.stringify({ command: command.slice(0, 20_000), terminalId: convId, timeoutS: 240 }),
       },
     })
-    queued++
+    await tgSend(chatId, '⌨️ Команда ушла на GitHub Actions (Ubuntu) — пришлю вывод и файлы.')
+    return NextResponse.json({ ok: true })
   }
-  await db.message.create({
-    data: { conversationId: convId, role: 'assistant', kind: 'text', content: answer },
-  })
 
-  // ---- reply (strip execution blocks; they are not for humans)
-  const plain =
-    answer
-      .replace(/```\s*run-(terminal|vterm)\s*\n[\s\S]*?```/g, '')
-      .trim() || ''
-  let reply = plain || answer.slice(0, 3800)
-  if (queued > 0)
-    reply += `\n\n⌨️ ${queued} команда(ы) ушли на GitHub Actions (Ubuntu) — вывод и файлы пришлю сюда через 1-5 минут.`
-  await tgSend(chatId, reply)
+  // ---- default: hand the whole message to the resident agent on GitHub
+  // Actions (owner request 2026-10-18): instead of one big shell command the
+  // runner works as a real agent - plans, runs many commands, delivers files.
+  const convId = await ensureConv(cache)
+  await db.message.create({
+    data: { conversationId: convId, role: 'user', kind: 'text', content: text.slice(0, 4000) },
+  })
+  await db.agentTask.create({
+    data: {
+      conversationId: convId,
+      type: 'terminal',
+      title: `🤖 ${text.replace(/\s+/g, ' ').slice(0, 90)}`,
+      status: 'queued',
+      progress: 'Агент на GitHub Actions возьмёт задачу в течение минуты…',
+      payload: JSON.stringify({
+        command: `#!agent\n${text.slice(0, 8000)}`,
+        terminalId: convId,
+        timeoutS: 3600,
+      }),
+    },
+  })
+  await tgSend(
+    chatId,
+    '🤖 Задачу принял агент на GitHub Actions (Ubuntu). Он сам разобьёт её на команды и доведёт до конца. ' +
+      'По ходу пришлю шаги, в конце — результат и файлы.',
+  )
   return NextResponse.json({ ok: true })
 }

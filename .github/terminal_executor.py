@@ -20,6 +20,8 @@ import sys
 import time
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 SITE = (os.environ.get("SITE") or "https://vebai-six.vercel.app").rstrip("/")
 SECRET = os.environ.get("SECRET") or ""
 SESSION = os.environ.get("SESSION") or ""
@@ -31,6 +33,12 @@ TMO = min(TMO, 30)
 SHIFT_SECONDS = 340 * 60   # 5h40m shift, safely under the 6h GitHub job cap
 IDLE_POLL = 10             # seconds between claim polls when queue is empty
 WS = "/tmp/ws"             # persistent workspace for the whole shift
+
+# Agent mode (owner request 2026-10-18): commands prefixed with '#!agent' are
+# handled by agent_runner.py - an LLM loop that plans and runs many commands
+# itself instead of one big shell blob.
+AGENT_BUDGET_MIN = float(os.environ.get("AGENT_BUDGET_MIN") or "45")
+AGENT_PREFIX = "#!agent"
 
 MIME = {
     ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
@@ -151,6 +159,37 @@ def main() -> int:
         cmd_id = c["id"]
         done += 1
         since_ts = time.time() - 1
+
+        # ---- agent task: hand over to the LLM loop (many self-planned commands)
+        raw = str(c.get("command", ""))
+        if raw.startswith(AGENT_PREFIX):
+            task = raw[len(AGENT_PREFIX):].lstrip("\n").strip()
+            os.makedirs("/tmp/cmds", exist_ok=True)
+            try:
+                with open(f"/tmp/cmds/{cmd_id[:8]}.task", "w") as f:
+                    f.write(task)
+            except OSError:
+                pass
+            rc = 0
+            try:
+                import agent_runner
+                budget = min(AGENT_BUDGET_MIN, (deadline - time.time()) / 60 - 5)
+                if budget < 3:
+                    raise RuntimeError("в смене осталось меньше 8 минут - жду новую смену")
+                final_text = agent_runner.run_agent(task, budget_min=budget)
+                with open(f"/tmp/.out-{cmd_id[:8]}", "w") as fo:
+                    fo.write(final_text)
+            except Exception as e:  # agent crashed -> report the failure
+                rc = 1
+                try:
+                    with open(f"/tmp/.out-{cmd_id[:8]}", "w") as fo:
+                        fo.write(f"агент упал: {type(e).__name__}: {str(e)[:600]}")
+                except OSError:
+                    pass
+            post_result(cmd_id, rc, since_ts)
+            continue
+
+        # ---- plain shell command
         os.makedirs("/tmp/cmds", exist_ok=True)
         script = f"/tmp/cmds/{cmd_id[:8]}.sh"
         with open(script, "w") as f:

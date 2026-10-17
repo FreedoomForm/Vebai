@@ -63,9 +63,15 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: 'command not found' }, { status: 404 })
 
   // ---- files: store inline + mirror to Telegram (channel + owner's private chat)
+  const isAgent = cmd.command.startsWith('#!agent')
+  const agentTaskHead = isAgent
+    ? cmd.command.slice(7).trim().replace(/\s+/g, ' ').slice(0, 200)
+    : ''
   const saved: { id: string; path: string; size: number }[] = []
   const tgFiles: { name: string; data: Buffer; mime?: string }[] = []
-  const caption = `🗂 файл(ы) команды (GitHub Actions)\n$ ${cmd.command.slice(0, 250)}`
+  const caption = isAgent
+    ? `🗂 файл(ы) агента (GitHub Actions)\n🤖 ${agentTaskHead}`
+    : `🗂 файл(ы) команды (GitHub Actions)\n$ ${cmd.command.slice(0, 250)}`
   for (const f of (body.files || []).slice(0, 8)) {
     const path = String(f.path || '').replace(/\\/g, '/').slice(0, 200)
     if (!path) continue
@@ -116,8 +122,11 @@ export async function POST(req: NextRequest) {
       const filesView = saved
         .map((s) => `📎 [${s.path}](/api/terminal/files/${s.id}) — ${(s.size / 1024).toFixed(1)} КБ`)
         .join('\n')
-      const content =
-        status === 'done'
+      const content = isAgent
+        ? status === 'done'
+          ? `🤖 Агент закончил задачу «${agentTaskHead}»\n\n${outputView}${filesView ? `\n\nФайлы:\n${filesView}` : ''}`
+          : `🤖 Агент не справился с задачей «${agentTaskHead}»: ${outputView.slice(0, 600)}${filesView ? `\n\nФайлы:\n${filesView}` : ''}`
+        : status === 'done'
           ? `Терминал (GitHub Actions): $ ${cmd.command.slice(0, 300)}\n\`\`\`\n${outputView}\n\`\`\`\nexit code: ${exit}${filesView ? `\n\nФайлы:\n${filesView}` : ''}`
           : `Терминал (GitHub Actions): команда «${cmd.command.slice(0, 120)}» не выполнена (exit ${exit}): ${outputView.slice(0, 400)}${filesView ? `\n\nФайлы:\n${filesView}` : ''}`
       await db.message.create({
