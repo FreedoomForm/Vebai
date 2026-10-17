@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Headless terminal executor for vebai (GitHub Actions runner).
+"""Resident headless terminal executor for vebai (GitHub Actions runner).
 
-Claims queued TerminalCommands from the site API, executes each in a clean
-bash environment (cwd = fresh scratch dir), and posts stdout/stderr plus any
-produced files back. Command text and output never reach the (public) Actions
-logs - they live only in /tmp and travel between here and the site API.
+Claims queued TerminalCommands from the site API and executes each in bash
+(cwd = persistent per-run workspace /tmp/ws, so cd / files / venvs survive
+between commands). Command text, output and produced files NEVER reach the
+(public) Actions logs - they travel between here and the site API only.
 
-Loop: up to 10 commands or 29 minutes per workflow run.
+Resident mode (owner request 2026-10-18): the runner stays alive until the
+~5h40m shift deadline, idling between commands. When the shift ends (or the
+runner dies), the site's tick sees the stale heartbeat and dispatches a fresh
+run - reconnect is automatic. Queue is drained continuously as commands
+arrive; there is no per-run command cap anymore.
 """
 import base64
 import json
@@ -24,6 +28,10 @@ TMO_RAW = (os.environ.get("TMO") or "15").strip()
 TMO = int(TMO_RAW) if TMO_RAW.isdigit() else 15
 TMO = min(TMO, 30)
 
+SHIFT_SECONDS = 340 * 60   # 5h40m shift, safely under the 6h GitHub job cap
+IDLE_POLL = 10             # seconds between claim polls when queue is empty
+WS = "/tmp/ws"             # persistent workspace for the whole shift
+
 MIME = {
     ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
@@ -35,28 +43,30 @@ MAX_FILE = 3_000_000          # per-file inline cap (bytes)
 MAX_TOTAL_B64 = 3_400_000     # total base64 budget for the callback body
 
 
-def api(path: str, payload: dict) -> dict:
+def api(path: str, payload: dict, timeout: int = 120) -> dict:
     req = urllib.request.Request(
         SITE + path,
         data=json.dumps(payload).encode(),
         headers={"content-type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
-def collect_files(workdir: str) -> list:
+def collect_files(since_ts: float) -> list:
+    """files created/modified inside the workspace since the command started"""
     files = []
     total = 0
-    for root, _, names in os.walk(workdir):
+    for root, _, names in os.walk(WS):
         for n in names:
-            if n in (".stdout", ".stderr"):
-                continue
             p = os.path.join(root, n)
             try:
-                sz = os.path.getsize(p)
+                st = os.stat(p)
             except OSError:
                 continue
+            if st.st_mtime < since_ts:
+                continue
+            sz = st.st_size
             b64len = (sz + 2) // 3 * 4
             if sz > MAX_FILE or total + b64len > MAX_TOTAL_B64:
                 continue
@@ -68,18 +78,18 @@ def collect_files(workdir: str) -> list:
             total += b64len
             ext = os.path.splitext(n)[1].lower()
             files.append({
-                "path": os.path.relpath(p, workdir),
+                "path": os.path.relpath(p, WS),
                 "b64": base64.b64encode(b).decode(),
                 "mime": MIME.get(ext, "application/octet-stream"),
             })
     return files
 
 
-def pack_result(cmd_id: str, rc: int, workdir: str) -> dict:
+def pack_result(cmd_id: str, rc: int, since_ts: float) -> dict:
     out = ""
     err = ""
-    p_out = os.path.join(workdir, ".stdout")
-    p_err = os.path.join(workdir, ".stderr")
+    p_out = f"/tmp/.out-{cmd_id[:8]}"
+    p_err = f"/tmp/.err-{cmd_id[:8]}"
     if os.path.exists(p_out):
         with open(p_out, encoding="utf-8", errors="replace") as f:
             out = f.read()[-12000:]
@@ -92,53 +102,72 @@ def pack_result(cmd_id: str, rc: int, workdir: str) -> dict:
     return {
         "secret": SECRET, "session": SESSION, "cmdId": cmd_id,
         "status": "done" if rc == 0 else "failed", "exitCode": rc,
-        "output": output, "files": collect_files(workdir),
+        "output": output, "files": collect_files(since_ts),
     }
+
+
+def post_result(cmd_id: str, rc: int, since_ts: float) -> bool:
+    """best effort: retry a few times; a lost result self-heals on the site
+    (stuck-command reclaim) but only if we do not keep the shift alive"""
+    for attempt in range(3):
+        try:
+            r = api("/api/terminal/gh/result", pack_result(cmd_id, rc, since_ts))
+            print("cmd", cmd_id[:8], "exit", rc, "posted", r.get("ok"), flush=True)
+            return True
+        except Exception as e:
+            print(f"result post failed ({attempt + 1}/3):", type(e).__name__, flush=True)
+            time.sleep(10)
+    return False
 
 
 def main() -> int:
     if not SECRET or not SESSION:
         print("missing SECRET/SESSION env")
         return 2
-    deadline = time.time() + 29 * 60
+    os.makedirs(WS, exist_ok=True)
+    deadline = time.time() + SHIFT_SECONDS
     specific = CMDID
-    for _ in range(10):
-        if time.time() >= deadline:
-            break
+    done = 0
+    print(f"resident shift start: workspace {WS}, shift {SHIFT_SECONDS // 60} min", flush=True)
+    while time.time() < deadline:
         try:
             d = api("/api/terminal/gh/claim",
                     {"secret": SECRET, "session": SESSION, "cmd": specific})
         except Exception as e:
-            print("claim failed:", type(e).__name__)
-            return 1
+            # transient site/network hiccup: stay resident, retry shortly
+            print("claim failed:", type(e).__name__, flush=True)
+            specific = ""
+            time.sleep(20)
+            continue
         specific = ""
         c = (d.get("cmd") or {}) if d.get("ok") else {}
         if not c.get("id"):
-            print("queue empty - done")
-            return 0
+            remaining = int(deadline - time.time())
+            if remaining % 600 < IDLE_POLL + 1:
+                print(f"idle, ~{remaining // 60} min left in shift", flush=True)
+            time.sleep(IDLE_POLL)
+            continue
+
         cmd_id = c["id"]
-        workdir = "/tmp/task-" + cmd_id[:8]
-        os.makedirs(workdir, exist_ok=True)
-        script = "/tmp/task-" + cmd_id[:8] + ".sh"
+        done += 1
+        since_ts = time.time() - 1
+        os.makedirs("/tmp/cmds", exist_ok=True)
+        script = f"/tmp/cmds/{cmd_id[:8]}.sh"
         with open(script, "w") as f:
             f.write(str(c.get("command", "")))
         rc = 1
         try:
-            with open(os.path.join(workdir, ".stdout"), "w") as fo, \
-                 open(os.path.join(workdir, ".stderr"), "w") as fe:
-                p = subprocess.run(["bash", script], cwd=workdir, stdin=subprocess.DEVNULL,
+            with open(f"/tmp/.out-{cmd_id[:8]}", "w") as fo, \
+                 open(f"/tmp/.err-{cmd_id[:8]}", "w") as fe:
+                p = subprocess.run(["bash", script], cwd=WS, stdin=subprocess.DEVNULL,
                                    stdout=fo, stderr=fe, timeout=TMO * 60)
             rc = p.returncode
         except subprocess.TimeoutExpired:
             rc = 124
         except Exception:
             rc = 127
-        try:
-            r = api("/api/terminal/gh/result", pack_result(cmd_id, rc, workdir))
-            print("cmd", cmd_id[:8], "exit", rc, "posted", r.get("ok"))
-        except Exception as e:
-            print("result post failed:", type(e).__name__)
-            return 1
+        post_result(cmd_id, rc, since_ts)
+    print(f"resident shift over: {done} command(s) executed this run", flush=True)
     return 0
 
 

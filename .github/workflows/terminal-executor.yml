@@ -3,6 +3,12 @@ name: terminal-executor
 # Headless Linux executor for the site's `terminal` tool (Kaggle-free per
 # owner rule). Command text / output / produced files NEVER appear in these
 # public logs: they travel only between the site API and /tmp files.
+#
+# RESIDENT mode (owner request 2026-10-18): one run stays alive ~5h40m
+# (under the 6h GitHub job cap), continuously draining the command queue
+# and idling between commands. When the shift ends or the runner dies, the
+# site's tick (/api/agent/tick) sees the stale session heartbeat and
+# dispatches a fresh run - the executor reconnects itself, 24/7.
 # One-time setup (owner): repo secrets GH_TERM_SECRET + VEBAI_SITE_URL.
 
 on:
@@ -27,7 +33,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 350 # resident shift backstop (< 6h GitHub job cap)
     steps:
       - name: Checkout (executor script lives in the repo)
         uses: actions/checkout@v4

@@ -378,6 +378,34 @@ async function startTerminalTask(taskId: string) {
   }
 }
 
+/** keep the resident GitHub executor alive 24/7 (owner request 2026-10-18):
+ * the runner shift lasts ~5h40m (GitHub job cap 6h). The claim endpoint
+ * doubles as heartbeat; when it goes stale (shift ended or runner died)
+ * dispatch a fresh resident run. 10-min dispatch guard avoids spam while
+ * GitHub cold-starts. */
+async function ghResidentKeepalive() {
+  try {
+    const session = await db.terminalSession.findFirst({
+      where: { kind: 'gh', status: 'active' },
+      orderBy: { createdAt: 'desc' },
+    })
+    if (!session) return
+    const staleMs = 12 * 60_000
+    if (session.lastSeenAt && Date.now() - session.lastSeenAt.getTime() < staleMs) return
+    const st = await db.studioState.findUnique({ where: { key: 'ghKeep' } })
+    let dispatchedAt = 0
+    try { dispatchedAt = Number(JSON.parse(st?.data || '{}').dispatchedAt) || 0 } catch { /* ignore */ }
+    if (Date.now() - dispatchedAt < 10 * 60_000) return
+    await db.studioState.upsert({
+      where: { key: 'ghKeep' },
+      create: { key: 'ghKeep', data: JSON.stringify({ dispatchedAt: Date.now() }) },
+      update: { data: JSON.stringify({ dispatchedAt: Date.now() }) },
+    })
+    void ghDispatch(session.id)
+    console.warn('[agent-worker] gh executor heartbeat stale -> resident redispatch')
+  } catch { /* non-fatal */ }
+}
+
 async function syncTerminalTask(taskId: string) {
   const task = await db.agentTask.findUnique({ where: { id: taskId } })
   if (!task || task.status !== 'running') return
@@ -551,6 +579,8 @@ async function tick() {
       orderBy: { createdAt: 'asc' },
     })
     for (const t of termRunning) await syncTerminalTask(t.id)
+
+    await ghResidentKeepalive()
   } catch (e) {
     console.error('[agent-worker] tick error:', e instanceof Error ? e.message : e)
   }

@@ -25,6 +25,15 @@ export async function POST(req: NextRequest) {
   if (!session || session.kind !== 'gh' || session.secret !== secret)
     return NextResponse.json({ ok: false, error: 'forbidden' }, { status: 403 })
 
+  // every authorized poll doubles as the resident-runner heartbeat
+  // (throttled: the runner polls every ~10s, one DB write per minute is plenty)
+  if (!session.lastSeenAt || Date.now() - session.lastSeenAt.getTime() > 60_000) {
+    await db.terminalSession.update({
+      where: { id: sessionId },
+      data: { lastSeenAt: new Date() },
+    })
+  }
+
   const stale = new Date(Date.now() - 25 * 60_000)
 
   const tryClaim = async (id: string, staleOnly = false) => {
@@ -60,10 +69,6 @@ export async function POST(req: NextRequest) {
 
   if (!cmd) return NextResponse.json({ ok: false, reason: 'empty' })
 
-  await db.terminalSession.update({
-    where: { id: sessionId },
-    data: { lastSeenAt: new Date() },
-  })
   return NextResponse.json({
     ok: true,
     cmd: { id: cmd.id, command: cmd.command, conversationId: cmd.conversationId },
