@@ -108,11 +108,24 @@ async function sendOne(
   }
 }
 
-/** upload produced files to the owner channel; returns count delivered */
-export async function uploadToTelegram(files: TgFile[], caption: string): Promise<number> {
+/** id of the owner's private chat with the bot (locked via /start in the
+ * webhook flow) - null if nobody has bound the bot yet */
+export async function botOwnerChatId(): Promise<string | null> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
+    if (!row) return null
+    return (JSON.parse(row.data) as { ownerChatId?: string }).ownerChatId || null
+  } catch { return null }
+}
+
+/** upload produced files to the owner channel (or an explicit chat);
+ * returns count delivered */
+export async function uploadToTelegram(
+  files: TgFile[], caption: string, chatIdOverride?: string,
+): Promise<number> {
   const token = botToken()
   if (!token || files.length === 0) return 0
-  const chatId = await resolveChatId()
+  const chatId = chatIdOverride || (await resolveChatId())
   if (!chatId) return 0 // bot not admin yet (or invite-only) — skip silently
   let n = 0
   for (const f of files.slice(0, 10)) {
@@ -123,10 +136,10 @@ export async function uploadToTelegram(files: TgFile[], caption: string): Promis
 }
 
 /** one plain text message (used for terminal command logs) */
-export async function sendTelegramText(text: string): Promise<boolean> {
+export async function sendTelegramText(text: string, chatIdOverride?: string): Promise<boolean> {
   const token = botToken()
   if (!token) return false
-  const chatId = await resolveChatId()
+  const chatId = chatIdOverride || (await resolveChatId())
   if (!chatId) return false
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {

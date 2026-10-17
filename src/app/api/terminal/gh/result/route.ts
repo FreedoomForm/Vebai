@@ -1,9 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { uploadToTelegram } from '@/lib/telegram'
+import { uploadToTelegram, sendTelegramText } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 120
+
+async function readBotCache(): Promise<{ ownerChatId?: string; convId?: string }> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
+    if (!row) return {}
+    return JSON.parse(row.data) as { ownerChatId?: string; convId?: string }
+  } catch { return {} }
+}
 
 interface GhFile {
   path?: string
@@ -54,9 +62,10 @@ export async function POST(req: NextRequest) {
   if (!updated)
     return NextResponse.json({ ok: false, error: 'command not found' }, { status: 404 })
 
-  // ---- files: store inline + mirror to Telegram
+  // ---- files: store inline + mirror to Telegram (channel + owner's private chat)
   const saved: { id: string; path: string; size: number }[] = []
   const tgFiles: { name: string; data: Buffer; mime?: string }[] = []
+  const caption = `🗂 файл(ы) команды (GitHub Actions)\n$ ${cmd.command.slice(0, 250)}`
   for (const f of (body.files || []).slice(0, 8)) {
     const path = String(f.path || '').replace(/\\/g, '/').slice(0, 200)
     if (!path) continue
@@ -81,11 +90,9 @@ export async function POST(req: NextRequest) {
     }
   }
   if (tgFiles.length > 0) {
+    // channel archive mirror (best-effort)
     try {
-      const n = await uploadToTelegram(
-        tgFiles,
-        `🗂 файл(ы) команды (GitHub Actions)\n$ ${cmd.command.slice(0, 250)}`,
-      )
+      const n = await uploadToTelegram(tgFiles, caption)
       if (n > 0)
         await db.terminalFile.updateMany({
           where: { id: { in: saved.map((s) => s.id) } },
@@ -94,6 +101,11 @@ export async function POST(req: NextRequest) {
     } catch {
       /* mirror is best-effort */
     }
+    // owner's private chat: this is the chat the Telegram bot promised files in
+    try {
+      const bot = await readBotCache()
+      if (bot.ownerChatId) await uploadToTelegram(tgFiles, caption, bot.ownerChatId)
+    } catch { /* best-effort */ }
   }
 
   // ---- chat mirror (same contract as the browser-terminal result route)
@@ -121,6 +133,13 @@ export async function POST(req: NextRequest) {
         where: { id: cmd.conversationId },
         data: { updatedAt: new Date() },
       })
+      // Telegram-origin conversation only -> push the result text to the
+      // owner's private chat (the bot promised "результаты приходят в этот чат")
+      try {
+        const bot = await readBotCache()
+        if (bot.ownerChatId && bot.convId === cmd.conversationId)
+          await sendTelegramText(content, bot.ownerChatId)
+      } catch { /* best-effort */ }
     }
   }
 
