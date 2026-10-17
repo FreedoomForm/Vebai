@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { syncStudio, prepFrameData } from '@/lib/studio'
 import { imageArtifactData, messageToDTO, taskToDTO } from './tools'
+import { ghDispatch, ghTerminalSession } from '@/lib/terminal/gh-executor'
 
 /** Prisma Bytes (Uint8Array<ArrayBuffer>) from a Node Buffer */
 function toBytes(b: Buffer): Uint8Array<ArrayBuffer> {
@@ -11,6 +12,7 @@ const globalForWorker = globalThis as unknown as {
   __agentWorkerStarted?: boolean
   __agentLastVideoSync?: number
   __agentLastTick?: number
+  __ghLastDispatch?: number
 }
 
 async function postResultMessage(
@@ -324,11 +326,6 @@ interface TerminalPayload {
   testMode?: boolean
 }
 
-/** owner policy (2026-10-17): Kaggle is VIDEO-ONLY. Terminal commands never
- * go to the Kaggle worker — they are queued as TerminalCommand for the
- * user's browser VM (Alpine v86 at /terminal), which polls the queue every
- * ~3s, executes on the serial console and posts the output back to the chat
- * (see /api/terminal/sessions/[id]/commands/[cmdId] POST). */
 async function startTerminalTask(taskId: string) {
   const task = await db.agentTask.findUnique({ where: { id: taskId } })
   if (!task || task.status !== 'queued') return
@@ -350,44 +347,28 @@ async function startTerminalTask(taskId: string) {
   }
   await db.agentTask.update({
     where: { id: task.id },
-    data: { status: 'running', progress: 'Команда в очереди браузерного терминала…' },
+    data: { status: 'running', progress: 'Отправляю на GitHub Actions (Ubuntu)…' },
   })
   try {
-    // session resolution: explicit session id -> latest active browser
-    // session of the conversation owner -> create a fresh one
-    const conv = await db.conversation.findUnique({ where: { id: task.conversationId } })
-    let session = payload.terminalId
-      ? await db.terminalSession.findFirst({ where: { id: payload.terminalId, kind: 'browser' } })
-      : null
-    if (!session) {
-      session = await db.terminalSession.findFirst({
-        where: { kind: 'browser', status: 'active', userId: conv?.userId ?? undefined },
-        orderBy: { updatedAt: 'desc' },
-      })
-    }
-    if (!session) {
-      session = await db.terminalSession.create({
-        data: {
-          kind: 'browser', userId: conv?.userId ?? null,
-          title: 'Терминал агента', secret: crypto.randomUUID().replace(/-/g, ''),
-        },
-      })
-    }
+    // Headless executor on GitHub Actions (owner rule: Kaggle is video-only).
+    const session = await ghTerminalSession()
     const cmd = await db.terminalCommand.create({
-      data: { sessionId: session.id, conversationId: task.conversationId, command, source: 'agent' },
+      data: {
+        sessionId: session.id,
+        command: command.slice(0, 3800),
+        conversationId: task.conversationId,
+        source: 'agent',
+      },
     })
-    await db.terminalSession.update({ where: { id: session.id }, data: { updatedAt: new Date() } })
     await db.agentTask.update({
       where: { id: task.id },
-      data: { jobIds: JSON.stringify([cmd.id]) },
+      data: {
+        status: 'running',
+        progress: 'Выполняется на GitHub Actions (Ubuntu)…',
+        jobIds: JSON.stringify(['cmd:' + cmd.id]),
+      },
     })
-    const stale = !session.lastSeenAt || Date.now() - session.lastSeenAt.getTime() > 90_000
-    if (stale) {
-      const { sendTelegramText } = await import('@/lib/telegram')
-      void sendTelegramText(
-        `🧠 Агенту нужен твой компьютер: команда ждёт в очереди браузерного терминала.\nОткрой вкладку «Терминал»: ${process.env.NEXT_PUBLIC_SITE_URL || 'https://vebai-six.vercel.app'}/terminal\n$ ${command.slice(0, 200)}`,
-      ).catch(() => {})
-    }
+    void ghDispatch(session.id, cmd.id)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     await db.agentTask.update({
@@ -397,64 +378,150 @@ async function startTerminalTask(taskId: string) {
   }
 }
 
-/** give the browser VM a fair chance to connect before giving up on the card */
-const TERMINAL_CMD_TIMEOUT_MS = 20 * 60_000
-
 async function syncTerminalTask(taskId: string) {
   const task = await db.agentTask.findUnique({ where: { id: taskId } })
   if (!task || task.status !== 'running') return
-  let ids: string[] = []
-  try { ids = JSON.parse(task.jobIds || '[]') as string[] } catch { /* ignore */ }
-  if (ids.length === 0) return
-  const cmd = await db.terminalCommand.findUnique({ where: { id: ids[0] } })
-  if (!cmd) return
+  let jobIds: string[] = []
+  try { jobIds = JSON.parse(task.jobIds || '[]') as string[] } catch { /* ignore */ }
 
-  if (cmd.status === 'pending') {
-    if (Date.now() - cmd.createdAt.getTime() > TERMINAL_CMD_TIMEOUT_MS) {
+  // ---- TerminalCommand paths: 'cmd:<id>' (GitHub Actions executor) and
+  // bare ids (tasks created while the browser-VM dispatcher was live)
+  const first = jobIds[0] || ''
+  let cmd = first.startsWith('cmd:')
+    ? await db.terminalCommand.findUnique({ where: { id: first.slice(4) } })
+    : first
+      ? await db.terminalCommand.findUnique({ where: { id: first } })
+      : null
+  if (cmd) {
+    const isGh = cmd.sessionId
+      ? (await db.terminalSession.findUnique({ where: { id: cmd.sessionId } }))?.kind === 'gh'
+      : false
+    if (!first.startsWith('cmd:') && cmd.status === 'pending' && isGh) {
+      // bare id + gh session: normalize to the prefixed form for clarity
       await db.agentTask.update({
         where: { id: task.id },
-        data: {
-          status: 'failed',
-          progress: null,
-          error: 'браузерный терминал не подключался 20 минут; команда осталась в очереди и выполнится, как только откроют вкладку /terminal',
-        },
+        data: { jobIds: JSON.stringify(['cmd:' + cmd.id]) },
       })
-    } else {
-      const progress = 'Жду браузерный терминал (вкладка /terminal должна быть открыта)…'
-      if (progress !== task.progress) {
-        await db.agentTask.update({ where: { id: task.id }, data: { progress } })
-      }
     }
-    return
-  }
-
-  if (cmd.status === 'running') {
-    const progress = 'Выполняется в браузерной VM (Alpine v86)…'
-    if (progress !== task.progress) {
-      await db.agentTask.update({ where: { id: task.id }, data: { progress } })
-    }
-    return
-  }
-
-  // done | failed — the chat + Telegram message is posted by the
-  // /api/terminal/sessions/[id]/commands/[cmdId] route; here we only mirror
-  // the terminal state onto the AgentTask card
-  const exit = cmd.exitCode ?? 0
-  const output = (cmd.output || '(пустой вывод)').slice(0, 2000)
-  await db.agentTask.update({
-    where: { id: task.id },
-    data: cmd.status === 'done'
-      ? {
-          status: 'completed',
-          progress: null,
-          result: JSON.stringify({ summary: `Команда выполнена в браузерном терминале (exit ${exit})`, output }),
+    if (cmd.status === 'pending') {
+      if (isGh) {
+        // dispatch retry (workflow may have failed to start)
+        const now = Date.now()
+        if (now - (globalForWorker.__ghLastDispatch || 0) > 90_000) {
+          globalForWorker.__ghLastDispatch = now
+          void ghDispatch(cmd.sessionId, cmd.id)
         }
-      : {
-          status: 'failed',
-          progress: null,
-          error: `команда не выполнена (exit ${exit}): ${output.slice(0, 240)}`,
-        },
-  })
+      } else {
+        // browser VM dispatcher legacy: wait for the tab (owner policy 2026-10-17)
+        const progress = 'Жду браузерный терминал (вкладка /terminal должна быть открыта)…'
+        if (progress !== task.progress) {
+          await db.agentTask.update({ where: { id: task.id }, data: { progress } })
+        }
+        if (Date.now() - cmd.createdAt.getTime() > 20 * 60_000) {
+          await db.agentTask.update({
+            where: { id: task.id },
+            data: {
+              status: 'failed',
+              progress: null,
+              error: 'браузерный терминал не подключался 20 минут; команда осталась в очереди и выполнится, как только откроют вкладку /terminal',
+            },
+          })
+        }
+      }
+      return
+    }
+    if (cmd.status === 'running') {
+      if (Date.now() - cmd.updatedAt.getTime() > 30 * 60_000) {
+        await db.terminalCommand.update({
+          where: { id: cmd.id },
+          data: { status: 'failed', output: (cmd.output || '') + '\n[timeout 30 min]' },
+        })
+        await db.agentTask.update({
+          where: { id: task.id },
+          data: { status: 'failed', progress: null, error: 'терминал: таймаут 30 минут' },
+        })
+        await postResultMessage(
+          task.conversationId,
+          `Терминал (GitHub Actions): команда «${task.title}» не уложилась в 30 минут и снята.`,
+          { taskId: task.id },
+        )
+      }
+      return
+    }
+    // done | failed — the result route already posted the chat message + Telegram
+    const output = (cmd.output || '').slice(0, 2000)
+    await db.agentTask.update({
+      where: { id: task.id },
+      data:
+        cmd.status === 'done'
+          ? {
+              status: 'completed',
+              progress: null,
+              result: JSON.stringify({
+                summary: `Команда выполнена (exit ${cmd.exitCode ?? 0})`,
+                output,
+              }),
+            }
+          : {
+              status: 'failed',
+              progress: null,
+              error: `терминал: ${(cmd.output || 'ошибка выполнения').slice(0, 250)}`,
+            },
+    })
+    return
+  }
+  if (jobIds.length === 0) return
+
+  // ---- legacy path: old Kaggle CMD jobs (tasks created before the switch)
+  const job = await db.job.findUnique({ where: { id: jobIds[0] } })
+  if (!job) return
+
+  if (job.status === 'queued' || job.status === 'generating') {
+    const now = Date.now()
+    if (now - (globalForWorker.__agentLastVideoSync || 0) > 15_000) {
+      globalForWorker.__agentLastVideoSync = now
+      await syncStudio()
+    }
+    return
+  }
+
+  if (job.status === 'complete' && job.videoData) {
+    let rec: { cmd?: string; exit_code?: number; output?: string } = {}
+    try { rec = JSON.parse(Buffer.from(job.videoData).toString('utf8')) } catch { /* raw text */ }
+    const output = (rec.output || Buffer.from(job.videoData).toString('utf8') || '(пустой вывод)').slice(0, 6000)
+    const exit = typeof rec.exit_code === 'number' ? rec.exit_code : 0
+    const content = `Терминал: $ ${rec.cmd || task.title}\n\`\`\`\n${output}\n\`\`\`\nexit code: ${exit}`
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: {
+        status: 'completed',
+        progress: null,
+        result: JSON.stringify({ summary: `Команда выполнена (exit ${exit})`, output: output.slice(0, 2000) }),
+      },
+    })
+    await postResultMessage(task.conversationId, content, { taskId: task.id })
+    try {
+      const { sendTelegramText } = await import('@/lib/telegram')
+      await sendTelegramText(`🖥 терминал ${task.conversationId}\n$ ${rec.cmd || command0(task)}\nexit ${exit}\n\n${output.slice(0, 2500)}`)
+    } catch { /* non-fatal */ }
+    return
+  }
+
+  if (job.status === 'failed') {
+    await db.agentTask.update({
+      where: { id: task.id },
+      data: { status: 'failed', error: (job.error || 'воркер не смог выполнить команду').slice(0, 280) },
+    })
+    await postResultMessage(
+      task.conversationId,
+      `Терминал: команда «${task.title}» не выполнена: ${(job.error || 'ошибка воркера').slice(0, 200)}`,
+      { taskId: task.id },
+    )
+  }
+}
+
+function command0(task: { title: string }): string {
+  return task.title.replace(/^\$ /, '')
 }
 
 /* -------------------------------------------------------------- main worker */

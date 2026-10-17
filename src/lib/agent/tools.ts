@@ -190,10 +190,11 @@ async function execGenerateVideo(
 /* --------------------------------------------------------------- terminal */
 
 /**
- * terminal — the user's own browser terminal (Alpine Linux via v86 at
- * /terminal). Commands are queued as TerminalCommand and executed inside the
- * VM in the user's tab; output is posted back to the chat. Kaggle is NEVER
- * used for terminal commands (owner policy: Kaggle is video-only).
+ * terminal — real Linux shell on the site's persistent worker container
+ * (Ubuntu on the Kaggle GPU/CPU worker: ffmpeg, python3, pip, git, curl…).
+ * Commands run in a per-conversation workspace that survives between calls;
+ * the worker snapshots it to storage + Telegram, so state survives restarts.
+ * Output is delivered to the chat as a task_result message when done.
  */
 async function execTerminal(
   args: Record<string, unknown>,
@@ -209,7 +210,7 @@ async function execTerminal(
       type: 'terminal',
       title: `$ ${command.slice(0, 90)}`,
       status: 'queued',
-      progress: 'Команда в очереди браузерного терминала…',
+      progress: 'Команда в очереди Linux-воркера…',
       payload: JSON.stringify({ command, terminalId, timeoutS }),
     },
   })
@@ -218,7 +219,7 @@ async function execTerminal(
     data: { updatedAt: new Date() },
   })
   return {
-    summary: `Команда поставлена в очередь браузерного терминала (Alpine v86, вкладка /terminal): $ ${command.slice(0, 120)}. Вывод придёт в чат после выполнения (обычно секунды, максимум ~4 мин на команду).`,
+    summary: `Команда отправлена на GitHub Actions (чистая Ubuntu, без Kaggle): $ ${command.slice(0, 120)}. Вывод и файлы придут в чат отдельным сообщением через 1-5 минут.`,
     taskId: task.id,
     data: { taskId: task.id, terminalId },
   }

@@ -1,0 +1,39 @@
+name: terminal-executor
+
+# Headless Linux executor for the site's `terminal` tool (Kaggle-free per
+# owner rule). Command text / output / produced files NEVER appear in these
+# public logs: they travel only between the site API and /tmp files.
+# One-time setup (owner): repo secrets GH_TERM_SECRET + VEBAI_SITE_URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: 'TerminalSession id (kind=gh)'
+        required: true
+      cmd:
+        description: 'TerminalCommand id to claim (optional)'
+        required: false
+        default: ''
+      timeout:
+        description: 'per-command timeout, minutes (<=30)'
+        required: false
+        default: '15'
+
+concurrency:
+  group: gh-term-${{ github.event.inputs.session }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Execute queued terminal commands
+        env:
+          SITE: ${{ secrets.VEBAI_SITE_URL }}
+          SECRET: ${{ secrets.GH_TERM_SECRET }}
+          SESSION: ${{ github.event.inputs.session }}
+          CMDID: ${{ github.event.inputs.cmd }}
+          TMO: ${{ github.event.inputs.timeout }}
+        run: python3 .github/terminal_executor.py
