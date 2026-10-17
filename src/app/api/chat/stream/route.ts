@@ -20,8 +20,8 @@ function systemPrompt(): string {
     '- Отвечай по делу: структурируй ответы заголовками и списками, используй markdown; код — в блоках с указанием языка.',
     '- Инструмент видео: сайт умеет генерировать короткие клипы (5 или 10 секунд) через свой фоновый пайплайн на Kaggle (модель MiniMax H3, постоянный GPU-воркер). Если пользователь просит видео — предложи включить кнопку «Сделать видео» в поле ввода и кратко опиши задуманные кадры (сюжет, движение камеры, свет). Видео появляется в чате автоматически, когда готово. Сроки честные: генерация идёт на бесплатных GPU Kaggle — 5-секундный клип считается примерно 45-60 минут, 10-секундный — около 2-2.5 часов; минутное видео (6 клипов по 10 секунд, генерируются парами на двух T4) готово ориентировочно через 6-8 часов. Сразу называй эти сроки, чтобы человек не ждал «через пару минут».',
     '- ДЛИННОЕ ВИДЕО — это НЕ проблема: один клип максимум 10 секунд, но клипы автоматически склеиваются в ОДИН готовый файл (ffmpeg). Поэтому, если просят видео длиннее 10 секунд (например «1 минута: человек играет на пианино»), НЕ отказывайся и не проси сокращать: предложи раскадровку из нужного числа клипов по 10 секунд (1 минута = 6 клипов) с описанием каждого кадра, а сайт сам сгенерирует их и склеит в единый ролик.',
-    '- У тебя есть ДВА терминала. (1) terminal (блоки ```run-terminal```): фоновый Linux-воркер (Ubuntu на Kaggle: python3, pip, ffmpeg, git, curl) — работает 24/7 даже при закрытом браузере, но команда выполняется 1-5 минут. (2) ИНТЕРАКТИВНЫЙ терминал (блоки ```run-vterm```): настоящий Alpine Linux в браузере пользователя (v86) — мгновенный отклик, нужен только пользователь, стейт-файлы в Telegram, но медленный CPU и вкладка должна быть открыта; если она закрыта, владелец получит уведомление в Telegram. Для быстрых команд (посчитать, создать файл, посмотреть систему) предпочитай run-vterm; для тяжёлых/долгих (pip с компиляцией, видео, длинные скрипты) — run-terminal.',
-    '- ПРОТОКОЛ ВЫПОЛНЕНИЯ КОМАНД: если пользователь просит ВЫПОЛНИТЬ/ЗАПУСТИТЬ команду или код (а не просто показать), в конце ответа добавь блок вида:\n```run-terminal\nкоманда\n``` (фоновый воркер) ИЛИ \n```run-vterm\nкоманда\n``` (интерактивный терминал в браузере) — по одной команде на блок, максимум 3 блока на ответ (для серии команд используй `cmd1 && cmd2` или мини-скрипт). ОБЫЧНЫЕ примеры кода в этот формат НЕ заворачивай — только реальное исполнение. Результат выполнения придёт в чат отдельным сообщением.',
+    '- У тебя есть ОДИН терминал — БРАУЗЕРНЫЙ терминал пользователя: блоки ```run-vterm``` ставят команду в очередь Alpine Linux (v86), который реально работает во вкладке /terminal на его компьютере: python3, pip/apk, wget/curl (сеть есть), файлы; созданные файлы (/root/workspace) синхронизируются в Telegram и приходят в чат. Вкладка терминала должна быть открыта — если она закрыта, владелец получит пинг в Telegram. Kaggle используется СТРОГО только для генерации видео (кнопка «Сделать видео»): НИКОГДА не отправляй туда команды, файлы, PDF или любые другие задачи, кроме видео.',
+    '- ПРОТОКОЛ ВЫПОЛНЕНИЯ КОМАНД: если пользователь просит ВЫПОЛНИТЬ/ЗАПУСТИТЬ/СОЗДАТЬ что-то (PDF, файл, скрипт, расчёт — а не просто показать код), в конце ответа добавь блок:\n```run-vterm\nкоманда\n```\n— по одной команде на блок, максимум 3 блока на ответ (для серии используй `cmd1 && cmd2` или мини-скрипт). ОБЫЧНЫЕ примеры кода в этот формат НЕ заворачивай — только реальное исполнение. Результат выполнения придёт в чат отдельным сообщением. Пример: «создай PDF» = в браузерном терминале поставить python3 + fpdf2, сгенерировать файл в /root/workspace — он автоматически уйдёт в Telegram и в чат.',
     '- Создание изображений НЕДОСТУПНО (генерация картинок на сайте отключена). Если просят нарисовать/сгенерировать изображение — честно скажи, что генерация изображений на сайте сейчас отключена, и предложи альтернативу: короткое видео по этому же описанию (кнопка «Сделать видео»), либо подробное текстовое описание/промпт, который пользователь сможет использовать в любом внешнем генераторе картинок.',
     '- Не выдумывай факты; если не уверен — честно скажи об этом.',
     `- Текущая дата и время (UTC): ${now.toISOString().slice(0, 19).replace('T', ' ')}`,
@@ -35,35 +35,12 @@ function sse(payload: Record<string, unknown>): Uint8Array {
 /* ---- terminal dispatch ------------------------------------------------- */
 
 /** the model marks commands to ACTUALLY execute with fenced blocks:
- * ```run-terminal\n<cmd>\n``` — queue each as a terminal AgentTask; the agent
- * worker ships it to the Kaggle Linux worker and posts the output back. */
-async function launchTerminalBlocks(text: string, conversationId: string): Promise<number> {
-  const re = /```run-terminal\s*\n([\s\S]*?)```/g
-  let n = 0
-  for (let m = re.exec(text); m && n < 3; m = re.exec(text)) {
-    const command = m[1].trim().slice(0, 3400)
-    if (!command) continue
-    await db.agentTask.create({
-      data: {
-        conversationId,
-        type: 'terminal',
-        title: `$ ${command.replace(/\s+/g, ' ').slice(0, 90)}`,
-        status: 'queued',
-        progress: 'Команда в очереди Linux-воркера…',
-        payload: JSON.stringify({ command, terminalId: conversationId, timeoutS: 240 }),
-      },
-    })
-    n++
-  }
-  return n
-}
-
-/** the model can also target the INTERACTIVE browser terminal (v86 VM in the
- * user's tab): ```run-vterm\n<cmd>\n``` — queued as TerminalCommand; the page
- * executes it and the output is posted back to this chat + Telegram. If no
- * terminal page is open (stale heartbeat) the owner gets a Telegram nudge. */
+ * ```run-vterm\n<cmd>\n``` (```run-terminal``` accepted as a legacy alias) —
+ * each is queued as a TerminalCommand for the user's browser VM (Alpine v86
+ * at /terminal); the page executes it and posts the output back to this chat
+ * + Telegram. Owner policy: Kaggle is video-only, commands never go there. */
 async function launchVtermBlocks(text: string, conversationId: string, userId: string | null): Promise<number> {
-  const re = /```run-vterm\s*\n([\s\S]*?)```/g
+  const re = /```run-(?:vterm|terminal)\s*\n([\s\S]*?)```/g
   let n = 0
   for (let m = re.exec(text); m && n < 3; m = re.exec(text)) {
     const command = m[1].trim().slice(0, 3400)
@@ -348,23 +325,16 @@ export async function POST(req: NextRequest) {
             }
           }
         }
-        // ---- terminal dispatch: fenced run-terminal blocks -> Linux worker
+        // ---- terminal dispatch: fenced run-vterm blocks -> browser VM
         if (conversationId) {
           try {
             const conv = await db.conversation.findUnique({ where: { id: conversationId } })
             if (conv && (!conv.userId || conv.userId === user.id)) {
-              const n = await launchTerminalBlocks(fullAnswer, conversationId)
-              if (n > 0) {
-                controller.enqueue(sse({
-                  type: 'notice',
-                  text: `⌨️ ${n} команда(ы) отправлены в фоновый Linux-воркер — вывод придёт отдельным сообщением через 1-5 минут`,
-                }))
-              }
               const nv = await launchVtermBlocks(fullAnswer, conversationId, conv.userId)
               if (nv > 0) {
                 controller.enqueue(sse({
                   type: 'notice',
-                  text: `🖥 ${nv} команда(ы) в очереди интерактивного терминала (/terminal) — вывод придёт, как только вкладка терминала их выполнит`,
+                  text: `🖥 ${nv} команда(ы) в очереди браузерного терминала (/terminal) — вывод придёт, как только вкладка терминала их выполнит`,
                 }))
               }
             }
