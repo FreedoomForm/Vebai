@@ -25,7 +25,7 @@ async function launchTerminalBlocks(text: string, conversationId: string): Promi
   const re = /```run-terminal\s*\n([\s\S]*?)```/g
   let n = 0
   for (let m = re.exec(text); m && n < 3; m = re.exec(text)) {
-    const command = m[1].trim().slice(0, 3400)
+    const command = m[1].trim().slice(0, 20_000)
     if (!command) continue
     await db.agentTask.create({
       data: {

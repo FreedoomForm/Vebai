@@ -190,7 +190,7 @@ export async function POST(req: NextRequest) {
   let queued = 0
   const re = /```run-terminal\s*\n([\s\S]*?)```/g
   for (let m = re.exec(answer); m && queued < 3; m = re.exec(answer)) {
-    const command = m[1].trim().slice(0, 3400)
+    const command = m[1].trim().slice(0, 20_000)
     if (!command) continue
     await db.agentTask.create({
       data: {

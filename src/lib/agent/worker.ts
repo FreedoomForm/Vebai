@@ -355,7 +355,7 @@ async function startTerminalTask(taskId: string) {
     const cmd = await db.terminalCommand.create({
       data: {
         sessionId: session.id,
-        command: command.slice(0, 3800),
+        command: command.slice(0, 20_000),
         conversationId: task.conversationId,
         source: 'agent',
       },
