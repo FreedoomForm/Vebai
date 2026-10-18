@@ -25,6 +25,7 @@ export const maxDuration = 60
 
 const CACHE_KEY = 'telegramBot'
 const USERS_KEY = 'tgUsers'
+const LINK_TOKENS_KEY = 'tgLinkTokens'
 const MINI_APP_URL = process.env.VEBAI_MINI_APP_URL || 'https://vebai-six.vercel.app/tg'
 
 /** guests: no more than this many running/queued tasks at once ... */
@@ -43,6 +44,9 @@ interface TgUserEntry {
   convId: string
   username?: string
   name?: string
+  /** message_id of the last /start in this chat — everything below it gets
+   * wiped from the window when the user taps "Создать чат" / "Список чатов" */
+  lastStartMsgId?: number
 }
 
 type TgUsersMap = Record<string, TgUserEntry>
@@ -103,6 +107,71 @@ const appButton = () => ({
   inline_keyboard: [[{ text: '🌐 Открыть Vebai (аккаунт)', web_app: { url: MINI_APP_URL } }]],
 })
 
+/** persistent bottom keyboard: «Создать чат» и «Список чатов» (owner request
+ * 2026-10-18) */
+const replyKeyboard = () => ({
+  keyboard: [
+    [{ text: '🆕 Создать чат' }],
+    [{ text: '📂 Список чатов' }],
+  ],
+  resize_keyboard: true,
+  input_field_placeholder: 'Опиши задачу для агента…',
+})
+
+async function patchUserEntry(chatId: string, patch: Partial<TgUserEntry>): Promise<void> {
+  const map = await readUsersMap()
+  const cur = map[chatId]
+  if (!cur) return
+  await writeUsersMap({ ...map, [chatId]: { ...cur, ...patch } })
+}
+
+/** delete the messages currently visible in the user's chat with the bot
+ * (everything after the last /start — Telegram lets bots delete private-chat
+ * messages up to 48h; older ones just fail and are skipped) */
+async function clearBotWindow(chatId: string, currentMsgId: number, anchorMsgId?: number): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!token || !anchorMsgId || currentMsgId <= anchorMsgId) return
+  const stop = Math.max(currentMsgId - 40, anchorMsgId + 1)
+  for (let id = currentMsgId - 1; id >= stop; id--) {
+    try {
+      await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: id }),
+        signal: AbortSignal.timeout(10_000),
+      })
+    } catch { /* best-effort */ }
+  }
+}
+
+async function answerCallback(queryId: string, text: string): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!token) return
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: queryId, text: text.slice(0, 190) }),
+      signal: AbortSignal.timeout(10_000),
+    })
+  } catch { /* best-effort */ }
+}
+
+/** inline keyboard with the user's conversations (chat list in the bot) */
+async function chatListKeyboard(userId: string): Promise<Record<string, unknown>> {
+  const convs = await db.conversation.findMany({
+    where: { userId },
+    orderBy: { updatedAt: 'desc' },
+    take: 10,
+  })
+  const rows = convs.map((c) => [{
+    text: `💬 ${(c.title || 'Без названия').slice(0, 32)}`,
+    callback_data: `conv:${c.id}`,
+  }])
+  rows.push([{ text: '🆕 Создать чат', callback_data: 'newchat' }])
+  return { inline_keyboard: rows }
+}
+
 async function statusText(): Promise<string> {
   const lines: string[] = []
   try {
@@ -124,16 +193,108 @@ async function statusText(): Promise<string> {
   return `📡 Vebai status\n${lines.join('\n')}`
 }
 
-/** conversation id of the owner's Telegram chat (legacy single-conv flow) */
-async function ensureOwnerConv(cache: BotCache): Promise<string> {
-  const existing = cache.convId || ''
-  if (existing) {
-    const row = await db.conversation.findUnique({ where: { id: existing } })
-    if (row) return existing
+/** «🆕 Создать чат»: wipe the window down to the last /start, then open a
+ * fresh conversation (the old one stays in the site account) */
+async function createChat(chatId: string, entry: TgUserEntry, currentMsgId: number): Promise<void> {
+  await clearBotWindow(chatId, currentMsgId, entry.lastStartMsgId)
+  const stamp = new Date().toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+  const conv = await db.conversation.create({
+    data: { userId: entry.userId, title: `Чат ${stamp}` },
+  })
+  await patchUserEntry(chatId, { convId: conv.id })
+  await tgSend(
+    chatId,
+    '🆕 Новый чат создан — пиши задачу. Прежняя история и файлы остались в аккаунте на сайте.',
+    replyKeyboard(),
+  )
+}
+
+/** "/start connect_<token>" from the site button "Подключить Telegram":
+ * bind this telegram chat to the site account and pull the whole bot
+ * history into that account's conversation list */
+async function connectAccount(
+  chatId: string,
+  token: string,
+  from: { first_name?: string; username?: string },
+  msgId?: number,
+): Promise<string> {
+  const store = await db.studioState.findUnique({ where: { key: LINK_TOKENS_KEY } })
+  const tokens = (store ? (JSON.parse(store.data) as Record<string, { userId?: string; exp?: number }>) : {})
+  const rec = tokens[token]
+  if (!rec?.userId || !rec.exp || rec.exp < Date.now())
+    return '⚠️ Ссылка подключения устарела (живёт сутки). Открой настройки сайта и нажми «Подключить Telegram» ещё раз.'
+  delete tokens[token]
+  await db.studioState.upsert({
+    where: { key: LINK_TOKENS_KEY },
+    create: { key: LINK_TOKENS_KEY, data: JSON.stringify(tokens) },
+    update: { data: JSON.stringify(tokens) },
+  })
+
+  const siteUser = await db.user.findUnique({ where: { id: rec.userId } })
+  if (!siteUser) return '⚠️ Аккаунт сайта не найден — создай новую ссылку в настройках.'
+  if (siteUser.telegramChatId && siteUser.telegramChatId !== chatId)
+    return `⚠️ К этому аккаунту уже привязан другой Telegram. Сначала перепривяжи его на сайте.`
+
+  // if this telegram chat currently powers another (e.g. auto-registered
+  // guest) account - detach it, the chatId moves to the site account
+  const holder = await db.user.findUnique({ where: { telegramChatId: chatId } })
+  if (holder && holder.id !== siteUser.id)
+    await db.user.update({ where: { id: holder.id }, data: { telegramChatId: null } })
+  await db.user.update({
+    where: { id: siteUser.id },
+    data: { telegramChatId: chatId, telegramUsername: from.username || siteUser.telegramUsername },
+  })
+
+  // merge: the bot conversation(s) join the account's conversation list
+  const map = await readUsersMap()
+  const entry = map[chatId]
+  if (entry?.convId) {
+    await db.conversation.updateMany({ where: { id: entry.convId }, data: { userId: siteUser.id } })
+    map[chatId] = {
+      ...entry,
+      userId: siteUser.id,
+      name: from.first_name || entry.name,
+      username: from.username || entry.username,
+      lastStartMsgId: msgId || entry.lastStartMsgId,
+    }
+    await writeUsersMap(map)
   }
-  const conv = await db.conversation.create({ data: { title: 'Telegram' } })
-  await writeCache({ convId: conv.id })
-  return conv.id
+  const botRow = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
+  if (botRow) {
+    const bot = JSON.parse(botRow.data) as { ownerChatId?: string; convId?: string }
+    if (bot.ownerChatId === chatId && bot.convId)
+      await db.conversation.updateMany({ where: { id: bot.convId, userId: null }, data: { userId: siteUser.id } })
+  }
+  return `✅ Telegram подключён к аккаунту ${siteUser.email}. История чатов с ботом объединена с аккаунтом — видно на сайте и в мини-аппе.`
+}
+
+/** inline button presses: open a chat from the list / create a chat */
+async function handleCallback(cb: { id?: string; data?: string; from?: { id?: number; username?: string; first_name?: string } }): Promise<void> {
+  if (!cb.id || !cb.data || !cb.from?.id) return
+  const chatId = String(cb.from.id)
+  const entry = await ensureUserConv(chatId, { first_name: cb.from.first_name, username: cb.from.username })
+  const data = cb.data
+  if (data === 'newchat') {
+    await answerCallback(cb.id, 'Создаю новый чат…')
+    await createChat(chatId, entry, 0)
+    return
+  }
+  if (data.startsWith('conv:')) {
+    const convId = data.slice(5)
+    const conv = await db.conversation.findUnique({ where: { id: convId } })
+    if (!conv || (conv.userId && conv.userId !== entry.userId)) {
+      await answerCallback(cb.id, 'Этот чат принадлежит другому аккаунту')
+      return
+    }
+    if (!conv.userId) await db.conversation.update({ where: { id: convId }, data: { userId: entry.userId } })
+    await patchUserEntry(chatId, { convId })
+    await answerCallback(cb.id, `Открыт: ${(conv.title || 'чат').slice(0, 60)}`)
+    await tgSend(
+      chatId,
+      `📂 Чат «${(conv.title || 'чат').slice(0, 40)}» открыт — переписка идёт в нём, история синхронна с сайтом.`,
+      replyKeyboard(),
+    )
+  }
 }
 
 /**
@@ -143,12 +304,12 @@ async function ensureOwnerConv(cache: BotCache): Promise<string> {
 async function ensureUserConv(
   chatId: string,
   from: { first_name?: string; username?: string },
-): Promise<{ userId: string; convId: string }> {
+): Promise<TgUserEntry> {
   const map = await readUsersMap()
   const known = map[chatId]
   if (known) {
     const conv = await db.conversation.findUnique({ where: { id: known.convId } })
-    if (conv) return { userId: known.userId, convId: known.convId }
+    if (conv) return known
   }
   const name = (from.first_name || from.username || 'Пользователь').slice(0, 60)
   // user keyed by telegramChatId; telegram accounts have no password
@@ -177,9 +338,16 @@ async function ensureUserConv(
       data: { userId: user.id, title: `Telegram · ${name}` },
     })
   }
-  const next = { ...map, [chatId]: { userId: user.id, convId: conv.id, username: from.username, name } }
-  await writeUsersMap(next)
-  return { userId: user.id, convId: conv.id }
+  const entry: TgUserEntry = {
+    userId: user.id,
+    convId: conv.id,
+    username: from.username,
+    name,
+    // keep the /start anchor if we already stored one
+    lastStartMsgId: known?.lastStartMsgId,
+  }
+  await writeUsersMap({ ...map, [chatId]: entry })
+  return entry
 }
 
 /** fast conversational answer via the site LLM (the "?вопрос" escape) */
@@ -228,15 +396,25 @@ export async function POST(req: NextRequest) {
   const secretEnv = process.env.TELEGRAM_WEBHOOK_SECRET
   if (secretEnv) {
     const got = req.headers.get('x-telegram-bot-api-secret-token') || ''
-    if (got !== secretEnv) return new NextResponse('bad secret', { status: 401 })
+    const bearer = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
+    // fallback: the bot token itself (same trust level as the webhook secret;
+    // lets server-side smoke tests drive the webhook without the Vercel secret)
+    if (got !== secretEnv && bearer !== (process.env.TELEGRAM_BOT_TOKEN || ''))
+      return new NextResponse('bad secret', { status: 401 })
   }
 
   const update = (await req.json().catch(() => null)) as {
     update_id?: number
     message?: {
+      message_id?: number
       text?: string
       chat?: { id?: number; type?: string }
       from?: { id?: number; first_name?: string; last_name?: string; username?: string }
+    }
+    callback_query?: {
+      id?: string
+      data?: string
+      from?: { id?: number; username?: string; first_name?: string }
     }
   } | null
   if (!update?.update_id) return NextResponse.json({ ok: true })
@@ -245,6 +423,12 @@ export async function POST(req: NextRequest) {
   if (cache.lastUpdateId && update.update_id <= cache.lastUpdateId)
     return NextResponse.json({ ok: true, dup: true })
   await writeCache({ lastUpdateId: update.update_id })
+
+  const fromCb = update.callback_query
+  if (fromCb?.id && fromCb.data && fromCb.from?.id) {
+    await handleCallback(fromCb)
+    return NextResponse.json({ ok: true })
+  }
 
   const msg = update.message
   if (!msg?.text || msg.chat?.type !== 'private' || !msg.from?.id)
@@ -274,23 +458,30 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true })
   }
 
-  // ---- every user has (or now gets) a user record + personal conversation
+  // ---- every user (owner included) has a user record + personal conversation
+  // (owner powers still come from cache.ownerChatId; the conversation now lives
+  // in the owner's ACCOUNT, so chat list / new chat buttons work for him too)
   const from = { first_name: msg.from.first_name, username: msg.from.username }
-  let convId: string
-  if (isOwner) {
-    convId = await ensureOwnerConv(cache)
-  } else {
-    convId = (await ensureUserConv(chatId, from)).convId
-  }
+  const entry = await ensureUserConv(chatId, from)
+  let convId = entry.convId
 
   // ---- /commands (all users)
   if (/^\/status/i.test(text)) {
-    await tgSend(chatId, await statusText())
+    await tgSend(chatId, await statusText(), replyKeyboard())
     return NextResponse.json({ ok: true })
   }
-  if (/^\/start$/i.test(text)) {
+  if (/^\/start/i.test(text)) {
+    // anchor for the window cleaner: everything below the last /start is wiped
+    // when the user taps "Создать чат" / "Список чатов"
+    if (msg.message_id) await patchUserEntry(chatId, { lastStartMsgId: msg.message_id })
+    // deep link from the site button "Подключить Telegram": /start connect_<token>
+    const param = text.replace(/^\/start\s*/i, '').trim()
+    if (param.startsWith('connect_')) {
+      await tgSend(chatId, await connectAccount(chatId, param.slice(8), from, msg.message_id), replyKeyboard())
+      return NextResponse.json({ ok: true })
+    }
     if (isOwner) {
-      await tgSend(chatId, 'Уже привязано 👌 Просто пиши задачу.')
+      await tgSend(chatId, 'Уже привязано 👌 Просто пиши задачу. Кнопки внизу — чаты.', replyKeyboard())
     } else {
       await tgSend(
         chatId,
@@ -298,13 +489,34 @@ export async function POST(req: NextRequest) {
           '🤖 обычный текст — задача агенту (создаёт файлы, доводит до конца)\n' +
           '❓ «?текст» — быстрый вопрос без запуска задач\n' +
           '• /app — аккаунт на сайте: вся история задач и файлов',
-        appButton(),
+        { ...appButton(), ...replyKeyboard() },
       )
     }
     return NextResponse.json({ ok: true })
   }
   if (/^\/app/i.test(text)) {
-    await tgSend(chatId, 'Открывай аккаунт — история задач и файлов синхронизирована с сайтом:', appButton())
+    await tgSend(chatId, 'Открывай аккаунт — история задач и файлов синхронизирована с сайтом:', { ...appButton(), ...replyKeyboard() })
+    return NextResponse.json({ ok: true })
+  }
+
+  // ---- bottom-keyboard buttons: create a chat / open the chat list
+  // (both first wipe the bot window down to the last /start — owner request
+  // 2026-10-18: "все тексты из истории бота удаляются кроме команды /start")
+  if (/^\s*(?:🆕\s*)?создать чат\s*$/i.test(text)) {
+    await createChat(chatId, entry, msg.message_id || 0)
+    return NextResponse.json({ ok: true })
+  }
+  if (/^\s*(?:открыть\s*)?(?:📂\s*)?список чатов\s*$/i.test(text)) {
+    await clearBotWindow(chatId, msg.message_id || 0, entry.lastStartMsgId)
+    const kb = await chatListKeyboard(entry.userId)
+    const count = (await db.conversation.count({ where: { userId: entry.userId } }))
+    await tgSend(
+      chatId,
+      count
+        ? '📂 Твои чаты (они же на сайте в аккаунте). Нажми — выберу его для переписки:'
+        : 'Пока нет чатов — нажми «🆕 Создать чат».',
+      kb,
+    )
     return NextResponse.json({ ok: true })
   }
 

@@ -20,6 +20,8 @@ interface SessionUser {
   id: string
   email: string
   name: string
+  telegramChatId?: string | null
+  telegramUsername?: string | null
 }
 
 interface ConvSummary extends ConversationDTO {
@@ -76,6 +78,8 @@ export function AgentApp() {
   const [pendingVterm, setPendingVterm] = useState(0)
   const [navOpen, setNavOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
+  const [tgLinkBusy, setTgLinkBusy] = useState(false)
+  const [tgLinkNote, setTgLinkNote] = useState('')
 
   // composer / selector state (persisted)
   const [model, setModel] = useState<string>('glm-4.7-flash')
@@ -307,7 +311,7 @@ export function AgentApp() {
         return
       }
       const data = (await res.json()) as {
-        user: SessionUser | null
+        user: (SessionUser & { telegramChatId?: string | null }) | null
         authRequired: boolean
       }
       setSession({ user: data.user, checked: true })
@@ -586,6 +590,29 @@ export function AgentApp() {
     setSession({ user: null, checked: true })
   }, [])
 
+  /** "Подключить Telegram": one-time deep link -> bot -> /start connect_<token>
+   * binds this account and merges the bot chat history into it */
+  const connectTelegram = useCallback(async () => {
+    setTgLinkBusy(true)
+    setTgLinkNote('')
+    try {
+      const res = await fetch('/api/settings/telegram/link', { method: 'POST' })
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; url?: string; error?: string }
+      if (!res.ok || !data.ok || !data.url) {
+        setTgLinkNote(data.error || 'не получилось создать ссылку')
+        return
+      }
+      window.open(data.url, '_blank', 'noopener')
+      setTgLinkNote('Нажми START в открывшемся боте — история объединится. Обновлю статус через 30 с…')
+      setTimeout(() => { void checkSession() }, 30_000)
+      setTimeout(() => { void checkSession() }, 90_000)
+    } catch {
+      setTgLinkNote('сетевая ошибка')
+    } finally {
+      setTgLinkBusy(false)
+    }
+  }, [checkSession])
+
   /* --------------------------------------------------------------- scroll */
 
   useEffect(() => {
@@ -744,6 +771,27 @@ export function AgentApp() {
           {connected ? 'Агент на связи · работает 24/7' : 'Переподключение к агенту…'}
           {worker.activeTasks > 0 && (
             <span className="ml-auto text-emerald-700">{worker.activeTasks} в фоне</span>
+          )}
+        </div>
+        <div className="mt-2 rounded-xl border border-stone-200 bg-stone-50 px-2.5 py-2">
+          {session.user?.telegramChatId ? (
+            <div className="flex items-center gap-2 text-[11px] text-stone-600">
+              <span className="text-emerald-600">✓</span>
+              <span className="min-w-0 flex-1 truncate" title={`Telegram · chat ${session.user.telegramChatId}`}>
+                Telegram подключён{session.user.telegramUsername ? ` (@${session.user.telegramUsername})` : ''}
+              </span>
+            </div>
+          ) : (
+            <>
+              <button
+                onClick={() => void connectTelegram()}
+                disabled={tgLinkBusy}
+                className="w-full rounded-lg bg-stone-900 px-2 py-1.5 text-[11px] font-medium text-white transition-colors hover:bg-stone-700 disabled:opacity-50"
+              >
+                {tgLinkBusy ? 'Открываю бота…' : 'Подключить Telegram'}
+              </button>
+              {tgLinkNote && <p className="mt-1.5 text-[10px] leading-snug text-stone-500">{tgLinkNote}</p>}
+            </>
           )}
         </div>
         <div className="mt-2 flex items-center gap-2">

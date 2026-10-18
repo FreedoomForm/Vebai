@@ -12,8 +12,18 @@ export async function GET(req: NextRequest) {
 
   const { user } = await requireAuth(req)
   if (!user) return NextResponse.json({ user: null, authRequired: true }, { status: 401 })
+  const row = await db.user.findUnique({
+    where: { id: user.id },
+    select: { telegramChatId: true, telegramUsername: true },
+  })
   return NextResponse.json({
-    user: { id: user.id, email: user.email, name: user.name },
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      telegramChatId: row?.telegramChatId || null,
+      telegramUsername: row?.telegramUsername || null,
+    },
     authRequired: true,
     model: DEFAULT_CHAT_MODEL,
   })
