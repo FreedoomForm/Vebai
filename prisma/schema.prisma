@@ -42,6 +42,8 @@ model User {
   zaiToken      String? // anonymous chat.z.ai session token minted for this user
   zaiUserId     String? // chat.z.ai session user id (for the signature)
   zaiSessionAt  DateTime? // when the session was last (re)minted
+  telegramChatId  String?  @unique // telegram user id when linked (mini app / bot)
+  telegramUsername String? // @username from telegram (display only)
   createdAt     DateTime       @default(now())
   conversations Conversation[]
 }
@@ -150,6 +152,7 @@ model TerminalFile {
   id        String          @id @default(cuid())
   sessionId String
   session   TerminalSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  conversationId String? // when set: file belongs to this chat (per-user listing)
   path      String
   size      Int             @default(0)
   mime      String?

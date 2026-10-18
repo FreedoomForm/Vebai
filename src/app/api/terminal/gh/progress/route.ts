@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { sendTelegramText } from '@/lib/telegram'
+import { sendTelegramText, taskChat } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 
@@ -49,13 +49,12 @@ export async function POST(req: NextRequest) {
       })
       .catch(() => null)
 
-    // mirror to the owner's DM for Telegram-origin tasks
+    // mirror to the task sender's Telegram chat (multi-user: not only the
+    // owner's DM anymore)
     try {
       if (cmd.conversationId) {
-        const row = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
-        const bot = row ? (JSON.parse(row.data) as { ownerChatId?: string; convId?: string }) : {}
-        if (bot.ownerChatId && bot.convId && bot.convId === cmd.conversationId)
-          await sendTelegramText(`🤖 ${text}`, bot.ownerChatId)
+        const origin = await taskChat(cmd.conversationId)
+        if (origin?.chatId) await sendTelegramText(`🤖 ${text}`, origin.chatId)
       }
     } catch {
       /* best-effort */

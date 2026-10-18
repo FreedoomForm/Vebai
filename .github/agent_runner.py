@@ -25,8 +25,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import zai_client  # noqa: E402
 
-WS = "/tmp/ws"
-MEMORY = "/tmp/agent_memory.md"   # outside WS: must NOT be collected as an attachment
+WS = "/tmp/ws"                   # default workspace (overridden per-run, see run_agent)
+MEMORY = "/tmp/agent_memory.md"   # default shift memory (overridden per-run)
 SITE = (os.environ.get("SITE") or "https://vebai-six.vercel.app").rstrip("/")
 SECRET = os.environ.get("SECRET") or ""
 SESSION = os.environ.get("SESSION") or ""
@@ -66,6 +66,15 @@ def api(path: str, payload: dict, timeout: int = 60):
 _last_progress = 0.0
 
 
+def redact(text: str) -> str:
+    """the bot is multi-user now: scrub runner secrets from anything that
+    travels to users (a task could run `printenv`)"""
+    for v in (SECRET, os.environ.get("ZAI_API_KEY") or ""):
+        if v and v in text:
+            text = text.replace(v, "***")
+    return text
+
+
 def post_progress(text: str) -> None:
     """mirror a short progress line to the owner's Telegram (best effort)."""
     global _last_progress
@@ -77,7 +86,7 @@ def post_progress(text: str) -> None:
         return
     try:
         api("/api/terminal/gh/progress",
-            {"secret": SECRET, "session": SESSION, "text": str(text)[:400]},
+            {"secret": SECRET, "session": SESSION, "text": redact(str(text))[:400]},
             timeout=30)
     except Exception:
         pass  # progress must never break the loop
@@ -256,8 +265,12 @@ def save_memory(task: str, final: str) -> None:
 
 def run_agent(task, budget_min=None) -> str:
     """run one agent task end-to-end; returns the final answer text."""
-    global _last_progress
+    global _last_progress, WS, MEMORY
     _last_progress = 0.0
+    # per-run workspace/memory (multi-user: guests get their own dirs,
+    # set by terminal_executor from the claim's guestChat)
+    WS = os.environ.get("AGENT_WS") or "/tmp/ws"
+    MEMORY = os.environ.get("AGENT_MEMORY") or "/tmp/agent_memory.md"
     os.makedirs(WS, exist_ok=True)
     started_ts = time.time()
 
@@ -285,6 +298,11 @@ def run_agent(task, budget_min=None) -> str:
         "  перед задачей типа pdf/charts/docx/xlsx/pptx/media/web прочитай нужный плейбук\n"
         f"- память смены (итоги прошлых задач):\n{load_memory()}\n"
     )
+    if os.environ.get("AGENT_GUEST"):
+        header += (
+            "- заказчик — гость из Telegram (не владелец): обращайся нейтрально и вежливо;\n"
+            "  `<send to=\"owner\">` доставит файл ИМЕННО ему в личку; канал и третьи лица недоступны\n"
+        )
     history = [{"role": "user", "content": header}]
     final_text = ""
     last_cmd_sig = ""

@@ -1,17 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { uploadToTelegram, sendTelegramText } from '@/lib/telegram'
+import { uploadToTelegram, sendTelegramText, taskChat } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 120
-
-async function readBotCache(): Promise<{ ownerChatId?: string; convId?: string }> {
-  try {
-    const row = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
-    if (!row) return {}
-    return JSON.parse(row.data) as { ownerChatId?: string; convId?: string }
-  } catch { return {} }
-}
 
 interface GhFile {
   path?: string
@@ -82,6 +74,7 @@ export async function POST(req: NextRequest) {
         where: { sessionId_path: { sessionId, path } },
         create: {
           sessionId,
+          conversationId: cmd.conversationId,
           path,
           size: buf.byteLength,
           mime: f.mime || undefined,
@@ -96,22 +89,39 @@ export async function POST(req: NextRequest) {
     }
   }
   if (tgFiles.length > 0) {
-    // channel archive mirror (best-effort)
+    // multi-user delivery (2026-10-18): files go to the TASK SENDER's chat;
+    // the public channel archive + owner DM remain owner-only (privacy:
+    // strangers' files must not land in the owner's channel)
+    const origin = await taskChat(cmd.conversationId).catch(() => null)
     try {
-      const n = await uploadToTelegram(tgFiles, caption)
-      if (n > 0)
-        await db.terminalFile.updateMany({
-          where: { id: { in: saved.map((s) => s.id) } },
-          data: { tgOk: true },
-        })
+      if (origin?.isOwner) {
+        const n = await uploadToTelegram(tgFiles, caption)
+        if (n > 0)
+          await db.terminalFile.updateMany({
+            where: { id: { in: saved.map((s) => s.id) } },
+            data: { tgOk: true },
+          })
+        if (origin.chatId)
+          await uploadToTelegram(tgFiles, caption, origin.chatId)
+      } else if (origin) {
+        const n = await uploadToTelegram(tgFiles, caption, origin.chatId)
+        if (n > 0)
+          await db.terminalFile.updateMany({
+            where: { id: { in: saved.map((s) => s.id) } },
+            data: { tgOk: true },
+          })
+      } else {
+        // pure site conversation (no telegram user bound): legacy archive
+        const n = await uploadToTelegram(tgFiles, caption)
+        if (n > 0)
+          await db.terminalFile.updateMany({
+            where: { id: { in: saved.map((s) => s.id) } },
+            data: { tgOk: true },
+          })
+      }
     } catch {
       /* mirror is best-effort */
     }
-    // owner's private chat: this is the chat the Telegram bot promised files in
-    try {
-      const bot = await readBotCache()
-      if (bot.ownerChatId) await uploadToTelegram(tgFiles, caption, bot.ownerChatId)
-    } catch { /* best-effort */ }
   }
 
   // ---- chat mirror (same contract as the browser-terminal result route)
@@ -142,12 +152,11 @@ export async function POST(req: NextRequest) {
         where: { id: cmd.conversationId },
         data: { updatedAt: new Date() },
       })
-      // Telegram-origin conversation only -> push the result text to the
-      // owner's private chat (the bot promised "результаты приходят в этот чат")
+      // Telegram counterpart of this conversation (multi-user: the sender's
+      // own chat) -> push the result text there
       try {
-        const bot = await readBotCache()
-        if (bot.ownerChatId && bot.convId === cmd.conversationId)
-          await sendTelegramText(content, bot.ownerChatId)
+        const origin = await taskChat(cmd.conversationId)
+        if (origin?.chatId) await sendTelegramText(content, origin.chatId)
       } catch { /* best-effort */ }
     }
   }

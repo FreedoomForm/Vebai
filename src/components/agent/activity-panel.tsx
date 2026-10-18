@@ -1,10 +1,72 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import {
-  ImageIcon, Film, Loader2, CheckCircle2, XCircle, Clock3, Activity,
+  ImageIcon, Film, Loader2, CheckCircle2, XCircle, Clock3, Activity, FileText, Download,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { AgentTaskDTO } from '@/lib/agent/types'
+
+interface MyFile {
+  id: string
+  name: string
+  size: number
+  tgOk: boolean
+  updatedAt: string
+  url: string
+}
+
+/** Files produced by this user's tasks (Telegram bot + site agent). Fetched
+ * from /api/my/files (cookie-auth scoped to the session user). */
+function MyFiles() {
+  const [files, setFiles] = useState<MyFile[] | null>(null)
+  useEffect(() => {
+    let alive = true
+    fetch('/api/my/files?limit=30')
+      .then((r) => (r.ok ? r.json() : { files: [] }))
+      .then((j: { files?: MyFile[] }) => {
+        if (alive) setFiles(j.files || [])
+      })
+      .catch(() => alive && setFiles([]))
+    const t = setInterval(() => {
+      fetch('/api/my/files?limit=30')
+        .then((r) => (r.ok ? r.json() : { files: [] }))
+        .then((j: { files?: MyFile[] }) => alive && setFiles(j.files || []))
+        .catch(() => null)
+    }, 30000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
+  if (files === null) return null
+  return (
+    <div className="border-t border-stone-200 pt-2 mt-2 px-1">
+      <p className="flex items-center gap-1.5 px-1 py-1 text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+        <FileText className="h-3.5 w-3.5" /> Мои файлы ({files.length})
+      </p>
+      {files.length === 0 ? (
+        <p className="px-1 pb-1 text-[11px] text-stone-400">
+          Файлы из задач в Telegram и на сайте появятся здесь — можно скачать в любой момент.
+        </p>
+      ) : (
+        <div className="space-y-1">
+          {files.slice(0, 30).map((f) => (
+            <a
+              key={f.id}
+              href={f.url}
+              className="flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs text-stone-700 hover:border-emerald-300 hover:bg-emerald-50/40"
+            >
+              <FileText className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+              <span className="truncate flex-1">{f.name}</span>
+              <span className="shrink-0 text-[10px] text-stone-400">
+                {f.size >= 1024 ? `${(f.size / 1024).toFixed(0)} КБ` : `${f.size} Б`}
+              </span>
+              <Download className="h-3 w-3 shrink-0 text-stone-400" />
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 const STATUS_META: Record<
   AgentTaskDTO['status'],
@@ -120,6 +182,7 @@ export function ActivityPanel({
         ) : (
           sorted.map((t) => <TaskCard key={t.id} task={t} />)
         )}
+        <MyFiles />
       </div>
     </div>
   )

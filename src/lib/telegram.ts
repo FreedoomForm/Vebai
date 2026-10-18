@@ -118,6 +118,36 @@ export async function botOwnerChatId(): Promise<string | null> {
   } catch { return null }
 }
 
+/**
+ * Where should results/progress/files of a task be delivered?
+ * Multi-user (2026-10-18): the chat of the USER who owns the conversation
+ * (bound via telegramChatId). Falls back to the legacy owner conversation
+ * (key 'telegramBot') when the conversation has no user yet.
+ * null = the conversation has no Telegram counterpart (pure site chat).
+ */
+export async function taskChat(
+  conversationId: string | null | undefined,
+): Promise<{ chatId: string; isOwner: boolean } | null> {
+  if (!conversationId) return null
+  try {
+    const conv = await db.conversation.findUnique({ where: { id: conversationId } })
+    if (conv?.userId) {
+      const u = await db.user.findUnique({ where: { id: conv.userId } })
+      if (u?.telegramChatId) {
+        const owner = await botOwnerChatId()
+        return { chatId: u.telegramChatId, isOwner: !!owner && u.telegramChatId === owner }
+      }
+    }
+    const botRow = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
+    if (botRow) {
+      const bot = JSON.parse(botRow.data) as { ownerChatId?: string; convId?: string }
+      if (bot.ownerChatId && bot.convId && bot.convId === conversationId)
+        return { chatId: bot.ownerChatId, isOwner: true }
+    }
+  } catch { /* fall through */ }
+  return null
+}
+
 /** upload produced files to the owner channel (or an explicit chat);
  * returns count delivered */
 export async function uploadToTelegram(

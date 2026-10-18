@@ -61,11 +61,22 @@ def api(path: str, payload: dict, timeout: int = 120) -> dict:
         return json.loads(r.read().decode())
 
 
-def collect_files(since_ts: float) -> list:
-    """files created/modified inside the workspace since the command started"""
+def redact(text: str) -> str:
+    """multi-user safety (2026-10-18): the bot is open to every Telegram user,
+    so runner secrets (session secret, ZAI key) are scrubbed from anything
+    that travels back to users - even if a task runs `printenv`."""
+    for v in (SECRET, os.environ.get("ZAI_API_KEY") or ""):
+        if v and v in text:
+            text = text.replace(v, "***")
+    return text
+
+
+def collect_files(since_ts: float, base_dir: str = WS, path_prefix: str = "") -> list:
+    """files created/modified inside base_dir since the command started;
+    path_prefix (e.g. 'guest_123/') keeps per-user names unique in the DB"""
     files = []
     total = 0
-    for root, _, names in os.walk(WS):
+    for root, _, names in os.walk(base_dir):
         for n in names:
             p = os.path.join(root, n)
             try:
@@ -86,14 +97,15 @@ def collect_files(since_ts: float) -> list:
             total += b64len
             ext = os.path.splitext(n)[1].lower()
             files.append({
-                "path": os.path.relpath(p, WS),
+                "path": path_prefix + os.path.relpath(p, base_dir),
                 "b64": base64.b64encode(b).decode(),
                 "mime": MIME.get(ext, "application/octet-stream"),
             })
     return files
 
 
-def pack_result(cmd_id: str, rc: int, since_ts: float) -> dict:
+def pack_result(cmd_id: str, rc: int, since_ts: float, base_dir: str = WS,
+                path_prefix: str = "") -> dict:
     out = ""
     err = ""
     p_out = f"/tmp/.out-{cmd_id[:8]}"
@@ -106,20 +118,22 @@ def pack_result(cmd_id: str, rc: int, since_ts: float) -> dict:
             data = f.read()
         if data.strip():
             err = data[-3000:]
-    output = out + (("\n[stderr]\n" + err) if err else "")
+    output = redact(out + (("\n[stderr]\n" + err) if err else ""))
     return {
         "secret": SECRET, "session": SESSION, "cmdId": cmd_id,
         "status": "done" if rc == 0 else "failed", "exitCode": rc,
-        "output": output, "files": collect_files(since_ts),
+        "output": output, "files": collect_files(since_ts, base_dir, path_prefix),
     }
 
 
-def post_result(cmd_id: str, rc: int, since_ts: float) -> bool:
+def post_result(cmd_id: str, rc: int, since_ts: float, base_dir: str = WS,
+                path_prefix: str = "") -> bool:
     """best effort: retry a few times; a lost result self-heals on the site
     (stuck-command reclaim) but only if we do not keep the shift alive"""
     for attempt in range(3):
         try:
-            r = api("/api/terminal/gh/result", pack_result(cmd_id, rc, since_ts))
+            r = api("/api/terminal/gh/result",
+                    pack_result(cmd_id, rc, since_ts, base_dir, path_prefix))
             print("cmd", cmd_id[:8], "exit", rc, "posted", r.get("ok"), flush=True)
             return True
         except Exception as e:
@@ -160,6 +174,13 @@ def main() -> int:
         done += 1
         since_ts = time.time() - 1
 
+        # multi-user: guests (telegram users other than the owner) work in a
+        # per-user workspace and never see each other's files by default
+        guest = str(c.get("guestChat") or "")
+        task_ws = f"/tmp/ws/guest_{guest}" if guest else WS
+        path_prefix = f"guest_{guest}/" if guest else ""
+        os.makedirs(task_ws, exist_ok=True)
+
         # ---- agent task: hand over to the LLM loop (many self-planned commands)
         raw = str(c.get("command", ""))
         if raw.startswith(AGENT_PREFIX):
@@ -172,6 +193,13 @@ def main() -> int:
                 pass
             rc = 0
             try:
+                os.environ["AGENT_WS"] = task_ws
+                os.environ["AGENT_MEMORY"] = (
+                    f"/tmp/agent_memory_guest_{guest}.md" if guest else "/tmp/agent_memory.md")
+                if guest:
+                    os.environ["AGENT_GUEST"] = "1"
+                else:
+                    os.environ.pop("AGENT_GUEST", None)
                 import agent_runner
                 budget = min(AGENT_BUDGET_MIN, (deadline - time.time()) / 60 - 5)
                 if budget < 3:
@@ -186,7 +214,7 @@ def main() -> int:
                         fo.write(f"агент упал: {type(e).__name__}: {str(e)[:600]}")
                 except OSError:
                     pass
-            post_result(cmd_id, rc, since_ts)
+            post_result(cmd_id, rc, since_ts, task_ws, path_prefix)
             continue
 
         # ---- plain shell command
@@ -198,14 +226,14 @@ def main() -> int:
         try:
             with open(f"/tmp/.out-{cmd_id[:8]}", "w") as fo, \
                  open(f"/tmp/.err-{cmd_id[:8]}", "w") as fe:
-                p = subprocess.run(["bash", script], cwd=WS, stdin=subprocess.DEVNULL,
+                p = subprocess.run(["bash", script], cwd=task_ws, stdin=subprocess.DEVNULL,
                                    stdout=fo, stderr=fe, timeout=TMO * 60)
             rc = p.returncode
         except subprocess.TimeoutExpired:
             rc = 124
         except Exception:
             rc = 127
-        post_result(cmd_id, rc, since_ts)
+        post_result(cmd_id, rc, since_ts, task_ws, path_prefix)
     print(f"resident shift over: {done} command(s) executed this run", flush=True)
     return 0
 

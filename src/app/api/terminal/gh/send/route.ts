@@ -5,6 +5,7 @@ import {
   sendTelegramText,
   botOwnerChatId,
   resolveChatId,
+  taskChat,
   type TgFile,
 } from '@/lib/telegram'
 
@@ -22,12 +23,12 @@ interface SendFile {
  * texts/files to a person through the Telegram bot (owner request 2026-10-18:
  * "организуй отправку нужных файлов и текстов нужному человеку").
  *
- * Recipients:
- *   "owner"/"me" (default) -> the owner's private chat with the bot
- *   "channel"              -> the archive channel (TELEGRAM_CHAT_ID / cache)
- *   "-100..." | "123..."   -> explicit numeric chat id (bot can only reach
- *                             chats it already knows)
- *   "@username"            -> public channel/supergroup username
+ * Recipients (scoped to the TASK SENDER since the bot went multi-user):
+ *   "owner"/"me" (default) -> the sender's own chat (for the owner's tasks
+ *                             that is the owner's private chat, for guest
+ *                             tasks - the guest who sent the task)
+ *   "channel"              -> the archive channel (OWNER ONLY)
+ *   "-100..." | "@user"    -> explicit third party (OWNER ONLY)
  *
  * Auth is identical to /claim, /result and /progress (TerminalSession
  * kind='gh' + secret). The route also doubles as a keep-alive: it refreshes
@@ -51,15 +52,39 @@ export async function POST(req: NextRequest) {
   if (!session || session.kind !== 'gh' || session.secret !== secret)
     return NextResponse.json({ ok: false, error: 'forbidden' }, { status: 403 })
 
-  // ---- resolve the recipient ------------------------------------------------
+  // ---- keep-alive + origin resolution (who is the task sender?) ----------
+  await db.terminalSession
+    .update({ where: { id: sessionId }, data: { lastSeenAt: new Date() } })
+    .catch(() => null)
+  const cmd = await db.terminalCommand
+    .findFirst({ where: { sessionId, status: 'running' }, orderBy: { updatedAt: 'desc' } })
+    .catch(() => null)
+  const origin = await taskChat(cmd?.conversationId).catch(() => null)
+  const isOwnerTask = !!origin?.isOwner
+
+  // ---- resolve the recipient ----------------------------------------------
   const raw = String(body.chat || 'owner').trim()
   const alias = raw.toLowerCase()
   let chatId: string | null = null
-  if (!raw || alias === 'owner' || alias === 'me' || alias === 'владелец')
-    chatId = await botOwnerChatId()
-  else if (alias === 'channel' || alias === 'канал') chatId = await resolveChatId()
-  else if (/^-?\d{3,}$/.test(raw) || /^@[a-zA-Z][a-zA-Z0-9_]{3,63}$/.test(raw)) chatId = raw
-  else
+  if (!raw || alias === 'owner' || alias === 'me' || alias === 'владелец') {
+    // "me" = the person who sent the task (owner alias keeps working for
+    // the owner's own tasks)
+    chatId = origin?.chatId || (await botOwnerChatId())
+  } else if (alias === 'channel' || alias === 'канал') {
+    if (!isOwnerTask)
+      return NextResponse.json(
+        { ok: false, error: 'отправка в канал доступна только владельцу — отправь файл себе (to=owner)' },
+        { status: 403 },
+      )
+    chatId = await resolveChatId()
+  } else if (/^-?\d{3,}$/.test(raw) || /^@[a-zA-Z][a-zA-Z0-9_]{3,63}$/.test(raw)) {
+    if (!isOwnerTask)
+      return NextResponse.json(
+        { ok: false, error: 'отправка третьим лицам доступна только владельцу — отправь файл себе (to=owner)' },
+        { status: 403 },
+      )
+    chatId = raw
+  } else
     return NextResponse.json(
       { ok: false, error: `непонятный получатель «${raw.slice(0, 60)}» — owner | channel | chat_id | @username` },
       { status: 400 },
@@ -111,10 +136,10 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ---- transparency: the owner always sees what the agent sends elsewhere ---
+  // ---- transparency: the owner always sees third-party sends ---------------
   try {
     const ownerId = await botOwnerChatId()
-    if (chatId !== ownerId) {
+    if (isOwnerTask && chatId !== ownerId) {
       const what = files.length
         ? `файл(ы): ${files.map((f) => f.name).join(', ').slice(0, 200)}`
         : `текст: ${text.slice(0, 150)}`
@@ -124,13 +149,7 @@ export async function POST(req: NextRequest) {
     /* best-effort */
   }
 
-  // ---- keep-alive: same contract as /progress -------------------------------
-  await db.terminalSession
-    .update({ where: { id: sessionId }, data: { lastSeenAt: new Date() } })
-    .catch(() => null)
-  const cmd = await db.terminalCommand
-    .findFirst({ where: { sessionId, status: 'running' }, orderBy: { updatedAt: 'desc' } })
-    .catch(() => null)
+  // ---- keep-alive touch of the running command (same contract as /progress)
   if (cmd) {
     await db.terminalCommand
       .update({

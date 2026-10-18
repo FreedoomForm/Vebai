@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { taskChat } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 
@@ -69,8 +70,14 @@ export async function POST(req: NextRequest) {
 
   if (!cmd) return NextResponse.json({ ok: false, reason: 'empty' })
 
+  // multi-user (2026-10-18): tell the runner whether this task comes from a
+  // guest telegram user - it then uses a per-user workspace and redacts
+  // secrets from outputs more aggressively
+  const origin = await taskChat(cmd.conversationId).catch(() => null)
+  const guestChat = origin && !origin.isOwner ? origin.chatId : null
+
   return NextResponse.json({
     ok: true,
-    cmd: { id: cmd.id, command: cmd.command, conversationId: cmd.conversationId },
+    cmd: { id: cmd.id, command: cmd.command, conversationId: cmd.conversationId, guestChat },
   })
 }
