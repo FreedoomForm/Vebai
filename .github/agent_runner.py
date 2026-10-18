@@ -9,7 +9,10 @@ Telegram via /api/terminal/gh/progress; produced files are collected by
 the executor's post_result (mtime diff of /tmp/ws) as before.
 
 Protocol (see AGENT.md): the model answers with <cmd to="900">...</cmd>,
-<search>...</search>, <read>...</read> or <final>...</final> blocks.
+<search>...</search>, <read>...</read>, <send to="owner" file="...">...</send>
+or <final>...</final> blocks. <send> delivers texts/files to a person via the
+Telegram bot right now (owner's private chat by default) instead of waiting
+for the end-of-task result batch.
 Stdlib only - nothing to install on the runner.
 """
 import json
@@ -41,8 +44,12 @@ AGENT_MD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AGENT.md")
 RE_CMD = re.compile(r"<cmd(?:\s+to\s*=\s*\"?(\d+)\"?)?\s*>([\s\S]*?)</cmd>", re.I)
 RE_SEARCH = re.compile(r"<search>([\s\S]*?)</search>", re.I)
 RE_READ = re.compile(r"<read>([\s\S]*?)</read>", re.I)
+RE_SEND = re.compile(r"<send\b([^>]*?)/?>([\s\S]*?)</send>", re.I)
+RE_ATTR = re.compile(r"(\w+)\s*=\s*[\"']([^\"']*)[\"']")
 RE_FINAL = re.compile(r"<final>([\s\S]*?)</final>", re.I)
 RE_THINK = re.compile(r"<think>[\s\S]*?</think>|<thought>[\s\S]*?</thought>", re.I)
+
+MAX_SEND_BYTES = 3_400_000   # per request: Vercel body limit ~4.5MB base64-encoded
 
 
 # ------------------------------------------------------------------ plumbing
@@ -74,6 +81,53 @@ def post_progress(text: str) -> None:
             timeout=30)
     except Exception:
         pass  # progress must never break the loop
+
+
+def do_send(to: str, file_path: str, text: str) -> str:
+    """deliver a text/file to a person via the site's /api/terminal/gh/send;
+    returns a one-line report the model reads on its next turn."""
+    to = (to or "owner").strip() or "owner"
+    files = []
+    if file_path:
+        p = os.path.realpath(
+            file_path if os.path.isabs(file_path) else os.path.join(WS, file_path))
+        ws_root = os.path.realpath(WS)
+        if os.path.commonpath([p, ws_root]) != ws_root:
+            return (f"[send → {to}] ❌ файл должен лежать внутри {WS} "
+                    f"(получено: {file_path})")
+        if not os.path.isfile(p):
+            return f"[send → {to}] ❌ файл не найден: {file_path}"
+        size = os.path.getsize(p)
+        if size == 0:
+            return f"[send → {to}] ❌ файл пустой: {file_path}"
+        if size > MAX_SEND_BYTES:
+            return (f"[send → {to}] ❌ файл {size // 1024} КБ больше лимита 3.3 МБ — "
+                    "сожми (zip -9, jpg-качество) или раздели на части")
+        import base64
+        with open(p, "rb") as f:
+            files.append({"name": os.path.basename(p),
+                          "b64": base64.b64encode(f.read()).decode()})
+    text = (text or "").strip()
+    if not text and not files:
+        return f"[send → {to}] ❌ пусто: укажи file=\"...\" или напиши текст"
+    if not (SECRET and SESSION):
+        return "[send] ❌ SECRET/SESSION не заданы — отправка недоступна"
+    try:
+        res = api("/api/terminal/gh/send",
+                  {"secret": SECRET, "session": SESSION, "chat": to,
+                   "text": text[:8000], "files": files},
+                  timeout=120)
+    except Exception as e:
+        return f"[send → {to}] ❌ доставка не удалась: {str(e)[:150]}"
+    if res.get("ok"):
+        done = []
+        if res.get("textSent"):
+            done.append(f"текст доставлен ({res['textSent']} сообщ.)")
+        if res.get("filesSent"):
+            done.append(f"файлов доставлено: {res['filesSent']}")
+        return f"[send → {res.get('chat') or to}] ✅ " + "; ".join(done)
+    errs = "; ".join(res.get("errors") or [res.get("error") or "неизвестная ошибка"])
+    return f"[send → {to}] ❌ {errs[:300]}"
 
 
 def run_bash(script: str, timeout: int):
@@ -134,6 +188,17 @@ def parse_actions(reply: str):
         u = m.group(1).strip()
         if u:
             actions.append(("read", u, 40))
+    for m in RE_SEND.finditer(reply):
+        attrs = {k.lower(): v for k, v in RE_ATTR.findall(m.group(1))}
+        body = m.group(2).strip()
+        # tolerate file specified inside the body: "file: /tmp/ws/x.pdf"
+        fpath = attrs.get("file", "").strip()
+        if not fpath:
+            fm = re.search(r"^\s*(?:file|файл)\s*[:=]\s*(\S+)", body, re.I | re.M)
+            if fm:
+                fpath = fm.group(1)
+                body = re.sub(r"^\s*(?:file|файл)\s*[:=].*$", "", body, flags=re.I | re.M).strip()
+        actions.append(("send", (attrs.get("to", "").strip(), fpath, body), 60))
     return final, actions
 
 
@@ -266,7 +331,7 @@ def run_agent(task, budget_min=None) -> str:
 
         # ---- execute the requested actions in order
         outputs = []
-        for kind, arg, tmo in actions[:4]:
+        for kind, arg, tmo in actions[:6]:
             if kind == "cmd":
                 sig = re.sub(r"\s+", " ", arg)[:200]
                 same_cmd_runs = same_cmd_runs + 1 if sig == last_cmd_sig else 1
@@ -284,6 +349,11 @@ def run_agent(task, budget_min=None) -> str:
                 res = zai_client.read_page(arg)
                 outputs.append(f"[страница: {arg}]\n{res}")
                 post_progress(f"📄 шаг {step}/{MAX_STEPS}: читаю страницу")
+            elif kind == "send":
+                to, fpath, body = arg
+                outp = do_send(to, fpath, body)
+                outputs.append(outp)
+                post_progress(f"📤 шаг {step}/{MAX_STEPS}: {outp[:130]}")
 
         history.append({"role": "assistant", "content": reply})
         compact(history)
