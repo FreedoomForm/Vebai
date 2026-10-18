@@ -266,24 +266,13 @@ export async function POST(req: NextRequest) {
   }
   messages.push(...clean)
 
-  // ---- upstream stream
-  let upstream: ReadableStream<Uint8Array>
-  try {
-    upstream = await zai.streamChat({
-      messages,
-      stream: true,
-      // effort: 'max' → deep thinking; 'high' → fast answers, thinking off
-      thinking: { type: effort === 'max' ? 'enabled' : 'disabled' },
-      ...(model ? { model } : {}),
-    })
-  } catch (e) {
-    const message = e instanceof Error ? e.message.slice(0, 300) : 'Z.ai недоступен'
-    return new Response(
-      `data: ${JSON.stringify({ type: 'error', message, code: 'upstream_error' })}\n\n`,
-      { status: 502, headers: { 'Content-Type': 'text/event-stream' } },
-    )
-  }
-
+  // ---- upstream stream. Acquisition happens INSIDE the SSE stream: when
+  // Z.ai's free tier is overloaded, the internal retry chain can exhaust and
+  // the old code answered a dead 502 with the real reason invisible (UI
+  // showed a bare "stream 502"). Now the connection opens immediately (200)
+  // and the user watches live retry notices; only after ~45s does the stream
+  // end with an explicit error event (Повторить still works).
+  const upstreamRef: { current: ReadableStream<Uint8Array> | null } = { current: null }
   const decoder = new TextDecoder()
   // T16: the model decides what the user sees — only <answer>…</answer>
   // content is forwarded; run-terminal/run-vterm blocks (outside <answer>)
@@ -291,9 +280,39 @@ export async function POST(req: NextRequest) {
   const answerFilter = createAnswerStreamFilter()
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // acquire the upstream with visible retries (overload bursts usually
+      // clear within seconds — keep the user informed instead of a dead 502)
+      const acqT0 = Date.now()
+      let attempt = 0
+      for (;;) {
+        try {
+          upstreamRef.current = await zai.streamChat({
+            messages,
+            stream: true,
+            // effort: 'max' → deep thinking; 'high' → fast answers, thinking off
+            thinking: { type: effort === 'max' ? 'enabled' : 'disabled' },
+            ...(model ? { model } : {}),
+          })
+          break
+        } catch (e) {
+          attempt++
+          const reason = e instanceof Error ? e.message.slice(0, 200) : 'Z.ai недоступен'
+          if (Date.now() - acqT0 > 45_000 || attempt >= 4) {
+            controller.enqueue(
+              sse({ type: 'error', message: `Z.ai недоступен: ${reason}`, code: 'upstream_error' }),
+            )
+            controller.close()
+            return
+          }
+          controller.enqueue(
+            sse({ type: 'notice', text: `Z.ai перегружен — переподключаюсь (попытка ${attempt + 1})…` }),
+          )
+          await new Promise((r) => setTimeout(r, 3500))
+        }
+      }
       let buf = ''
       let fullAnswer = ''
-      const reader = upstream.getReader()
+      const reader = upstreamRef.current!.getReader()
       try {
         for (;;) {
           const { done, value } = await reader.read()
@@ -379,7 +398,7 @@ export async function POST(req: NextRequest) {
       }
     },
     cancel() {
-      void upstream.cancel().catch(() => {})
+      void upstreamRef.current?.cancel().catch(() => {})
     },
   })
 

@@ -436,8 +436,15 @@ export function AgentApp() {
           signal: ac.signal,
         })
         if (!res.ok || !res.body) {
-          const data = (await res.json().catch(() => ({}))) as { error?: string }
-          throw new Error(data.error || `stream ${res.status}`)
+          // the route can answer non-200 with an SSE `data:` line — surface
+          // the real upstream message instead of a bare "stream 502"
+          const raw = await res.text().catch(() => '')
+          let msg = ''
+          try {
+            const j = JSON.parse(raw.replace(/^data:\s*/i, '').trim()) as { message?: string }
+            msg = String(j.message || '')
+          } catch { /* keep the generic fallback below */ }
+          throw new Error(msg || `stream ${res.status}`)
         }
 
         const reader = res.body.getReader()
