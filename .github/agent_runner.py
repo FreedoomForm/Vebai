@@ -4,15 +4,23 @@
 agent - it reads AGENT.md, plans with GLM (same official Z.ai API as the
 site), executes its own bash commands one by one inside the persistent
 /tmp/ws workspace, observes the output, fixes its mistakes and only then
-reports the final answer. Progress lines are mirrored to the owner's
-Telegram via /api/terminal/gh/progress; produced files are collected by
-the executor's post_result (mtime diff of /tmp/ws) as before.
+reports the final answer.
+
+T16 (owner request 2026-10-18): the user sees ONLY what the agent wants to
+show. No progress lines are mirrored to Telegram any more - the runner just
+sends a silent heartbeat to /api/terminal/gh/progress (running-timeout +
+resident keepalive). The final answer follows the <answer>/<file> protocol
+(see AGENT.md): <answer>...</answer> is the text the user gets, <file>
+tags pick which workspace files are delivered - everything else (steps,
+commands, search, intermediate notes) never reaches the user. Produced
+files are collected by the executor's post_result (mtime diff of /tmp/ws)
+as before; /api/terminal/gh/result does the parsing/filtering.
 
 Protocol (see AGENT.md): the model answers with <cmd to="900">...</cmd>,
 <search>...</search>, <read>...</read>, <send to="owner" file="...">...</send>
 or <final>...</final> blocks. <send> delivers texts/files to a person via the
-Telegram bot right now (owner's private chat by default) instead of waiting
-for the end-of-task result batch.
+Telegram bot right now (the task sender's private chat by default) instead
+of waiting for the end-of-task result batch.
 Stdlib only - nothing to install on the runner.
 """
 import json
@@ -66,30 +74,25 @@ def api(path: str, payload: dict, timeout: int = 60):
 _last_progress = 0.0
 
 
-def redact(text: str) -> str:
-    """the bot is multi-user now: scrub runner secrets from anything that
-    travels to users (a task could run `printenv`)"""
-    for v in (SECRET, os.environ.get("ZAI_API_KEY") or ""):
-        if v and v in text:
-            text = text.replace(v, "***")
-    return text
-
-
-def post_progress(text: str) -> None:
-    """mirror a short progress line to the owner's Telegram (best effort)."""
+def heartbeat() -> None:
+    """T16: SILENT keepalive - no step text ever travels to users. Same
+    /api/terminal/gh/progress endpoint, generic payload; the route only
+    touches the running command's updatedAt (30-min timeout guard) and the
+    session's lastSeenAt (resident redispatch guard). Throttled to one
+    beat per 4 minutes - far below both timeouts."""
     global _last_progress
     now = time.time()
-    if now - _last_progress < 20:  # telegram flood safety
+    if now - _last_progress < 240:  # one beat / 4 min is enough
         return
     _last_progress = now
     if not (SECRET and SESSION):
         return
     try:
         api("/api/terminal/gh/progress",
-            {"secret": SECRET, "session": SESSION, "text": redact(str(text))[:400]},
+            {"secret": SECRET, "session": SESSION, "text": "работаю"},
             timeout=30)
     except Exception:
-        pass  # progress must never break the loop
+        pass  # keepalive must never break the loop
 
 
 def do_send(to: str, file_path: str, text: str) -> str:
@@ -308,7 +311,7 @@ def run_agent(task, budget_min=None) -> str:
     last_cmd_sig = ""
     same_cmd_runs = 0
 
-    post_progress(f"🏁 взял задачу: {task.strip()[:120]}")
+    heartbeat()  # initial silent beat (T16: no user-visible "took the task" line)
 
     for step in range(1, MAX_STEPS + 1):
         if time.time() > deadline:
@@ -356,22 +359,22 @@ def run_agent(task, budget_min=None) -> str:
                 last_cmd_sig = sig
                 rc, dt, outp = run_bash(arg, tmo)
                 outputs.append(f"$ {arg[:400]}\n(exit {rc}, {dt} c)\n{outp or '(пустой вывод)'}")
-                post_progress(f"⚙️ шаг {step}/{MAX_STEPS}: {arg.strip()[:130]}")
+                heartbeat()
                 if same_cmd_runs >= 3:
                     outputs.append("[СИСТЕМА] эта команда уже повторяется 3-й раз без успеха — смени подход.")
             elif kind == "search":
                 res = zai_client.web_search(arg)
                 outputs.append(f"[поиск: {arg}]\n{res}")
-                post_progress(f"🔍 шаг {step}/{MAX_STEPS}: ищу «{arg[:100]}»")
+                heartbeat()
             elif kind == "read":
                 res = zai_client.read_page(arg)
                 outputs.append(f"[страница: {arg}]\n{res}")
-                post_progress(f"📄 шаг {step}/{MAX_STEPS}: читаю страницу")
+                heartbeat()
             elif kind == "send":
                 to, fpath, body = arg
                 outp = do_send(to, fpath, body)
                 outputs.append(outp)
-                post_progress(f"📤 шаг {step}/{MAX_STEPS}: {outp[:130]}")
+                heartbeat()
 
         history.append({"role": "assistant", "content": reply})
         compact(history)
@@ -391,12 +394,10 @@ def run_agent(task, budget_min=None) -> str:
         except Exception as e:
             final_text = f"Лимит шагов исчерпан, финал не получен: {e}"
 
-    # ---- self-check: attach the real file list (runner-side verification)
-    files = list_new_files(started_ts)
-    if files:
-        listing = ", ".join(f"{p} ({s // 1024} КБ)" if s >= 1024 else f"{p} ({s} Б)"
-                            for p, s in files)
-        final_text += f"\n\n📎 Файлы: {listing}"
+    # ---- T16: no automatic file listing here. The agent lists the files it
+    # wants to deliver with <file>...</file> tags (AGENT.md protocol);
+    # /api/terminal/gh/result parses them and delivers ONLY those. An output
+    # without the <answer> protocol keeps the legacy deliver-everything mode.
     save_memory(task, final_text)
     return final_text or "(агент закончил без финального ответа)"
 

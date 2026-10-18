@@ -1,97 +1,14 @@
 'use client'
 
-import { useState } from 'react'
 import Image from 'next/image'
-import {
-  Search, Globe, ImageIcon, Film, ListChecks,
-  Loader2, Check, X, ChevronDown, Bot,
-} from 'lucide-react'
+import { Bot } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import type { MessageDTO, ArtifactDTO, ToolCallDTO } from '@/lib/agent/types'
+import type { MessageDTO, ArtifactDTO } from '@/lib/agent/types'
 import ReactMarkdown from 'react-markdown'
 
-/* ------------------------------------------------------------ tool icons */
-
-const TOOL_META: Record<string, { label: string; icon: typeof Search }> = {
-  generate_plan: { label: 'Составляет план', icon: ListChecks },
-  web_search: { label: 'Ищет в интернете', icon: Search },
-  read_page: { label: 'Читает страницу', icon: Globe },
-  generate_image: { label: 'Генерирует изображение', icon: ImageIcon },
-  generate_video: { label: 'Ставит видео на генерацию', icon: Film },
-}
-
-function ToolCard({ call }: { call: ToolCallDTO }) {
-  const [open, setOpen] = useState(false)
-  const meta = TOOL_META[call.name] || { label: call.name, icon: Bot }
-  const Icon = meta.icon
-  return (
-    <div className="rounded-xl border border-stone-200 bg-stone-50 overflow-hidden">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2.5 px-3 py-2.5 text-left hover:bg-stone-100 transition-colors"
-      >
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-stone-100 border border-stone-200">
-          <Icon className="h-3.5 w-3.5 text-emerald-600" />
-        </span>
-        <span className="text-sm text-stone-800 flex-1 min-w-0">
-          {meta.label}
-          {call.name === 'web_search' && typeof call.args.query === 'string' && (
-            <span className="text-stone-400"> «{String(call.args.query).slice(0, 48)}»</span>
-          )}
-          {call.name === 'generate_image' && typeof call.args.title === 'string' && (
-            <span className="text-stone-400"> «{String(call.args.title).slice(0, 40)}»</span>
-          )}
-        </span>
-        {call.status === 'running' ? (
-          <Loader2 className="h-4 w-4 shrink-0 animate-spin text-emerald-600" />
-        ) : call.status === 'error' ? (
-          <X className="h-4 w-4 shrink-0 text-red-500" />
-        ) : (
-          <Check className="h-4 w-4 shrink-0 text-emerald-600" />
-        )}
-        <ChevronDown className={cn('h-3.5 w-3.5 shrink-0 text-stone-400 transition-transform', open && 'rotate-180')} />
-      </button>
-      {open && (
-        <div className="px-3 pb-3 pt-0 space-y-1.5">
-          {call.summary && (
-            <p className="text-xs leading-relaxed text-stone-500 whitespace-pre-wrap break-words">
-              {call.summary}
-            </p>
-          )}
-          <pre className="max-h-32 overflow-auto rounded bg-stone-100 p-2 text-[11px] leading-snug text-stone-500">
-            {JSON.stringify(call.args, null, 1)}
-          </pre>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/* ------------------------------------------------------------- plan card */
-
-function PlanCard({ plan }: { plan: NonNullable<MessageDTO['meta']>['plan'] }) {
-  if (!plan) return null
-  return (
-    <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-4">
-      <div className="flex items-center gap-2 mb-3">
-        <ListChecks className="h-4 w-4 text-emerald-700" />
-        <span className="text-sm font-medium text-emerald-800">
-          {plan.title || 'План действий'}
-        </span>
-      </div>
-      <ol className="space-y-2">
-        {plan.steps.map((step, i) => (
-          <li key={i} className="flex items-start gap-2.5 text-sm">
-            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-emerald-300 bg-white text-[11px] font-medium text-emerald-700">
-              {i + 1}
-            </span>
-            <span className="text-stone-700 leading-snug">{step.title}</span>
-          </li>
-        ))}
-      </ol>
-    </div>
-  )
-}
+/* T16 (owner request 2026-10-18): the user sees ONLY what the AI wants to
+ * show — its <answer> text and the artifacts it chose to deliver. Plans,
+ * tool cards and step logs are internal work and are no longer rendered. */
 
 /* ---------------------------------------------------------- artifacts */
 
@@ -170,8 +87,6 @@ export function MessageItem({
     )
   }
 
-  const tools = message.meta?.tools || []
-  const plan = message.meta?.plan
   const artifacts = message.meta?.artifacts || []
 
   return (
@@ -184,10 +99,6 @@ export function MessageItem({
         <div className="w-8 shrink-0" />
       )}
       <div className="min-w-0 flex-1 space-y-3 pt-0.5">
-        {plan && <PlanCard plan={plan} />}
-        {tools.map((call, i) => (
-          <ToolCard key={i} call={call} />
-        ))}
         {message.content && (
           <div className="text-[15px] leading-relaxed text-stone-800 max-w-none break-words [&_p]:my-1.5 [&_strong]:text-stone-900 [&_code]:rounded [&_code]:bg-stone-100 [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[12px] [&_code]:text-emerald-700 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:ml-4 [&_h1]:text-base [&_h1]:font-semibold [&_h2]:text-base [&_h2]:font-semibold [&_h3]:text-sm [&_h3]:font-semibold">
             <ReactMarkdown>{message.content}</ReactMarkdown>

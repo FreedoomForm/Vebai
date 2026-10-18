@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { systemPrompt } from '@/lib/agent/prompt'
+import { parseAiAnswer } from '@/lib/agent/answer'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -378,7 +379,12 @@ async function chatAnswer(convId: string, q: string): Promise<string> {
       messages,
       thinking: { type: 'disabled' }, // fast mode: Telegram waits
     })
-    const answer = cc.choices?.[0]?.message?.content || '(пустой ответ модели)'
+    // T16: the user sees only what the model wants to show — <answer>…</answer>
+    // content; everything else (thinking, plans) is stripped. Same parser as
+    // the site stream and the GH agent results.
+    const raw = cc.choices?.[0]?.message?.content || '(пустой ответ модели)'
+    const parsed = parseAiAnswer(raw)
+    const answer = (parsed.text || raw).slice(0, 20_000)
     await db.message.create({
       data: { conversationId: convId, role: 'assistant', kind: 'text', content: answer },
     })
@@ -445,12 +451,12 @@ export async function POST(req: NextRequest) {
       await tgSend(
         chatId,
         '✅ Привязано. Ты ВЛАДЕЛЕЦ этого бота — пиши задачи прямо сюда.\n\n' +
-          '🤖 обычный текст — задача АГЕНТУ на GitHub Actions (Ubuntu): он сам спланирует команды, доведёт дело до конца и пришлёт файлы (PDF, отчёты, код…), даже если сайт и Telegram закрыты\n' +
+          '🤖 обычный текст — задача АГЕНТУ на GitHub Actions (Ubuntu): он сам спланирует работу, доведёт дело до конца и пришлёт файлы (PDF, отчёты, код…), даже если сайт и Telegram закрыты. Ты увидишь только готовый результат и нужные файлы — без промежуточных шагов\n' +
           '❓ «?текст» — быстрый вопрос модели без запуска задач\n' +
           '❗ «!команда» — одна прямая shell-команда на сервере (только владелец)\n' +
           '• /app — открыть мини-апп: аккаунт на сайте с историей задач и файлов\n' +
           '• /status — состояние конвейера\n\n' +
-          'Результаты, шаги работы и файлы приходят в этот чат.',
+          'В конце работы приходит только готовый результат и файлы — то, что агент сам решит показать.',
       )
     } else {
       await tgSend(chatId, 'Бот привязывается по /start. Напиши /start.')
@@ -486,7 +492,7 @@ export async function POST(req: NextRequest) {
       await tgSend(
         chatId,
         `Привет! Я агент Vebai — сделаю документ, график, отчёт, найду инфу в интернете и пришлю файлы сюда.\n\n` +
-          '🤖 обычный текст — задача агенту (создаёт файлы, доводит до конца)\n' +
+          '🤖 обычный текст — задача агенту (создаёт файлы, доводит до конца; ты увидишь только готовый результат)\n' +
           '❓ «?текст» — быстрый вопрос без запуска задач\n' +
           '• /app — аккаунт на сайте: вся история задач и файлов',
         { ...appButton(), ...replyKeyboard() },
@@ -602,8 +608,7 @@ export async function POST(req: NextRequest) {
   })
   await tgSend(
     chatId,
-    '🤖 Задачу принял агент на GitHub Actions (Ubuntu). Он сам разобьёт её на команды и доведёт до конца. ' +
-      'По ходу пришлю шаги, в конце — результат и файлы.',
+    '🤖 Задачу принял агент на GitHub Actions (Ubuntu). Работаю молча: в конце пришлю только готовый результат и нужные файлы.',
   )
   return NextResponse.json({ ok: true })
 }

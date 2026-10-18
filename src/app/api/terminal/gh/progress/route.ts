@@ -1,18 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { sendTelegramText, taskChat } from '@/lib/telegram'
 
 export const dynamic = 'force-dynamic'
 
 /**
- * POST /api/terminal/gh/progress — short progress lines from the agent-mode
- * runner (prefix '#!agent' commands). Auth identical to /claim and /result.
+ * POST /api/terminal/gh/progress — heartbeat from the agent-mode runner
+ * (prefix '#!agent' commands). Auth identical to /claim and /result.
  *
- * Two jobs:
+ * T16 (owner request 2026-10-18): the user must NOT see intermediate work.
+ * This route is now a SILENT keepalive only:
  *  1. touch the TerminalCommand row so the 30-minute running-timeout in
  *     syncTerminalTask never kills a legitimately long agent job;
- *  2. mirror the progress note to the owner's private Telegram chat when the
- *     command belongs to the Telegram conversation (same rule as /result).
+ *  2. touch the session (resident keepalive, stale-heartbeat redispatch);
+ *  3. keep the last note in the command row for server-side diagnostics.
+ * No Telegram mirrors, no chat messages — the user sees only the final
+ * <answer> delivered by /result.
  */
 export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as {
@@ -48,17 +50,6 @@ export async function POST(req: NextRequest) {
         data: { output: `[агент] ${text}`.slice(0, 500) },
       })
       .catch(() => null)
-
-    // mirror to the task sender's Telegram chat (multi-user: not only the
-    // owner's DM anymore)
-    try {
-      if (cmd.conversationId) {
-        const origin = await taskChat(cmd.conversationId)
-        if (origin?.chatId) await sendTelegramText(`🤖 ${text}`, origin.chatId)
-      }
-    } catch {
-      /* best-effort */
-    }
   }
   return NextResponse.json({ ok: true })
 }

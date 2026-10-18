@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, Circle, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal,
+  Loader2, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -266,7 +266,7 @@ export function AgentApp() {
       case 'done': {
         sendingRef.current = false
         setSending(false)
-        setStream((s) => (s && (s.text.trim() || s.tools.length) ? s : null))
+        setStream((s) => (s && s.text.trim() ? s : null))
         if (!startSeenRef.current) {
           // the server never persisted this message — drop the optimistic bubble
           setMessages((prev) => prev.filter((m) => m.id !== 'temp-user'))
@@ -947,46 +947,14 @@ export function AgentApp() {
                 />
               ))}
 
-              {/* live stream segment */}
-              {stream && (stream.note || stream.text.trim() || stream.tools.length > 0 || stream.plan) && (
+              {/* live stream segment (T16: only the model's chosen text and
+                  short status notes — no plans/tools, no intermediate work) */}
+              {stream && (stream.note || stream.text.trim()) && (
                 <div className="flex gap-3">
                   <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-stone-200 bg-stone-900">
                     <Sparkles className="h-4 w-4 text-white" />
                   </div>
                   <div className="min-w-0 flex-1 space-y-3 pt-0.5">
-                    {stream.plan && (
-                      <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4">
-                        <ol className="space-y-2">
-                          {stream.plan.steps.map((step, i) => (
-                            <li key={i} className="flex items-start gap-2.5 text-sm">
-                              <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-stone-300 bg-white text-[11px] font-medium text-stone-700">
-                                {i + 1}
-                              </span>
-                              <span className="text-stone-700 leading-snug">{step.title}</span>
-                            </li>
-                          ))}
-                        </ol>
-                      </div>
-                    )}
-                    {stream.tools.map((call) => (
-                      <div key={call.id} className="rounded-xl border border-stone-200 bg-white px-3 py-2.5 flex items-center gap-2.5">
-                        <Circle
-                          className={cn(
-                            'h-2.5 w-2.5',
-                            call.status === 'running' && 'text-emerald-600 fill-emerald-600 animate-pulse',
-                            call.status === 'ok' && 'text-emerald-600',
-                            call.status === 'error' && 'text-red-500',
-                          )}
-                        />
-                        <span className="text-sm text-stone-700">{call.name}</span>
-                        {call.status === 'running' && (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-600" />
-                        )}
-                        {call.summary && (
-                          <span className="ml-auto truncate text-xs text-stone-400 max-w-[45%]">{call.summary}</span>
-                        )}
-                      </div>
-                    ))}
                     {stream.note && !stream.text.trim() && (
                       <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
                         <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />

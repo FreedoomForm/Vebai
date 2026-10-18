@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
+import { createAnswerStreamFilter } from '@/lib/agent/answer'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 300
@@ -191,7 +192,10 @@ async function freeWebSearch(query: string, num: number): Promise<SearchItem[]> 
  * streams back simplified events:
  *   { type: 'start', model }            — a model answered (after fallback chain)
  *   { type: 'reasoning', text }         — thinking deltas (4.7-flash fallback is a thinking model)
- *   { type: 'delta', text }             — answer deltas
+ *   { type: 'delta', text }             — VISIBLE answer deltas (T16: only the
+ *                                         text inside <answer>…</answer> is
+ *                                         forwarded; everything else the model
+ *                                         writes stays internal)
  *   { type: 'done' }                    — stream finished cleanly
  *   { type: 'error', message, code }    — upstream failure
  */
@@ -281,6 +285,10 @@ export async function POST(req: NextRequest) {
   }
 
   const decoder = new TextDecoder()
+  // T16: the model decides what the user sees — only <answer>…</answer>
+  // content is forwarded; run-terminal/run-vterm blocks (outside <answer>)
+  // are still dispatched below from the RAW text.
+  const answerFilter = createAnswerStreamFilter()
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let buf = ''
@@ -328,10 +336,15 @@ export async function POST(req: NextRequest) {
               controller.enqueue(sse({ type: 'reasoning', text: delta.reasoning_content.slice(0, 400) }))
             if (delta.content) {
               fullAnswer += delta.content
-              controller.enqueue(sse({ type: 'delta', text: delta.content }))
+              const visible = answerFilter.push(delta.content)
+              if (visible) controller.enqueue(sse({ type: 'delta', text: visible }))
             }
           }
         }
+        // stream over: emit the tail of an unclosed <answer>, or the cleaned
+        // full text when the model ignored the <answer> protocol entirely
+        const tail = answerFilter.flush()
+        if (tail) controller.enqueue(sse({ type: 'delta', text: tail }))
         // ---- terminal dispatch: fenced run-terminal blocks -> Linux worker
         if (conversationId) {
           try {
