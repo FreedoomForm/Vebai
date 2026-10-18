@@ -171,7 +171,74 @@ async function chatListKeyboard(userId: string): Promise<Record<string, unknown>
     callback_data: `conv:${c.id}`,
   }])
   rows.push([{ text: '🆕 Создать чат', callback_data: 'newchat' }])
+  rows.push([{ text: '⬅️ Назад', callback_data: 'back' }])
   return { inline_keyboard: rows }
+}
+
+/** header text of the morphing control panel (menu state) */
+const menuPanelText = () =>
+  '🤖 Vebai — панель управления:\n\n' +
+  '• «🆕 Создать чат» — новый чат для задач\n' +
+  '• «📂 Чаты» — список чатов (история откроется одним сообщением)\n' +
+  'Обычный текст = задача агенту, «?текст» = быстрый вопрос. Кнопки: /menu'
+
+/** chat history condensed into ONE message (Telegram cap ~4096 chars) */
+async function chatDigest(convId: string, title?: string): Promise<string> {
+  const msgs = await db.message.findMany({
+    where: { conversationId: convId },
+    orderBy: { createdAt: 'desc' },
+    take: 14,
+  })
+  const tail = '\n\n(вернуться к кнопкам: /menu)'
+  if (!msgs.length)
+    return `🆕 «${(title || 'Чат').slice(0, 40)}» пуст — напиши задачу обычным сообщением, агент приступит.${tail}`
+  const lines = msgs
+    .reverse()
+    .map((m) => `${m.role === 'user' ? '👤' : '🤖'} ${(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+    .join('\n\n')
+  let out = `📜 «${(title || 'Чат').slice(0, 40)}» — история одним сообщением:\n\n${lines}`
+  if (out.length > 3800) out = out.slice(0, 3760) + '…\n\n(показаны последние сообщения)'
+  return out + tail
+}
+
+/** morph the panel message: edit text + swap/remove the inline keyboard.
+ * kb === undefined -> buttons are REMOVED after the press (owner request:
+ * вошёл в чат — кнопки исчезли, история видна одним сообщением, пиши агенту). */
+async function editPanel(chatId: string, messageId: number, text: string, kb?: Record<string, unknown>): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!token || !messageId) {
+    await tgSend(chatId, text, kb)
+    return
+  }
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    message_id: messageId,
+    text: text.slice(0, 3800),
+    link_preview_options: { is_disabled: true },
+  }
+  if (kb) body.reply_markup = kb
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const j = (await r.json().catch(() => null)) as { ok?: boolean } | null
+    if (j?.ok) {
+      if (!kb) {
+        // strip whatever inline keyboard the message still carries
+        await fetch(`https://api.telegram.org/bot${token}/editMessageReplyMarkup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+          signal: AbortSignal.timeout(15_000),
+        }).catch(() => undefined)
+      }
+      return
+    }
+  } catch { /* fall through: send a fresh panel message */ }
+  await tgSend(chatId, text, kb)
 }
 
 async function statusText(): Promise<string> {
@@ -276,24 +343,32 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
   const chatId = String(cb.from.id)
   const entry = await ensureUserConv(chatId, { first_name: cb.from.first_name, username: cb.from.username })
   const data = cb.data
-  // the message carrying the pressed buttons anchors the window cleaner:
-  // everything between the last /start and this message gets wiped
+  // the message carrying the pressed buttons IS the live panel: every press
+  // morphs it (menu -> list -> history) or strips its buttons entirely
   const carrierMsgId = cb.message?.message_id || 0
+  if (data === 'back') {
+    await answerCallback(cb.id, 'Меню')
+    await editPanel(chatId, carrierMsgId, menuPanelText(), replyKeyboard())
+    return
+  }
   if (data === 'newchat') {
     await answerCallback(cb.id, 'Создаю новый чат…')
-    await createChat(chatId, entry, carrierMsgId)
+    const stamp = new Date().toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    const conv = await db.conversation.create({ data: { userId: entry.userId, title: `Чат ${stamp}` } })
+    await patchUserEntry(chatId, { convId: conv.id })
+    await editPanel(chatId, carrierMsgId, `🆕 «${conv.title}» создан — пиши задачу прямо сюда, результат придёт в этот чат.\n(кнопки: /menu)`)
     return
   }
   if (data === 'chatlist') {
     await answerCallback(cb.id, 'Открываю чаты…')
-    await clearBotWindow(chatId, carrierMsgId, entry.lastStartMsgId)
     const kb = await chatListKeyboard(entry.userId)
     const count = await db.conversation.count({ where: { userId: entry.userId } })
-    await tgSend(
+    await editPanel(
       chatId,
+      carrierMsgId,
       count
-        ? '📂 Твои чаты (они же на сайте в аккаунте). Нажми — выберу его для переписки:'
-        : 'Пока нет чатов — нажми «🆕 Создать чат» под этим сообщением.',
+        ? '📂 Твои чаты (они же на сайте в аккаунте). Нажми — открою историю одним сообщением:'
+        : 'Пока нет чатов — создай первый кнопкой ниже:',
       kb,
     )
     return
@@ -308,11 +383,10 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     if (!conv.userId) await db.conversation.update({ where: { id: convId }, data: { userId: entry.userId } })
     await patchUserEntry(chatId, { convId })
     await answerCallback(cb.id, `Открыт: ${(conv.title || 'чат').slice(0, 60)}`)
-    await tgSend(
-      chatId,
-      `📂 Чат «${(conv.title || 'чат').slice(0, 40)}» открыт — переписка идёт в нём, история синхронна с сайтом.`,
-      replyKeyboard(),
-    )
+    // buttons disappear; the history shows as ONE message; typing continues
+    // in THIS conversation
+    await editPanel(chatId, carrierMsgId, await chatDigest(conv.id, conv.title || undefined))
+    return
   }
 }
 
@@ -491,8 +565,12 @@ export async function POST(req: NextRequest) {
   let convId = entry.convId
 
   // ---- /commands (all users)
+  if (/^\/menu/i.test(text)) {
+    await tgSend(chatId, menuPanelText(), replyKeyboard())
+    return NextResponse.json({ ok: true })
+  }
   if (/^\/status/i.test(text)) {
-    await tgSend(chatId, await statusText(), replyKeyboard())
+    await tgSend(chatId, await statusText())
     return NextResponse.json({ ok: true })
   }
   if (/^\/start/i.test(text)) {
@@ -502,7 +580,7 @@ export async function POST(req: NextRequest) {
     // deep link from the site button "Подключить Telegram": /start connect_<token>
     const param = text.replace(/^\/start\s*/i, '').trim()
     if (param.startsWith('connect_')) {
-      await tgSend(chatId, await connectAccount(chatId, param.slice(8), from, msg.message_id), replyKeyboard())
+      await tgSend(chatId, await connectAccount(chatId, param.slice(8), from, msg.message_id))
       return NextResponse.json({ ok: true })
     }
     if (isOwner) {
@@ -550,10 +628,10 @@ export async function POST(req: NextRequest) {
   if (text.startsWith('?')) {
     const q = text.slice(1).trim()
     if (!q) {
-      await tgSend(chatId, 'Напиши вопрос после знака «?». А обычные задачи (без «?») уходят агенту на GitHub Actions.', replyKeyboard())
+      await tgSend(chatId, 'Напиши вопрос после знака «?». А обычные задачи (без «?») уходят агенту на GitHub Actions.')
       return NextResponse.json({ ok: true })
     }
-    await tgSend(chatId, await chatAnswer(convId, q), replyKeyboard())
+    await tgSend(chatId, await chatAnswer(convId, q))
     return NextResponse.json({ ok: true })
   }
 
@@ -564,13 +642,12 @@ export async function POST(req: NextRequest) {
       await tgSend(
         chatId,
         '❗ Прямые shell-команды доступны только владельцу.\nПросто опиши задачу обычным сообщением — агент сам выполнит всё, что нужно.',
-        replyKeyboard(),
       )
       return NextResponse.json({ ok: true })
     }
     const command = text.slice(1).trim()
     if (!command) {
-      await tgSend(chatId, 'Напиши команду после «!», например: !uptime', replyKeyboard())
+      await tgSend(chatId, 'Напиши команду после «!», например: !uptime')
       return NextResponse.json({ ok: true })
     }
     await db.message.create({
@@ -586,7 +663,7 @@ export async function POST(req: NextRequest) {
         payload: JSON.stringify({ command: command.slice(0, 20_000), terminalId: convId, timeoutS: 240 }),
       },
     })
-    await tgSend(chatId, '⌨️ Команда ушла на GitHub Actions (Ubuntu) — пришлю вывод и файлы.', replyKeyboard())
+    await tgSend(chatId, '⌨️ Команда ушла на GitHub Actions (Ubuntu) — пришлю вывод и файлы.')
     return NextResponse.json({ ok: true })
   }
 
@@ -597,7 +674,7 @@ export async function POST(req: NextRequest) {
       where: { conversationId: convId, type: 'terminal', status: { in: ['queued', 'running'] } },
     })
     if (active >= GUEST_MAX_ACTIVE) {
-      await tgSend(chatId, '⏳ Агент ещё занят твоей прошлой задачей. Дождись результата и присылай следующую.', replyKeyboard())
+      await tgSend(chatId, '⏳ Агент ещё занят твоей прошлой задачей. Дождись результата и присылай следующую.')
       return NextResponse.json({ ok: true })
     }
     const dayStart = new Date()
@@ -606,7 +683,7 @@ export async function POST(req: NextRequest) {
       where: { conversationId: convId, type: 'terminal', createdAt: { gte: dayStart } },
     })
     if (today >= GUEST_DAILY_LIMIT) {
-      await tgSend(chatId, `📅 Дневной лимит задач исчерпан (${GUEST_DAILY_LIMIT}/день). Лимит обновится в 00:00 UTC.`, replyKeyboard())
+      await tgSend(chatId, `📅 Дневной лимит задач исчерпан (${GUEST_DAILY_LIMIT}/день). Лимит обновится в 00:00 UTC.`)
       return NextResponse.json({ ok: true })
     }
   }
@@ -630,7 +707,6 @@ export async function POST(req: NextRequest) {
   await tgSend(
     chatId,
     '🤖 Задачу принял агент на GitHub Actions (Ubuntu). Работаю молча: в конце пришлю только готовый результат и нужные файлы.',
-    replyKeyboard(),
   )
   return NextResponse.json({ ok: true })
 }
