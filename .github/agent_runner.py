@@ -56,6 +56,17 @@ RE_SEND = re.compile(r"<send\b([^>]*?)/?>([\s\S]*?)</send>", re.I)
 RE_ATTR = re.compile(r"(\w+)\s*=\s*[\"']([^\"']*)[\"']")
 RE_FINAL = re.compile(r"<final>([\s\S]*?)</final>", re.I)
 RE_THINK = re.compile(r"<think>[\s\S]*?</think>|<thought>[\s\S]*?</thought>", re.I)
+RE_ANSWER = re.compile(r"<answer>([\s\S]*?)</answer>", re.I)
+RE_FTAG = re.compile(r"<file>([\s\S]*?)</file>", re.I)
+
+# T21a truth guard: file names mentioned in the visible answer, and claims
+# that something was already sent/attached (the agent must never say it
+# created/sent a file that does not exist).
+RE_EXT_FILE = re.compile(
+    r"[\w\-.]+\.(?:pdf|docx?|xlsx?|pptx?|csv|zip|7z|rar|png|jpe?g|gif|webp|mp4|mp3|wav|txt|json|html?|svg|md)\b",
+    re.I)
+RE_SEND_CLAIM = re.compile(
+    r"отправ(?:лен|ил|лю|ка)|доставл|прикрепл|выслал|вложени", re.I)
 
 MAX_SEND_BYTES = 3_400_000   # per request: Vercel body limit ~4.5MB base64-encoded
 
@@ -95,51 +106,53 @@ def heartbeat() -> None:
         pass  # keepalive must never break the loop
 
 
-def do_send(to: str, file_path: str, text: str) -> str:
+def do_send(to: str, file_path: str, text: str):
     """deliver a text/file to a person via the site's /api/terminal/gh/send;
-    returns a one-line report the model reads on its next turn."""
+    returns (one-line report the model reads on its next turn, ok, files_sent)."""
     to = (to or "owner").strip() or "owner"
     files = []
+    n_files = 0
     if file_path:
         p = os.path.realpath(
             file_path if os.path.isabs(file_path) else os.path.join(WS, file_path))
         ws_root = os.path.realpath(WS)
         if os.path.commonpath([p, ws_root]) != ws_root:
             return (f"[send → {to}] ❌ файл должен лежать внутри {WS} "
-                    f"(получено: {file_path})")
+                    f"(получено: {file_path})"), False, 0
         if not os.path.isfile(p):
-            return f"[send → {to}] ❌ файл не найден: {file_path}"
+            return f"[send → {to}] ❌ файл не найден: {file_path}", False, 0
         size = os.path.getsize(p)
         if size == 0:
-            return f"[send → {to}] ❌ файл пустой: {file_path}"
+            return f"[send → {to}] ❌ файл пустой: {file_path}", False, 0
         if size > MAX_SEND_BYTES:
             return (f"[send → {to}] ❌ файл {size // 1024} КБ больше лимита 3.3 МБ — "
-                    "сожми (zip -9, jpg-качество) или раздели на части")
+                    "сожми (zip -9, jpg-качество) или раздели на части"), False, 0
         import base64
         with open(p, "rb") as f:
             files.append({"name": os.path.basename(p),
                           "b64": base64.b64encode(f.read()).decode()})
     text = (text or "").strip()
     if not text and not files:
-        return f"[send → {to}] ❌ пусто: укажи file=\"...\" или напиши текст"
+        return f"[send → {to}] ❌ пусто: укажи file=\"...\" или напиши текст", False, 0
     if not (SECRET and SESSION):
-        return "[send] ❌ SECRET/SESSION не заданы — отправка недоступна"
+        return "[send] ❌ SECRET/SESSION не заданы — отправка недоступна", False, 0
     try:
         res = api("/api/terminal/gh/send",
                   {"secret": SECRET, "session": SESSION, "chat": to,
                    "text": text[:8000], "files": files},
                   timeout=120)
     except Exception as e:
-        return f"[send → {to}] ❌ доставка не удалась: {str(e)[:150]}"
+        return f"[send → {to}] ❌ доставка не удалась: {str(e)[:150]}", False, 0
     if res.get("ok"):
+        n_files = int(res.get("filesSent") or 0)
         done = []
         if res.get("textSent"):
             done.append(f"текст доставлен ({res['textSent']} сообщ.)")
-        if res.get("filesSent"):
-            done.append(f"файлов доставлено: {res['filesSent']}")
-        return f"[send → {res.get('chat') or to}] ✅ " + "; ".join(done)
+        if n_files:
+            done.append(f"файлов доставлено: {n_files}")
+        return (f"[send → {res.get('chat') or to}] ✅ " + "; ".join(done)), True, n_files
     errs = "; ".join(res.get("errors") or [res.get("error") or "неизвестная ошибка"])
-    return f"[send → {to}] ❌ {errs[:300]}"
+    return f"[send → {to}] ❌ {errs[:300]}", False, 0
 
 
 def run_bash(script: str, timeout: int):
@@ -223,6 +236,133 @@ def compact(history: list) -> None:
         c = m.get("content") or ""
         if len(c) > 2200:
             m["content"] = c[:1500] + "\n…[усечено для контекста]"
+
+
+# ----------------------------------------------------- T21a: truth guard
+# Owner report 2026-10-18: the bot once said «файл создал и отправил», but
+# nothing was created or delivered. The final answer is now mechanically
+# verified against the real workspace before it leaves the runner.
+
+def ws_files_basenames() -> set:
+    """every file currently in the workspace (basename, lowercase)."""
+    out = set()
+    for root, _, names in os.walk(WS):
+        for n in names:
+            out.add(n.lower())
+    return out
+
+
+def analyze_final(final_text: str, real: set, send_files_ok: int):
+    """returns (answer, missing, claimed):
+    answer  — the visible <answer> text ('' if the final is not tagged);
+    missing — file names the final promises (via <file> tags or mentions in
+              the answer) that do NOT exist in the workspace;
+    claimed — the answer says the file was sent/attached, but no <send> of a
+              file ever succeeded and none of the promised files exists."""
+    answers = [m.group(1).strip() for m in RE_ANSWER.finditer(final_text) if m.group(1).strip()]
+    answer = "\n\n".join(answers)
+    promised = []
+    seen = set()
+
+    def add(n: str) -> None:
+        n = n.strip().replace("\\", "/").split("/")[-1].strip()
+        if n and n.lower() not in seen:
+            seen.add(n.lower())
+            promised.append(n)
+
+    for m in RE_FTAG.finditer(final_text):
+        for line in re.split(r"[\n,;]+", m.group(1) or ""):
+            add(line.replace("/tmp/ws/", "").lstrip("./"))
+    if not answers:
+        # legacy untagged final: scan the whole text for file mentions
+        for m in RE_EXT_FILE.finditer(final_text):
+            add(m.group(0))
+    missing = [n for n in promised if n.lower() not in real]
+    # send-claims are checked in the VISIBLE text: the <answer> for tagged
+    # finals, the whole final for legacy untagged ones (answer is empty there)
+    claim_scope = answer if answers else final_text
+    claimed = bool(
+        claim_scope and RE_SEND_CLAIM.search(claim_scope)
+        and send_files_ok == 0
+        and not any(n.lower() in real for n in promised))
+    return answer, missing, claimed
+
+
+def append_honest_note(final_text: str, missing: list, claimed: bool) -> str:
+    """append a truthful system note INSIDE the visible answer (or at the
+    end for legacy untagged finals) so the user never keeps a false
+    "file created/sent" belief."""
+    bits = []
+    if missing:
+        bits.append("файл(ы) " + ", ".join(missing) + " в итоге НЕ были созданы — задача выполнена не полностью")
+    if claimed:
+        bits.append("файл НЕ был доставлен в Telegram — сообщение о готовности было ошибочным")
+    if not bits:
+        return final_text
+    note = "⚠️ " + "; ".join(bits) + "."
+    last = None
+    for m in RE_ANSWER.finditer(final_text):
+        last = m
+    if last:
+        i = last.end(1)
+        return final_text[:i] + "\n\n" + note + final_text[i:]
+    return final_text + "\n\n" + note
+
+
+def truth_guard(final_text: str, system: str, history: list, send_files_ok: int) -> str:
+    """verify the final against reality: ONE corrective round-trip (create
+    the missing files / re-send / rewrite the final honestly), then an
+    honest note if the agent still fails to deliver."""
+    final_text = (final_text or "").strip()
+    if not final_text:
+        return final_text
+    _, missing, claimed = analyze_final(final_text, ws_files_basenames(), send_files_ok)
+    if not missing and not claimed:
+        return final_text
+    problems = []
+    if missing:
+        problems.append("заявлен(ы) файл(ы), которых НЕТ в workspace: " + ", ".join(missing))
+    if claimed:
+        problems.append("в ответе сказано, что файл отправлен, но ни одна отправка <send> не удалась и ни один из обещанных файлов не существует")
+    history.append({"role": "user", "content":
+        ("[СИСТЕМА] ПРОВЕРКА ЧЕСТНОСТИ ФИНАЛА: " + "; ".join(problems) +
+         ". У тебя один ход: создай недостающий(е) файл(ы) через <cmd> (проверь ls и размер!), при необходимости отправь <send>, и дай новый <final> — только о РЕАЛЬНО существующих файлах. Если файл создать невозможно — честно скажи об этом в <answer>.")})
+    try:
+        reply, _ = zai_client.chat(
+            [{"role": "system", "content": system}] + history,
+            temperature=0.2, max_tokens=4000)
+    except Exception:
+        return append_honest_note(final_text, missing, claimed)
+    final2, actions = parse_actions(reply)
+    outs = []
+    for kind, arg, tmo in actions[:4]:
+        if kind == "cmd":
+            rc, dt, outp = run_bash(arg, min(tmo, 300))
+            outs.append(f"$ {arg[:200]}\n(exit {rc}, {dt} c)\n{outp or '(пусто)'}")
+        elif kind == "send":
+            report, ok, n = do_send(*arg)
+            if ok and n:
+                send_files_ok += n
+            outs.append(report)
+    if outs:
+        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "user", "content":
+            "=== вывод исправления ===\n" + "\n\n".join(outs) +
+            "\n\n[СИСТЕМА] Дай <final> сейчас — только правда о реально существующих файлах."})
+        try:
+            reply2, _ = zai_client.chat(
+                [{"role": "system", "content": system}] + history,
+                temperature=0.2, max_tokens=2500)
+            final3, _ = parse_actions(reply2)
+            final2 = final3 or final2 or reply2[:3000]
+        except Exception:
+            pass
+    if not final2:
+        final2 = reply[:3000]
+    _, missing2, claimed2 = analyze_final(final2, ws_files_basenames(), send_files_ok)
+    if missing2 or claimed2:
+        final2 = append_honest_note(final2, missing2, claimed2)
+    return final2
 
 
 # ---------------------------------------------------------------------- main
@@ -310,6 +450,7 @@ def run_agent(task, budget_min=None) -> str:
     final_text = ""
     last_cmd_sig = ""
     same_cmd_runs = 0
+    send_files_ok = 0   # T21a: files actually delivered by successful <send>s
 
     heartbeat()  # initial silent beat (T16: no user-visible "took the task" line)
 
@@ -372,7 +513,9 @@ def run_agent(task, budget_min=None) -> str:
                 heartbeat()
             elif kind == "send":
                 to, fpath, body = arg
-                outp = do_send(to, fpath, body)
+                outp, ok, n = do_send(to, fpath, body)
+                if ok and n:
+                    send_files_ok += n
                 outputs.append(outp)
                 heartbeat()
 
@@ -398,6 +541,10 @@ def run_agent(task, budget_min=None) -> str:
     # wants to deliver with <file>...</file> tags (AGENT.md protocol);
     # /api/terminal/gh/result parses them and delivers ONLY those. An output
     # without the <answer> protocol keeps the legacy deliver-everything mode.
+    # T21a: before anything leaves the runner, the final is checked against
+    # reality — the agent either creates the promised file or the user gets
+    # an honest system note instead of a phantom "created and sent".
+    final_text = truth_guard(final_text, system, history, send_files_ok)
     save_memory(task, final_text)
     return final_text or "(агент закончил без финального ответа)"
 

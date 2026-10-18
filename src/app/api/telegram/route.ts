@@ -48,6 +48,11 @@ interface TgUserEntry {
   /** message_id of the last /start in this chat — everything below it gets
    * wiped from the window when the user taps "Создать чат" / "Список чатов" */
   lastStartMsgId?: number
+  /** T21: true once the user explicitly created a chat (🆕) or picked an
+   * existing one (📂 -> conv:<id>). Until then the bot refuses to hand any
+   * message to the AI agent — owner request 2026-10-18: «не позволяй без
+   * создания нового чата или выбора существующего чата общаться с ИИ» */
+  chatPicked?: boolean
 }
 
 type TgUsersMap = Record<string, TgUserEntry>
@@ -270,7 +275,7 @@ async function createChat(chatId: string, entry: TgUserEntry, currentMsgId: numb
   const conv = await db.conversation.create({
     data: { userId: entry.userId, title: `Чат ${stamp}` },
   })
-  await patchUserEntry(chatId, { convId: conv.id })
+  await patchUserEntry(chatId, { convId: conv.id, chatPicked: true })
   await tgSend(
     chatId,
     '🆕 Новый чат создан — пиши задачу. Прежняя история и файлы остались в аккаунте на сайте.',
@@ -355,7 +360,7 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     await answerCallback(cb.id, 'Создаю новый чат…')
     const stamp = new Date().toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
     const conv = await db.conversation.create({ data: { userId: entry.userId, title: `Чат ${stamp}` } })
-    await patchUserEntry(chatId, { convId: conv.id })
+    await patchUserEntry(chatId, { convId: conv.id, chatPicked: true })
     await editPanel(chatId, carrierMsgId, `🆕 «${conv.title}» создан — пиши задачу прямо сюда, результат придёт в этот чат.\n(кнопки: /menu)`)
     return
   }
@@ -381,7 +386,7 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
       return
     }
     if (!conv.userId) await db.conversation.update({ where: { id: convId }, data: { userId: entry.userId } })
-    await patchUserEntry(chatId, { convId })
+    await patchUserEntry(chatId, { convId, chatPicked: true })
     await answerCallback(cb.id, `Открыт: ${(conv.title || 'чат').slice(0, 60)}`)
     // buttons disappear; the history shows as ONE message; typing continues
     // in THIS conversation
@@ -436,8 +441,11 @@ async function ensureUserConv(
     convId: conv.id,
     username: from.username,
     name,
-    // keep the /start anchor if we already stored one
+    // keep the /start anchor if we already stored one; keep the T21
+    // chatPicked flag ONLY if the stored conversation still exists (a fresh
+    // auto-created conv resets it — the user must pick/create a chat again)
     lastStartMsgId: known?.lastStartMsgId,
+    chatPicked: known && known.convId === conv.id ? known.chatPicked : undefined,
   }
   await writeUsersMap({ ...map, [chatId]: entry })
   return entry
@@ -458,7 +466,8 @@ async function chatAnswer(convId: string, q: string): Promise<string> {
       role: 'system',
       content:
         systemPrompt() +
-        '\nПользователь пишет из Telegram в быстрый режим: отвечай сжато, без markdown-таблиц, без блоков run-terminal. Если для ответа нужно что-то выполнить на сервере — скажи отправить задачу без «?» и агент сделает.',
+        '\nПользователь пишет из Telegram в быстрый режим: отвечай сжато, без markdown-таблиц, без блоков run-terminal. Если для ответа нужно что-то выполнить на сервере — скажи отправить задачу без «?» и агент сделает.' +
+        '\nВ ЭТОМ режиме у тебя НЕТ доступа к файлам и инструментам: НИКОГДА не утверждай, что создал, подготовил, прикрепил или отправил файл — это ложь. Если просят файл — скажи отправить задачу без «?».',
     },
   ]
   for (const m of history.reverse()) {
@@ -620,6 +629,20 @@ export async function POST(req: NextRequest) {
         ? '📂 Твои чаты (они же на сайте в аккаунте). Нажми — выберу его для переписки:'
         : 'Пока нет чатов — нажми «🆕 Создать чат».',
       kb,
+    )
+    return NextResponse.json({ ok: true })
+  }
+
+  // ---- T21 (owner request 2026-10-18): no talking to the AI agent until a
+  // chat is explicitly created (🆕) or picked (📂). Covers BOTH the default
+  // agent path below and the fast "?" chat — both write history into a
+  // conversation, and history needs a chosen chat. /-commands, "!cmd" and
+  // the two typed menu commands above stay available — they ARE the picker.
+  if (!entry.chatPicked) {
+    await tgSend(
+      chatId,
+      '🚫 Сначала открой чат: нажми «🆕 Создать чат» или «📂 Чаты» и выбери существующий.\nБез выбранного чата агент не примет задачу — истории некуда сохраняться.',
+      replyKeyboard(),
     )
     return NextResponse.json({ ok: true })
   }

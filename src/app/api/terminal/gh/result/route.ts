@@ -100,6 +100,18 @@ export async function POST(req: NextRequest) {
       const parsed = parseAiAnswer(output)
       visibleText = parsed.text
       wanted = parsed.files.length > 0 ? parsed.files : parsed.tagged ? [] : null
+      // T21a truth guard (site side): if the agent named files in its answer
+      // but they never arrived in the payload, say so honestly instead of
+      // letting a "файл создал и отправил" claim stand without an attachment.
+      if (wanted && wanted.length > 0) {
+        const delivered = new Set(saved.map((s) => (s.path.split('/').pop() || '').toLowerCase()))
+        const missing = wanted.filter((w) => {
+          const base = (String(w).replace(/^\.\//, '').split('/').pop() || '').toLowerCase()
+          return base && !delivered.has(base)
+        })
+        if (missing.length > 0)
+          visibleText += `\n\n⚠️ Файл(ы), названные агентом, НЕ доставлены: ${missing.join(', ')}. Агент не создал их или они больше лимита 3 МБ — попроси повторить задачу.`
+      }
     }
     const chosenTg = wanted ? tgFiles.filter((f) => fileWants(wanted as string[], f.name)) : tgFiles
     const chosenSaved = wanted ? saved.filter((s) => fileWants(wanted as string[], s.path)) : saved
@@ -192,7 +204,14 @@ export async function POST(req: NextRequest) {
     const conv = await db.conversation.findUnique({ where: { id: cmd.conversationId } })
     if (conv) {
       let visibleText = output
-      if (isAgent) visibleText = parseAiAnswer(output).text
+      if (isAgent) {
+        const p = parseAiAnswer(output)
+        visibleText = p.text
+        // T21a: the agent promised files but the payload carries NONE — the
+        // user must not keep a phantom "файл отправлен" belief.
+        if (p.files.length > 0)
+          visibleText += `\n\n⚠️ Агент назвал файл(ы): ${p.files.join(', ')}, но они НЕ были созданы/доставлены.`
+      }
       const content = isAgent
         ? status === 'done'
           ? `🤖 ${(visibleText || '(агент не вернул текст ответа)').slice(0, 6000)}`
