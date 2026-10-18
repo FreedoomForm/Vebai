@@ -15,10 +15,11 @@ export async function GET(req: NextRequest) {
   if (unauthorized) return unauthorized
 
   const take = Math.min(Number(new URL(req.url).searchParams.get('limit') || 40), 100)
+  const convIds = user
+    ? (await db.conversation.findMany({ where: { userId: user.id }, select: { id: true } })).map((c) => c.id)
+    : []
   const files = await db.terminalFile.findMany({
-    where: user
-      ? { conversation: { userId: user.id } }
-      : {},
+    where: { conversationId: { in: convIds } },
     orderBy: { updatedAt: 'desc' },
     take,
     select: {
