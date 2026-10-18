@@ -554,6 +554,7 @@ export function AgentApp() {
   const selectConversation = useCallback(
     (id: string) => {
       if (sendingRef.current) return
+      stickToBottomRef.current = true
       setActiveId(id)
       activeIdRef.current = id
       setMessages([])
@@ -567,6 +568,7 @@ export function AgentApp() {
 
   const newChat = useCallback(() => {
     if (sendingRef.current) return
+    stickToBottomRef.current = true
     setActiveId(null)
     activeIdRef.current = null
     setMessages([])
@@ -623,8 +625,14 @@ export function AgentApp() {
 
   useEffect(() => {
     const el = scrollRef.current
-    if (!el || !stickToBottomRef.current) return
-    el.scrollTop = el.scrollHeight
+    if (!el) return
+    if (messages.length === 0 && !stream && !sending) {
+      // hero / empty state — start at the top, otherwise the heading gets
+      // pushed above the fold (T17 visual check)
+      el.scrollTop = 0
+      return
+    }
+    if (stickToBottomRef.current) el.scrollTop = el.scrollHeight
   }, [messages, stream, sending])
 
   const onScroll = useCallback(() => {
