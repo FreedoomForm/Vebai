@@ -39,10 +39,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'нет initData — открой приложение из Telegram' }, { status: 400 })
 
   // ---- official Telegram WebApp initData validation
+  // Verified against the official test vector (Bot API 8.0+ initData that
+  // contains the `signature` field): the HMAC data-check-string includes ALL
+  // received fields EXCEPT `hash` — the `signature` field STAYS IN. Deleting
+  // it here made every real client fail with "подпись Telegram недействительна"
+  // (synthetic tests passed only because they never sent a signature).
   const params = new URLSearchParams(initData)
   const hash = params.get('hash') || ''
   params.delete('hash')
-  params.delete('signature')
   const dataCheckString = [...params.entries()]
     .map(([k, v]) => `${k}=${v}`)
     .sort()
