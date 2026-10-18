@@ -530,10 +530,10 @@ export async function POST(req: NextRequest) {
   if (text.startsWith('?')) {
     const q = text.slice(1).trim()
     if (!q) {
-      await tgSend(chatId, 'Напиши вопрос после знака «?». А обычные задачи (без «?») уходят агенту на GitHub Actions.')
+      await tgSend(chatId, 'Напиши вопрос после знака «?». А обычные задачи (без «?») уходят агенту на GitHub Actions.', replyKeyboard())
       return NextResponse.json({ ok: true })
     }
-    await tgSend(chatId, await chatAnswer(convId, q))
+    await tgSend(chatId, await chatAnswer(convId, q), replyKeyboard())
     return NextResponse.json({ ok: true })
   }
 
@@ -544,12 +544,13 @@ export async function POST(req: NextRequest) {
       await tgSend(
         chatId,
         '❗ Прямые shell-команды доступны только владельцу.\nПросто опиши задачу обычным сообщением — агент сам выполнит всё, что нужно.',
+        replyKeyboard(),
       )
       return NextResponse.json({ ok: true })
     }
     const command = text.slice(1).trim()
     if (!command) {
-      await tgSend(chatId, 'Напиши команду после «!», например: !uptime')
+      await tgSend(chatId, 'Напиши команду после «!», например: !uptime', replyKeyboard())
       return NextResponse.json({ ok: true })
     }
     await db.message.create({
@@ -565,7 +566,7 @@ export async function POST(req: NextRequest) {
         payload: JSON.stringify({ command: command.slice(0, 20_000), terminalId: convId, timeoutS: 240 }),
       },
     })
-    await tgSend(chatId, '⌨️ Команда ушла на GitHub Actions (Ubuntu) — пришлю вывод и файлы.')
+    await tgSend(chatId, '⌨️ Команда ушла на GitHub Actions (Ubuntu) — пришлю вывод и файлы.', replyKeyboard())
     return NextResponse.json({ ok: true })
   }
 
@@ -576,7 +577,7 @@ export async function POST(req: NextRequest) {
       where: { conversationId: convId, type: 'terminal', status: { in: ['queued', 'running'] } },
     })
     if (active >= GUEST_MAX_ACTIVE) {
-      await tgSend(chatId, '⏳ Агент ещё занят твоей прошлой задачей. Дождись результата и присылай следующую.')
+      await tgSend(chatId, '⏳ Агент ещё занят твоей прошлой задачей. Дождись результата и присылай следующую.', replyKeyboard())
       return NextResponse.json({ ok: true })
     }
     const dayStart = new Date()
@@ -585,7 +586,7 @@ export async function POST(req: NextRequest) {
       where: { conversationId: convId, type: 'terminal', createdAt: { gte: dayStart } },
     })
     if (today >= GUEST_DAILY_LIMIT) {
-      await tgSend(chatId, `📅 Дневной лимит задач исчерпан (${GUEST_DAILY_LIMIT}/день). Лимит обновится в 00:00 UTC.`)
+      await tgSend(chatId, `📅 Дневной лимит задач исчерпан (${GUEST_DAILY_LIMIT}/день). Лимит обновится в 00:00 UTC.`, replyKeyboard())
       return NextResponse.json({ ok: true })
     }
   }
@@ -609,6 +610,7 @@ export async function POST(req: NextRequest) {
   await tgSend(
     chatId,
     '🤖 Задачу принял агент на GitHub Actions (Ubuntu). Работаю молча: в конце пришлю только готовый результат и нужные файлы.',
+    replyKeyboard(),
   )
   return NextResponse.json({ ok: true })
 }
