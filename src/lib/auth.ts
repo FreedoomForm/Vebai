@@ -123,20 +123,34 @@ export async function requireAuth(req: Request): Promise<AuthResult> {
   return { user, unauthorized: null }
 }
 
+// Telegram opens mini apps inside an iframe on Telegram Web (top-level site
+// is telegram.org) and in webviews elsewhere: a SameSite=Lax cookie is not
+// sent in the cross-site iframe context, so the session would silently die
+// right after the mini-app auto-login. SameSite=None (Secure is mandatory
+// for it; production runs on HTTPS) keeps the session alive there. Dev keeps
+// Lax because SameSite=None is rejected on http://localhost.
+function cookieSameSite(): string {
+  return process.env.NODE_ENV === 'production' ? 'SameSite=None; Secure' : 'SameSite=Lax'
+}
+
 export function sessionCookieHeader(token: string): string {
   const parts = [
     `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Lax',
+    cookieSameSite(),
     `Max-Age=${SESSION_TTL_SEC}`,
   ]
-  if (process.env.NODE_ENV === 'production') parts.push('Secure')
   return parts.join('; ')
 }
 
 export function clearSessionCookieHeader(): string {
-  const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0']
-  if (process.env.NODE_ENV === 'production') parts.push('Secure')
+  const parts = [
+    `${SESSION_COOKIE}=`,
+    'Path=/',
+    'HttpOnly',
+    cookieSameSite(),
+    'Max-Age=0',
+  ]
   return parts.join('; ')
 }
