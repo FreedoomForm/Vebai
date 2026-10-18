@@ -82,6 +82,21 @@ export function AgentApp() {
   const [activityOpen, setActivityOpen] = useState(false)
   const [tgLinkBusy, setTgLinkBusy] = useState(false)
   const [tgLinkNote, setTgLinkNote] = useState('')
+  // live "thinking for Ns" ticker: the deep-thinking model can stay silent for
+  // 1-2 minutes (owner feedback 2026-10-18: "не работает" — это долгая фаза
+  // размышлений без видимого прогресса), so show elapsed seconds
+  const [thinkingSince, setThinkingSince] = useState<number | null>(null)
+  const [thinkSec, setThinkSec] = useState<number | null>(null)
+  useEffect(() => {
+    if (thinkingSince === null) {
+      setThinkSec(null)
+      return
+    }
+    const t0 = thinkingSince
+    setThinkSec(0)
+    const timer = setInterval(() => setThinkSec(Math.round((Date.now() - t0) / 1000)), 1000)
+    return () => clearInterval(timer)
+  }, [thinkingSince])
 
   // composer / selector state (persisted)
   const [model, setModel] = useState<string>('glm-4.7-flash')
@@ -208,6 +223,7 @@ export function AgentApp() {
         break
       }
       case 'delta': {
+        setThinkingSince(null)
         setStream((s) => ({ text: (s?.text || '') + evt.text, tools: s?.tools || [], note: s?.note }))
         break
       }
@@ -245,6 +261,7 @@ export function AgentApp() {
       case 'message': {
         setMessages((prev) => [...prev, evt.message])
         setStream(null)
+        setThinkingSince(null)
         // the persisted turn record replaces the live error bubble
         setErrorMsg(null)
         break
@@ -270,6 +287,7 @@ export function AgentApp() {
       case 'done': {
         sendingRef.current = false
         setSending(false)
+        setThinkingSince(null)
         setStream((s) => (s && s.text.trim() ? s : null))
         if (!startSeenRef.current) {
           // the server never persisted this message — drop the optimistic bubble
@@ -449,6 +467,7 @@ export function AgentApp() {
               if (!thinkingNoted) {
                 thinkingNoted = true
                 onEvent({ type: 'notice', text: 'Модель размышляет…' })
+                setThinkingSince(Date.now())
               }
             } else if (evt.type === 'delta') {
               answer += evt.text || ''
@@ -979,7 +998,10 @@ export function AgentApp() {
                     {stream.note && !stream.text.trim() && (
                       <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
                         <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />
-                        <span className="text-[13px] text-amber-800">{stream.note}</span>
+                        <span className="text-[13px] text-amber-800">
+                          {stream.note}
+                          {thinkSec !== null && stream.note.includes('размышляет') ? ` ${thinkSec}с` : ''}
+                        </span>
                       </div>
                     )}
                     {stream.text.trim() && (
