@@ -33,3 +33,4 @@ prisma/*.db
 .pgembed/
 .env*
 public/zz-captcha-bench.html
+__pycache__/
