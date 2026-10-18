@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
@@ -12,6 +12,20 @@ const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
+
+/**
+ * `interactive-widget=resizes-content` (Chrome Android 108+): the layout
+ * viewport shrinks when the on-screen keyboard opens, so h-dvh app shells
+ * keep the docked composer above the keyboard. iOS Safari ignores it —
+ * useKeyboardSafeHeight() pins the shell to visualViewport.height there.
+ */
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  viewportFit: "cover",
+  interactiveWidget: "resizes-content",
+};
 
 export const metadata: Metadata = {
   title: "Нейро-Архитектор — ИИ-агент 24/7",

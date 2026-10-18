@@ -13,7 +13,7 @@ const HISTORY_LIMIT = 40
  * back to the browser, which then streams the answer from OUR server
  * (POST /api/chat/stream → official Z.ai API, site owner's key).
  *
- * Body: { conversationId?, content }
+ * Body: { conversationId?, content, retry? }
  * -> { conversationId, userMessage, history, title? }
  */
 export async function POST(req: NextRequest) {
@@ -23,10 +23,12 @@ export async function POST(req: NextRequest) {
 
   let conversationId = ''
   let content = ''
+  let retry = false
   try {
-    const body = (await req.json()) as { conversationId?: string; content?: string }
+    const body = (await req.json()) as { conversationId?: string; content?: string; retry?: boolean }
     conversationId = String(body.conversationId || '')
     content = String(body.content || '').trim()
+    retry = Boolean(body.retry)
   } catch {
     return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 })
   }
@@ -47,6 +49,34 @@ export async function POST(req: NextRequest) {
     const conv = await db.conversation.create({ data: { userId: user.id } })
     convId = conv.id
   }
+
+  // ---- retry dedupe (T17): a failed turn already stored this exact user
+  // message — reuse it instead of saving an identical copy on "Повторить"
+  if (retry) {
+    const lastUser = await db.message.findFirst({
+      where: { conversationId: convId, role: 'user' },
+      orderBy: { createdAt: 'desc' },
+    })
+    if (lastUser && (lastUser.content || '').trim() === content) {
+      await db.conversation.update({ where: { id: convId }, data: { updatedAt: new Date() } })
+      const history = await db.message.findMany({
+        where: { conversationId: convId },
+        orderBy: { createdAt: 'asc' },
+      })
+      const plain: ChatMessage[] = []
+      for (const m of history.slice(-HISTORY_LIMIT)) {
+        const c = (m.content || '').trim()
+        if (!c) continue
+        if (m.role === 'user' || m.role === 'assistant') plain.push({ role: m.role, content: c })
+      }
+      return NextResponse.json({
+        conversationId: convId,
+        userMessage: messageToDTO(lastUser),
+        history: plain,
+      })
+    }
+  }
+
   const userMsg = await db.message.create({
     data: { conversationId: convId, role: 'user', kind: 'text', content },
   })

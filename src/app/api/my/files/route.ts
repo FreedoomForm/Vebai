@@ -14,12 +14,29 @@ export async function GET(req: NextRequest) {
   const { user, unauthorized } = await requireAuth(req)
   if (unauthorized) return unauthorized
 
-  const take = Math.min(Number(new URL(req.url).searchParams.get('limit') || 40), 100)
-  const convIds = user
-    ? (await db.conversation.findMany({ where: { userId: user.id }, select: { id: true } })).map((c) => c.id)
-    : []
+  const params = new URL(req.url).searchParams
+  const take = Math.min(Number(params.get('limit') || 40), 100)
+  // T17: optional per-chat view — the agent panel lists only the files of the
+  // conversation it is opened for (ownership verified against the session user)
+  const conversationId = params.get('conversationId')
+  const uid = user?.id || ''
+  let whereConversation: { conversationId: { in: string[] } | string }
+  if (conversationId) {
+    const owned = uid
+      ? await db.conversation.findFirst({
+          where: { id: conversationId, userId: uid },
+          select: { id: true },
+        })
+      : null
+    whereConversation = { conversationId: owned ? conversationId : '__none__' }
+  } else {
+    const convIds = uid
+      ? (await db.conversation.findMany({ where: { userId: uid }, select: { id: true } })).map((c) => c.id)
+      : []
+    whereConversation = { conversationId: { in: convIds } }
+  }
   const files = await db.terminalFile.findMany({
-    where: { conversationId: { in: convIds } },
+    where: whereConversation,
     orderBy: { updatedAt: 'desc' },
     take,
     select: {

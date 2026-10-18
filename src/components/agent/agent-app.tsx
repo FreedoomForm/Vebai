@@ -6,9 +6,11 @@ import {
   Loader2, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { plural } from '@/lib/plural'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { useAgentSocket, type AgentStatePayload } from '@/hooks/use-agent-socket'
+import { useKeyboardSafeHeight } from '@/hooks/use-keyboard-safe-height'
 import { MessageItem } from './message-item'
 import { ActivityPanel } from './activity-panel'
 import { Composer, type Effort, type SendOptions } from './composer'
@@ -90,6 +92,8 @@ export function AgentApp() {
   const [modelOpen, setModelOpen] = useState(false)
 
   const sendingRef = useRef(false)
+  // mobile keyboard: keep the docked composer visible (iOS Safari path)
+  useKeyboardSafeHeight()
   const activeIdRef = useRef<string | null>(null)
   activeIdRef.current = activeId
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -367,7 +371,9 @@ export function AgentApp() {
         const res = await fetch('/api/chat/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ conversationId, content }),
+          // retry (resume) — the failed attempt already persisted this exact
+          // user message; the server then dedupes instead of storing a copy
+          body: JSON.stringify({ conversationId, content, retry: resume }),
         })
         const data = (await res.json().catch(() => ({}))) as {
           error?: string
@@ -813,7 +819,10 @@ export function AgentApp() {
   )
 
   const heroBlock = (
-    <div className="mx-auto flex h-full max-w-3xl flex-col items-center justify-center gap-7 px-4 py-10 text-center">
+    // min-h-full (not h-full): on phones the hero content is taller than the
+    // viewport — with h-full + justify-center flexbox clipped the top and the
+    // area was unscrollable, cutting off the heading
+    <div className="mx-auto flex min-h-full max-w-3xl flex-col items-center justify-center gap-7 px-4 py-10 text-center">
       <div className="space-y-3">
         <h2 className="font-display text-4xl text-stone-900 sm:text-5xl">
           Что мне построить для тебя?
@@ -871,7 +880,10 @@ export function AgentApp() {
   )
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-white">
+    <div
+      className="flex h-dvh overflow-hidden bg-white"
+      style={{ height: 'var(--app-height, 100dvh)' }}
+    >
       {/* desktop sidebar */}
       <aside className="hidden md:flex w-64 shrink-0 border-r border-stone-200">
         {sidebar}
@@ -910,7 +922,8 @@ export function AgentApp() {
             {worker.activeTasks > 0 && (
               <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
                 <Loader2 className="h-3 w-3 animate-spin" />
-                {worker.activeTasks} фоновых задач
+                {worker.activeTasks}{' '}
+                {plural(worker.activeTasks, 'фоновая задача', 'фоновые задачи', 'фоновых задач')}
               </span>
             )}
             <Button
@@ -987,7 +1000,8 @@ export function AgentApp() {
                           size="sm"
                           onClick={() => {
                             const c = lastSentRef.current?.content
-                            if (c) handleSend(c)
+                            // resume: no second optimistic bubble + server-side dedupe
+                            if (c) handleSend(c, { resume: true })
                           }}
                           className="h-7 gap-1.5 rounded-lg bg-red-600 px-2.5 text-[12px] text-white hover:bg-red-700"
                         >
@@ -1040,7 +1054,7 @@ export function AgentApp() {
               video={video}
               onVideoToggle={toggleVideo}
             />
-            <p className="mt-2 text-center text-[11px] text-stone-400">
+            <p className="mt-2 hidden text-center text-[11px] text-stone-400 sm:block">
               Enter — отправить · Shift+Enter — новая строка · агент работает 24/7, результаты придут в чат
             </p>
           </div>
@@ -1050,7 +1064,7 @@ export function AgentApp() {
       {/* desktop activity panel */}
       <aside className="hidden lg:flex w-80 shrink-0 border-l border-stone-200">
         <div className="w-full">
-          <ActivityPanel tasks={tasks} worker={worker} />
+          <ActivityPanel tasks={tasks} worker={worker} conversationId={activeId} />
         </div>
       </aside>
 
@@ -1060,7 +1074,7 @@ export function AgentApp() {
           <SheetHeader className="sr-only">
             <SheetTitle>Активность агента</SheetTitle>
           </SheetHeader>
-          <ActivityPanel tasks={tasks} worker={worker} />
+          <ActivityPanel tasks={tasks} worker={worker} conversationId={activeId} />
         </SheetContent>
       </Sheet>
     </div>

@@ -5,6 +5,7 @@ import {
   ImageIcon, Film, Loader2, CheckCircle2, XCircle, Clock3, Activity, FileText, Download,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { plural } from '@/lib/plural'
 import type { AgentTaskDTO } from '@/lib/agent/types'
 
 interface MyFile {
@@ -16,35 +17,49 @@ interface MyFile {
   url: string
 }
 
-/** Files produced by this user's tasks (Telegram bot + site agent). Fetched
- * from /api/my/files (cookie-auth scoped to the session user). */
-function MyFiles() {
+/** Files produced in THIS conversation (site agent + linked Telegram bot).
+ * Fetched from /api/my/files?conversationId=… (cookie-auth scoped to the
+ * session user). T17: the panel shows the current chat's files only, not
+ * every file of every session. */
+function ChatFiles({
+  conversationId,
+  taskSig = '',
+}: {
+  conversationId: string | null
+  /** changes whenever a task in this chat changes state -> refetch files */
+  taskSig?: string
+}) {
   const [files, setFiles] = useState<MyFile[] | null>(null)
   useEffect(() => {
     let alive = true
-    fetch('/api/my/files?limit=30')
-      .then((r) => (r.ok ? r.json() : { files: [] }))
-      .then((j: { files?: MyFile[] }) => {
-        if (alive) setFiles(j.files || [])
-      })
-      .catch(() => alive && setFiles([]))
-    const t = setInterval(() => {
-      fetch('/api/my/files?limit=30')
+    // NOTE: no setState here — chat switches remount this component via its
+    // `key` in ActivityPanel, which resets to the null (hidden) state safely
+    const load = () => {
+      const q = conversationId
+        ? `?limit=30&conversationId=${encodeURIComponent(conversationId)}`
+        : ''
+      fetch(`/api/my/files${q}`)
         .then((r) => (r.ok ? r.json() : { files: [] }))
-        .then((j: { files?: MyFile[] }) => alive && setFiles(j.files || []))
-        .catch(() => null)
-    }, 30000)
+        .then((j: { files?: MyFile[] }) => {
+          if (alive) setFiles(j.files || [])
+        })
+        .catch(() => alive && setFiles([]))
+    }
+    load()
+    const t = setInterval(load, 30000)
     return () => { alive = false; clearInterval(t) }
-  }, [])
+  }, [conversationId, taskSig])
   if (files === null) return null
   return (
     <div className="border-t border-stone-200 pt-2 mt-2 px-1">
       <p className="flex items-center gap-1.5 px-1 py-1 text-[11px] font-semibold uppercase tracking-wide text-stone-500">
-        <FileText className="h-3.5 w-3.5" /> Мои файлы ({files.length})
+        <FileText className="h-3.5 w-3.5" /> Файлы чата ({files.length})
       </p>
       {files.length === 0 ? (
-        <p className="px-1 pb-1 text-[11px] text-stone-400">
-          Файлы из задач в Telegram и на сайте появятся здесь — можно скачать в любой момент.
+        <p className="px-1 pb-1 text-[11px] leading-snug text-stone-400">
+          {conversationId
+            ? 'Файлы из этого чата появятся здесь — можно скачать в любой момент.'
+            : 'Начни чат — файлы этой сессии появятся здесь.'}
         </p>
       ) : (
         <div className="space-y-1">
@@ -143,30 +158,30 @@ function TaskCard({ task }: { task: AgentTaskDTO }) {
 export function ActivityPanel({
   tasks,
   worker,
+  conversationId = null,
 }: {
   tasks: AgentTaskDTO[]
   worker: { activeTasks: number; queued: number; running: number }
+  /** current chat id — the files section lists only this chat's files */
+  conversationId?: string | null
 }) {
   const sorted = [...tasks].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   )
+  // refetch the file list whenever a task changes state (e.g. completes and
+  // saves new files into this conversation)
+  const taskSig = tasks.map((t) => `${t.id}:${t.status}`).join(',')
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-stone-200 px-4 py-3.5">
+      <div className="flex items-center gap-2 border-b border-stone-200 px-4 py-3.5 pr-12">
         <Activity className="h-4 w-4 text-emerald-600" />
         <h2 className="text-sm font-semibold text-stone-800">Активность агента</h2>
-        <span className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
-          <span className="relative flex h-1.5 w-1.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-60" />
-            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
-          </span>
-          24/7
-        </span>
       </div>
       <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
         {worker.activeTasks > 0 && (
           <p className="px-1 pb-1 text-xs text-stone-500">
-            Агент сейчас выполняет {worker.activeTasks} задач(у) в фоне — можешь закрыть браузер, всё продолжит работать.
+            Агент сейчас выполняет {worker.activeTasks}{' '}
+            {plural(worker.activeTasks, 'задачу', 'задачи', 'задач')} в фоне — можешь закрыть браузер, всё продолжит работать.
           </p>
         )}
         {sorted.length === 0 ? (
@@ -182,7 +197,7 @@ export function ActivityPanel({
         ) : (
           sorted.map((t) => <TaskCard key={t.id} task={t} />)
         )}
-        <MyFiles />
+        <ChatFiles key={conversationId || 'none'} conversationId={conversationId} taskSig={taskSig} />
       </div>
     </div>
   )
