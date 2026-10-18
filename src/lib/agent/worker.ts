@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { syncStudio, prepFrameData } from '@/lib/studio'
 import { imageArtifactData, messageToDTO, taskToDTO } from './tools'
-import { ghDispatch, ghTerminalSession } from '@/lib/terminal/gh-executor'
+import { ghDispatch, ghTerminalSession, mostAliveGhSession } from '@/lib/terminal/gh-executor'
 
 /** Prisma Bytes (Uint8Array<ArrayBuffer>) from a Node Buffer */
 function toBytes(b: Buffer): Uint8Array<ArrayBuffer> {
@@ -385,10 +385,10 @@ async function startTerminalTask(taskId: string) {
  * GitHub cold-starts. */
 async function ghResidentKeepalive() {
   try {
-    const session = await db.terminalSession.findFirst({
-      where: { kind: 'gh', status: 'active' },
-      orderBy: { createdAt: 'desc' },
-    })
+    // watch the session a live runner is attached to (freshest heartbeat);
+    // createdAt ordering would let a synthetic E2E session with no heartbeat
+    // masquerade as "stale" and trigger useless redispatches forever
+    const session = await mostAliveGhSession()
     if (!session) return
     const staleMs = 12 * 60_000
     if (session.lastSeenAt && Date.now() - session.lastSeenAt.getTime() < staleMs) return

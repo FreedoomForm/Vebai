@@ -37,13 +37,27 @@ export async function ghDispatch(sessionId: string, cmdId?: string): Promise<boo
   }
 }
 
+/** the session a LIVE runner is actually attached to: freshest heartbeat
+ * first, sessions that never heartbeated (synthetic E2E rows, brand-new)
+ * last. Ordering by createdAt alone is unsafe — an E2E once left an active
+ * gh session with lastSeenAt = null and every new task got queued into that
+ * dead session while the resident kept polling the real one (outage
+ * 2026-10-18, "бот не работает"). */
+export async function mostAliveGhSession() {
+  const { db } = await import('@/lib/db')
+  return db.terminalSession.findFirst({
+    where: { kind: 'gh', status: 'active' },
+    orderBy: [
+      { lastSeenAt: { sort: 'desc', nulls: 'last' } },
+      { createdAt: 'desc' },
+    ],
+  })
+}
+
 /** find (or lazily create) the shared headless TerminalSession */
 export async function ghTerminalSession() {
   const { db } = await import('@/lib/db')
-  const existing = await db.terminalSession.findFirst({
-    where: { kind: 'gh', status: 'active' },
-    orderBy: { createdAt: 'desc' },
-  })
+  const existing = await mostAliveGhSession()
   if (existing) return existing
   return db.terminalSession.create({
     data: {
