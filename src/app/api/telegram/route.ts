@@ -108,15 +108,16 @@ const appButton = () => ({
   inline_keyboard: [[{ text: '🌐 Открыть Vebai (аккаунт)', web_app: { url: MINI_APP_URL } }]],
 })
 
-/** persistent bottom keyboard: «Создать чат» и «Список чатов» (owner request
- * 2026-10-18) */
+/** inline menu attached to every bot message: «Создать чат» и «Чаты» живут
+ * ВНУТРИ чата под сообщениями (owner request 2026-10-18: кнопки в чате, не
+ * внизу экрана). Pressing them clears the bot window down to the last /start. */
 const replyKeyboard = () => ({
-  keyboard: [
-    [{ text: '🆕 Создать чат' }],
-    [{ text: '📂 Список чатов' }],
+  inline_keyboard: [
+    [
+      { text: '🆕 Создать чат', callback_data: 'newchat' },
+      { text: '📂 Чаты', callback_data: 'chatlist' },
+    ],
   ],
-  resize_keyboard: true,
-  input_field_placeholder: 'Опиши задачу для агента…',
 })
 
 async function patchUserEntry(chatId: string, patch: Partial<TgUserEntry>): Promise<void> {
@@ -270,14 +271,31 @@ async function connectAccount(
 }
 
 /** inline button presses: open a chat from the list / create a chat */
-async function handleCallback(cb: { id?: string; data?: string; from?: { id?: number; username?: string; first_name?: string } }): Promise<void> {
+async function handleCallback(cb: { id?: string; data?: string; from?: { id?: number; username?: string; first_name?: string }; message?: { message_id?: number } }): Promise<void> {
   if (!cb.id || !cb.data || !cb.from?.id) return
   const chatId = String(cb.from.id)
   const entry = await ensureUserConv(chatId, { first_name: cb.from.first_name, username: cb.from.username })
   const data = cb.data
+  // the message carrying the pressed buttons anchors the window cleaner:
+  // everything between the last /start and this message gets wiped
+  const carrierMsgId = cb.message?.message_id || 0
   if (data === 'newchat') {
     await answerCallback(cb.id, 'Создаю новый чат…')
-    await createChat(chatId, entry, 0)
+    await createChat(chatId, entry, carrierMsgId)
+    return
+  }
+  if (data === 'chatlist') {
+    await answerCallback(cb.id, 'Открываю чаты…')
+    await clearBotWindow(chatId, carrierMsgId, entry.lastStartMsgId)
+    const kb = await chatListKeyboard(entry.userId)
+    const count = await db.conversation.count({ where: { userId: entry.userId } })
+    await tgSend(
+      chatId,
+      count
+        ? '📂 Твои чаты (они же на сайте в аккаунте). Нажми — выберу его для переписки:'
+        : 'Пока нет чатов — нажми «🆕 Создать чат» под этим сообщением.',
+      kb,
+    )
     return
   }
   if (data.startsWith('conv:')) {
@@ -421,6 +439,7 @@ export async function POST(req: NextRequest) {
       id?: string
       data?: string
       from?: { id?: number; username?: string; first_name?: string }
+      message?: { message_id?: number }
     }
   } | null
   if (!update?.update_id) return NextResponse.json({ ok: true })
@@ -487,7 +506,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true })
     }
     if (isOwner) {
-      await tgSend(chatId, 'Уже привязано 👌 Просто пиши задачу. Кнопки внизу — чаты.', replyKeyboard())
+      await tgSend(chatId, 'Уже привязано 👌 Просто пиши задачу. Кнопки — под этим сообщением.', replyKeyboard())
     } else {
       await tgSend(
         chatId,
@@ -495,17 +514,18 @@ export async function POST(req: NextRequest) {
           '🤖 обычный текст — задача агенту (создаёт файлы, доводит до конца; ты увидишь только готовый результат)\n' +
           '❓ «?текст» — быстрый вопрос без запуска задач\n' +
           '• /app — аккаунт на сайте: вся история задач и файлов',
-        { ...appButton(), ...replyKeyboard() },
+        { inline_keyboard: [...appButton().inline_keyboard, ...replyKeyboard().inline_keyboard] },
       )
     }
     return NextResponse.json({ ok: true })
   }
   if (/^\/app/i.test(text)) {
-    await tgSend(chatId, 'Открывай аккаунт — история задач и файлов синхронизирована с сайтом:', { ...appButton(), ...replyKeyboard() })
+    await tgSend(chatId, 'Открывай аккаунт — история задач и файлов синхронизирована с сайтом:', { inline_keyboard: [...appButton().inline_keyboard, ...replyKeyboard().inline_keyboard] })
     return NextResponse.json({ ok: true })
   }
 
-  // ---- bottom-keyboard buttons: create a chat / open the chat list
+  // ---- typed text equivalents of the inline menu buttons: create a chat /
+  // open the chat list
   // (both first wipe the bot window down to the last /start — owner request
   // 2026-10-18: "все тексты из истории бота удаляются кроме команды /start")
   if (/^\s*(?:🆕\s*)?создать чат\s*$/i.test(text)) {
