@@ -56,6 +56,24 @@ async function api(path, payload, timeoutMs = 60_000) {
   return data
 }
 
+/** T34: result reports MUST reach the site — a lost report leaves the task
+ * claimed ('running') until the site-side stale reaper requeues it (up to a
+ * 10-minute stall, and the reaper itself starves when the tick pinger is
+ * down). Retry a few times before giving up. */
+async function apiRetry(path, payload, timeoutMs = 60_000, attempts = 3) {
+  let lastErr
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await api(path, payload, timeoutMs)
+    } catch (e) {
+      lastErr = e
+      log(`api ${path} attempt ${i + 1}/${attempts} failed:`, (e && e.message) || e)
+      if (i + 1 < attempts) await sleep(5_000)
+    }
+  }
+  throw lastErr
+}
+
 function makeClient(a) {
   const { TelegramClient } = require('telegram')
   const { StringSession } = require('telegram/sessions')
@@ -241,7 +259,7 @@ async function runOutboxJob(t) {
     info.msgId = String(sent && sent.id)
     log(`outbox ${t.id.slice(-6)}: text_len=${t.message.length} to=${info.peerName} ok`)
   }
-  await api('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, info })
+  await apiRetry('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, info })
 }
 
 /* ------------------------------------------------------------ T32 reads */
@@ -314,7 +332,7 @@ async function runReadJob(t) {
   const info = { peerId: String(peer.id), peerName: entityName(peer), count: out.length }
   const chars = out.reduce((a, x) => a + x.text.length, 0)
   log(`read ${t.id.slice(-6)}: chat=${info.peerName} count=${out.length} chars=${chars} search=${t.search ? 'yes' : 'no'}`)
-  await api('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, kind: 'read', info, messages: out }, 120_000)
+  await apiRetry('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, kind: 'read', info, messages: out }, 120_000)
 }
 
 async function pollOutbox(res) {
@@ -327,7 +345,7 @@ async function pollOutbox(res) {
     } catch (e) {
       const msg = String((e && e.message) || e).slice(0, 300)
       log(`outbox ${String(t.id).slice(-6)} failed:`, msg)
-      await api('/api/tg/outbox-result', {
+      await apiRetry('/api/tg/outbox-result', {
         secret: SECRET, id: t.id, ok: false,
         error: msg.includes('контакт не найден') || msg.includes('не личный') || msg.includes('бот')
           ? msg

@@ -142,6 +142,29 @@ def post_result(cmd_id: str, rc: int, since_ts: float, base_dir: str = WS,
     return False
 
 
+TICK_EVERY = 300            # seconds between site tick pings from this shift
+_last_tick = 0.0
+
+
+def ping_tick() -> None:
+    """T34: the resident shift is the only reliably-alive 24/7 component, so it
+    drives the site's /api/agent/tick itself. GitHub schedule crons (the
+    heartbeat workflow) get throttled to multi-hour gaps on this repo, which
+    starved the tick-driven machinery: stale-claim reaper (lost worker reports
+    stuck tasks in 'running' forever), resident keepalive, retries. Best
+    effort: failures are silent, the next window retries."""
+    global _last_tick
+    try:
+        req = urllib.request.Request(SITE + "/api/agent/tick")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+        print("tick pinged", flush=True)
+    except Exception as e:
+        print("tick ping failed:", type(e).__name__, flush=True)
+    finally:
+        _last_tick = time.time()
+
+
 def main() -> int:
     if not SECRET or not SESSION:
         print("missing SECRET/SESSION env")
@@ -152,6 +175,8 @@ def main() -> int:
     done = 0
     print(f"resident shift start: workspace {WS}, shift {SHIFT_SECONDS // 60} min", flush=True)
     while time.time() < deadline:
+        if time.time() - _last_tick >= TICK_EVERY:
+            ping_tick()
         try:
             d = api("/api/terminal/gh/claim",
                     {"secret": SECRET, "session": SESSION, "cmd": specific})
