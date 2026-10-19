@@ -35,7 +35,7 @@ export interface MessageDTO {
 export interface AgentTaskDTO {
   id: string
   conversationId: string
-  type: 'image' | 'video'
+  type: 'image' | 'video' | 'terminal' | 'tg_outbox'
   title: string
   status: 'queued' | 'running' | 'completed' | 'failed'
   progress?: string | null

@@ -9,6 +9,7 @@ import crypto from 'node:crypto'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { decryptSecret, parseExamples } from '@/lib/tguser'
+import { readyOutboxForWorker } from '@/lib/agent/outbox'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -65,5 +66,8 @@ export async function POST(req: Request) {
   // chain (.github/workflows/terminal-executor.yml job 'chain' greps for
   // resident:false before queueing the next shift). Set it conditionally if
   // the resident workers ever need to be stopped from the site side.
-  return NextResponse.json({ accounts: out, now: new Date().toISOString(), resident: true })
+  // T31: also hand out pending tg_outbox jobs (send a message/file FROM the
+  // owner's own account to a requested contact) — claimed atomically.
+  const outbox = await readyOutboxForWorker(5).catch(() => [])
+  return NextResponse.json({ accounts: out, outbox, now: new Date().toISOString(), resident: true })
 }

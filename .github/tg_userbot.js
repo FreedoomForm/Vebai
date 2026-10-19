@@ -7,6 +7,13 @@
  * answers incoming PRIVATE messages: /api/tg/incoming (dedupe + AI reply per
  * the owner's rules) -> sendMessage from the user's own account -> /api/tg/sent.
  *
+ * T31: the same poll also returns `outbox` jobs — the site agent's ```run-tg```
+ * blocks. The worker resolves the requested contact (username / phone / name
+ * via entity cache + dialogs) and sends a message and/or a document (base64
+ * file inlined by the site) FROM the owner's own account, then reports to
+ * /api/tg/outbox-result. Only person-to-person chats: channels/groups/bots
+ * are refused; nothing about message texts is logged (ids and lengths only).
+ *
  * Safety: private chats only, never bots, never first messages, replay guard
  * (msg age < 4 min + per-chat high-water id), 30 s per-chat cooldown, 25
  * replies/hour cap, and NOTHING about message text is ever logged (ids and
@@ -21,6 +28,7 @@ const COOLDOWN_MS = 30_000
 const HOUR_CAP = 25
 
 const clients = new Map() // accountId -> { client, sig }
+const sendOnly = new Map() // accountId -> client (outbox-only, no reply handler)
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -40,12 +48,10 @@ async function api(path, payload, timeoutMs = 60_000) {
   return data
 }
 
-async function connectAccount(a, sig) {
+function makeClient(a) {
   const { TelegramClient } = require('telegram')
   const { StringSession } = require('telegram/sessions')
-  const { NewMessage } = require('telegram/events')
-
-  const client = new TelegramClient(new StringSession(a.session), a.apiId, a.apiHash, {
+  return new TelegramClient(new StringSession(a.session), a.apiId, a.apiHash, {
     connectionRetries: 3,
     // T29: >=2 so PHONE_MIGRATE/server hiccups (handled by GramJS _call via
     // switchDC+resend on the next iteration) don't kill the request outright.
@@ -55,6 +61,12 @@ async function connectAccount(a, sig) {
     deviceModel: 'Vebai Agent',
     systemVersion: 'vebai-six.vercel.app',
   })
+}
+
+async function connectAccount(a, sig) {
+  const { NewMessage } = require('telegram/events')
+
+  const client = makeClient(a)
   await client.connect()
 
   const lastPerChat = new Map() // high-water message id per chat (replay guard)
@@ -106,7 +118,7 @@ async function connectAccount(a, sig) {
   }, new NewMessage({}))
 
   clients.set(a.id, { client, sig })
-  log('listening: account', a.id, '(me:', (a.me && a.me.username) || a.me?.firstName || 'unknown' + ')')
+  log('listening: account', a.id, '(me:', (a.me && (a.me.username || a.me.firstName)) || 'unknown' + ')')
 }
 
 async function pollConfigs() {
@@ -137,6 +149,119 @@ async function pollConfigs() {
     }
   }
   log(`tick: ${accounts.length} active account(s), listening: ${clients.size}`)
+  // T31: drop send-only clients for accounts that disappeared
+  for (const [id, so] of [...sendOnly]) {
+    if (!wanted.has(id)) {
+      try { await so.disconnect() } catch { /* gone */ }
+      sendOnly.delete(id)
+    }
+  }
+  return res
+}
+
+/* ---------------------------------------------------------------- T31 outbox */
+
+/** entity name for logs/reports — never includes message texts */
+function entityName(e) {
+  if (!e) return '?'
+  return [e.firstName, e.lastName, e.username, e.title].filter(Boolean).join(' ').slice(0, 120) || '?'
+}
+
+/** resolve a contact by @username / +phone / display name (entity cache,
+ * then a bounded dialogs scan). Throws with an honest message when not found. */
+async function findPeer(client, q) {
+  const s = String(q || '').trim()
+  if (!s) throw new Error('пустой получатель')
+  const cands = [s]
+  const tme = s.match(/t\.me\/([A-Za-z0-9_]+)/i)
+  if (tme) cands.push('@' + tme[1])
+  if (!s.startsWith('@') && /^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(s)) cands.push('@' + s)
+  for (const c of cands) {
+    try {
+      const e = await client.getEntity(c)
+      if (e) return e
+    } catch { /* try next / dialogs */ }
+  }
+  const norm = s.toLowerCase().replace(/^@/, '')
+  const phoneDigits = s.replace(/\D/g, '')
+  let fuzzy = null
+  for await (const d of client.iterDialogs({ limit: 200 })) {
+    const e = d.entity
+    if (!e) continue
+    const un = String(e.username || '').toLowerCase()
+    const ph = String(e.phone || '').replace(/\D/g, '')
+    const nm = [e.firstName, e.lastName].filter(Boolean).join(' ').toLowerCase()
+    if (un && un === norm) return e
+    if (phoneDigits.length >= 7 && ph && ph === phoneDigits) return e
+    if (nm && nm === norm) return e
+    if (!fuzzy && nm && norm.length >= 3 && (nm.includes(norm) || norm.includes(nm))) fuzzy = e
+  }
+  if (fuzzy) return fuzzy
+  throw new Error('контакт не найден в твоём Telegram (проверь @username, номер или имя)')
+}
+
+/** one outbox job: resolve the peer, send message/document from the owner's
+ * account, report to /api/tg/outbox-result. Only person-to-person chats. */
+async function runOutboxJob(t) {
+  let entry = clients.get(t.accountId)
+  if (!entry) {
+    let so = sendOnly.get(t.accountId)
+    if (!so) {
+      so = makeClient({ session: t.session, apiId: t.apiId, apiHash: t.apiHash })
+      await so.connect()
+      sendOnly.set(t.accountId, so)
+    }
+    entry = { client: so }
+  }
+  const peer = await findPeer(entry.client, t.peer)
+  const cls = peer.className || (peer.constructor && peer.constructor.name) || ''
+  if (cls === 'Channel' || cls === 'Chat') {
+    throw new Error('получатель — канал/группа: разрешены только личные чаты')
+  }
+  if (peer.bot) throw new Error('получатель — бот: отправка ботам отключена')
+
+  const info = {
+    peerId: String(peer.id),
+    peerName: entityName(peer),
+    msgId: null,
+    fileName: t.file ? t.file.name : null,
+  }
+  if (t.file) {
+    const buf = Buffer.from(String(t.file.b64 || ''), 'base64')
+    if (buf.length === 0) throw new Error('файл в задаче пустой')
+    const { CustomFile } = require('telegram/client/uploads')
+    const sent = await entry.client.sendFile(peer.id, {
+      file: new CustomFile(t.file.name, buf.length, '', buf),
+      caption: t.message || undefined,
+      forceDocument: true,
+    })
+    info.msgId = String(sent && sent.id)
+    log(`outbox ${t.id.slice(-6)}: file=${t.file.name} bytes=${buf.length} to=${info.peerName} ok`)
+  } else {
+    const sent = await entry.client.sendMessage(peer.id, { message: t.message, linkPreview: false })
+    info.msgId = String(sent && sent.id)
+    log(`outbox ${t.id.slice(-6)}: text_len=${t.message.length} to=${info.peerName} ok`)
+  }
+  await api('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, info })
+}
+
+async function pollOutbox(res) {
+  const jobs = Array.isArray(res.outbox) ? res.outbox : []
+  if (jobs.length > 0) log(`outbox: ${jobs.length} job(s) picked up`)
+  for (const t of jobs) {
+    try {
+      await runOutboxJob(t)
+    } catch (e) {
+      const msg = String((e && e.message) || e).slice(0, 300)
+      log(`outbox ${String(t.id).slice(-6)} failed:`, msg)
+      await api('/api/tg/outbox-result', {
+        secret: SECRET, id: t.id, ok: false,
+        error: msg.includes('контакт не найден') || msg.includes('не личный') || msg.includes('бот')
+          ? msg
+          : `Telegram: ${msg}`,
+      }, 60_000).catch((e2) => log('report failed:', (e2 && e2.message) || e2))
+    }
+  }
 }
 
 async function main() {
@@ -147,7 +272,8 @@ async function main() {
   log('tg_userbot supervisor started; site:', SITE)
   for (;;) {
     try {
-      await pollConfigs()
+      const res = await pollConfigs()
+      await pollOutbox(res)
     } catch (e) {
       log('poll error:', (e && e.message) || e)
     }

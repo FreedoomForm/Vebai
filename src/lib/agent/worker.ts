@@ -580,6 +580,11 @@ async function tick() {
     })
     for (const t of termRunning) await syncTerminalTask(t.id)
 
+    // T31: telegram outbox (send from the owner's account) — honest failures,
+    // stale retries and file waits are maintained here every tick
+    const { syncOutboxTasks } = await import('./outbox')
+    await syncOutboxTasks()
+
     await ghResidentKeepalive()
   } catch (e) {
     console.error('[agent-worker] tick error:', e instanceof Error ? e.message : e)

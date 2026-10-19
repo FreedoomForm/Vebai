@@ -6,6 +6,7 @@ import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { createAnswerStreamFilter } from '@/lib/agent/answer'
 import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
+import { createOutboxTasks } from '@/lib/agent/outbox'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 300
@@ -439,6 +440,20 @@ export async function POST(req: NextRequest) {
                 controller.enqueue(sse({
                   type: 'notice',
                   text: `🖥 ${nv} команда(ы) в очереди браузерного терминала (/terminal) — вывод придёт, как только вкладка терминала их выполнит`,
+                }))
+              }
+              // T31: ```run-tg``` blocks -> send from the OWNER'S Telegram
+              // account (message/file) to the requested contact
+              const nt = await createOutboxTasks(fullAnswer, conversationId, user.id)
+              if (nt === -1) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: '📤 Задачу отправки через Telegram выполнить нельзя: твой аккаунт Telegram ещё не подключён — подключи его на странице /tgagent и попроси повторить',
+                }))
+              } else if (nt > 0) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: `📤 ${nt} задача(и) на отправку через твой Telegram-аккаунт поставлены в очередь — если указан файл, он уйдёт, как только агент его создаст; отчёт придёт в чат`,
                 }))
               }
             }
