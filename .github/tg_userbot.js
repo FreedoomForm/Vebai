@@ -47,7 +47,9 @@ async function connectAccount(a, sig) {
 
   const client = new TelegramClient(new StringSession(a.session), a.apiId, a.apiHash, {
     connectionRetries: 3,
-    requestRetries: 1,
+    // T29: >=2 so PHONE_MIGRATE/server hiccups (handled by GramJS _call via
+    // switchDC+resend on the next iteration) don't kill the request outright.
+    requestRetries: 3,
     useWSS: true,
     floodSleepThreshold: 2,
     deviceModel: 'Vebai Agent',

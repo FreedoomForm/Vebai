@@ -104,14 +104,33 @@ export async function gramjs() {
 
 export function clientOpts() {
   return {
-    connectionRetries: 1,
-    requestRetries: 1,
+    connectionRetries: 2,
+    // T29: MUST stay >= 2. GramJS _call() handles PHONE_MIGRATE_X /
+    // NETWORK_MIGRATE_X (the number's home DC differs from the connect DC —
+    // e.g. Uzbek accounts live on DC5 while a fresh lambda client connects to
+    // its nearest DC) and ServerError/RPC_CALL_FAIL by switching DC / sleeping
+    // and RE-SENDING the request on the NEXT loop iteration. With
+    // requestRetries=1 there is no next iteration, so login failed with the
+    // useless "Request was unsuccessful 1 time(s)" even though Telegram was
+    // answering normally (reproduced on prod with a +998 number, fixed here).
+    requestRetries: 5,
     useWSS: true,
     autoReconnect: false,
     floodSleepThreshold: 0,
     deviceModel: 'Vebai Agent',
     systemVersion: 'vebai-six.vercel.app',
   }
+}
+
+/** Full MTProto failure into the server logs (Vercel runtime logs): the final
+ *  humanized text loses the underlying RPC details, so keep them here. */
+export function logTgFailure(stage: string, e: unknown): void {
+  const err = e as { constructor?: { name?: string }; message?: string; errorMessage?: string; newDc?: number; code?: number }
+  console.error(
+    `[tguser] ${stage} failed: ${err?.constructor?.name || 'Error'}: ${err?.message || String(e)}` +
+      (err?.errorMessage ? ` | errorMessage=${err.errorMessage}` : '') +
+      (err?.newDc ? ` | newDc=${err.newDc}` : ''),
+  )
 }
 
 /** Human-readable Russian error from a GramJS/MTProto failure (honest errors
@@ -121,6 +140,9 @@ export function tgErrorText(e: unknown): string {
   const flood = raw.match(/FLOOD_WAIT_(\d+)/i)
   if (flood)
     return `Telegram: слишком много попыток входа — подожди ${flood[1]} сек и попробуй снова (FLOOD_WAIT)`
+  const retries = raw.match(/Request was unsuccessful (\d+)/i)
+  if (retries)
+    return `Telegram не ответил после ${retries[1]} попыток (временный сбой сети/сервера) — попробуй ещё раз через минуту`
   const map: [RegExp, string][] = [
     [/PHONE_NUMBER_INVALID/i, 'Telegram отклонил номер: PHONE_NUMBER_INVALID'],
     [/PHONE_NUMBER_UNEXISTED/i, 'Telegram: номер не зарегистрирован (PHONE_NUMBER_UNEXISTED)'],
@@ -178,6 +200,7 @@ export async function mtprotoSendCode(
       apiHashEnc: encryptSecret(creds.apiHash),
     }
   } catch (e) {
+    logTgFailure('sendCode', e)
     throw new TgMtprotoError(tgErrorText(e))
   } finally {
     try { if (client) await client.disconnect() } catch { /* already gone */ }
@@ -231,6 +254,7 @@ export async function mtprotoVerifyCode(args: VerifyCodeArgs): Promise<VerifiedL
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e)
     if (/SESSION_PASSWORD_NEEDED/i.test(raw)) throw new NeedPasswordError()
+    logTgFailure('verifyCode', e)
     throw new TgMtprotoError(tgErrorText(e))
   } finally {
     try { if (client) await client.disconnect() } catch { /* already gone */ }
