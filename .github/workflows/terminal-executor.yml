@@ -62,3 +62,24 @@ jobs:
           AGENT_MAX_STEPS: '0'
           AGENT_BUDGET_MIN: '90'
         run: python3 .github/terminal_executor.py
+
+  # T26: personal telegram agents - parallel resident job. Every 30 s it asks
+  # /api/tg/work which user accounts are connected + switched on, keeps one
+  # GramJS MTProto client per account and answers incoming private messages
+  # from the user's own account per their approved rules.
+  tguser:
+    name: personal telegram agents (userbot listener)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # resident shift backstop (< 6h GitHub job cap)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GramJS (worker dependency)
+        run: npm install --no-save --no-audit --no-fund telegram
+
+      - name: Run userbot supervisor
+        env:
+          SITE: ${{ secrets.VEBAI_SITE_URL }}
+          SECRET: ${{ secrets.GH_TERM_SECRET }}
+        run: node .github/tg_userbot.js

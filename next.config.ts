@@ -2,8 +2,9 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: false,
-  // sharp stays external so Vercel reuses the platform-optimized build
-  serverExternalPackages: ["sharp"],
+  // sharp stays external so Vercel reuses the platform-optimized build;
+  // telegram (GramJS) is external so its node-only transports are not bundled
+  serverExternalPackages: ["sharp", "telegram"],
   async headers() {
     return [
       {

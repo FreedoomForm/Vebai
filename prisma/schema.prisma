@@ -46,6 +46,66 @@ model User {
   telegramUsername String? // @username from telegram (display only)
   createdAt     DateTime       @default(now())
   conversations Conversation[]
+  tgAccounts    TgAccount[]
+}
+
+// ---------------------------------------------------------------------------
+// T26: personal Telegram agents. A user connects HIS OWN Telegram account
+// (phone + code, MTProto user session - NOT the bot), explains the rules in a
+// chat with the site AI, approves reply variants, and the resident worker
+// (GitHub Actions shift) then answers incoming private messages on his behalf.
+model TgAccount {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phone           String
+  apiId           Int // MTProto app id (env-provided or user's own from my.telegram.org)
+  apiHashEnc      String // encrypted api_hash (AES-256-GCM)
+  sessionEnc      String? // encrypted GramJS StringSession (auth keys) - secrets at rest
+  phoneCodeHash   String? // transient login state between /connect and /verify
+  loginSessionEnc String? // encrypted session created during sendCode (must match at signIn)
+  status          String    @default("pending") // pending | 2fa | connected | error
+  statusText      String? // last human-readable status / honest error
+  meInfo          String? // JSON {id, firstName, username, phone}
+  active          Boolean   @default(false) // auto-reply master switch
+  lastCheckAt     DateTime? // last worker poll that included this account
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  config   TgAgentConfig?
+  messages TgAgentMessage[]
+
+  @@unique([userId, phone])
+  @@index([status, active])
+}
+
+// The system prompt + few-shot examples that drive the user's personal agent.
+// Maintained conversationally: the site AI rewrites it from the owner's rules,
+// the owner can edit it by hand, approved test variants become examples.
+model TgAgentConfig {
+  id           String    @id @default(cuid())
+  accountId    String    @unique
+  account      TgAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  systemPrompt String    @default("")
+  examples     String    @default("[]") // JSON [{from, incoming, reply, at}]
+  updatedAt    DateTime  @updatedAt
+}
+
+// Message log (incoming requests + replies actually sent). Dedupe key for
+// the worker is (account, chat, msgId, direction).
+model TgAgentMessage {
+  id        String    @id @default(cuid())
+  accountId String
+  account   TgAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  chatId    String
+  chatName  String?
+  msgId     String
+  direction String // in | out
+  text      String
+  createdAt DateTime  @default(now())
+
+  @@unique([accountId, chatId, msgId, direction])
+  @@index([accountId, createdAt])
 }
 
 // A chat thread with the persistent AI architect (Manus-style agent)

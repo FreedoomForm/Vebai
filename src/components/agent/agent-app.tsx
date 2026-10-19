@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal,
+  Loader2, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal, Send,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { plural } from '@/lib/plural'
@@ -772,6 +772,15 @@ export function AgentApp() {
               {pendingVterm}
             </span>
           )}
+        </a>
+        <a
+          href="/tgagent"
+          target="_blank"
+          rel="noreferrer"
+          className="flex w-full items-center justify-start gap-2 rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-100"
+        >
+          <Send className="h-4 w-4 text-sky-500" />
+          Telegram-агент
         </a>
       </div>
       <div className="mt-3 flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
