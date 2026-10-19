@@ -28,8 +28,9 @@ export async function POST(req: Request) {
   if ('error' in creds) return NextResponse.json({ error: creds.error }, { status: 400 })
 
   const { TelegramClient, StringSession } = await gramjs()
-  const client = new TelegramClient(new StringSession(''), creds.apiId, creds.apiHash, clientOpts())
+  let client
   try {
+    client = new TelegramClient(new StringSession(''), creds.apiId, creds.apiHash, clientOpts())
     await client.connect()
     const sent = await client.sendCode({ apiId: creds.apiId, apiHash: creds.apiHash }, phone)
     const loginSession = (client.session.save() as unknown as string) || ''
@@ -57,8 +58,8 @@ export async function POST(req: Request) {
       usingEnvCreds: !!envApiCreds(),
     })
   } catch (e) {
-    return NextResponse.json({ error: tgErrorText(e) }, { status: 400 })
+    return NextResponse.json({ error: `Telegram недоступен: ${tgErrorText(e)}` }, { status: 400 })
   } finally {
-    try { await client.disconnect() } catch { /* already gone */ }
+    try { if (client) await client.disconnect() } catch { /* already gone */ }
   }
 }

@@ -32,21 +32,22 @@ export async function POST(req: Request) {
   if (account.status === '2fa' && !password)
     return NextResponse.json({ needPassword: true, error: 'введи облачный пароль (2FA)' }, { status: 400 })
 
-  const { TelegramClient, StringSession, computeCheck } = await gramjs()
+  const { TelegramClient, StringSession, computeCheck, Api } = await gramjs()
   const apiHash = decryptSecret(account.apiHashEnc)
-  const client = new TelegramClient(
-    new StringSession(decryptSecret(account.loginSessionEnc)),
-    account.apiId, apiHash, clientOpts(),
-  )
+  let client
   try {
+    client = new TelegramClient(
+      new StringSession(decryptSecret(account.loginSessionEnc)),
+      account.apiId, apiHash, clientOpts(),
+    )
     await client.connect()
     if (account.status === '2fa' || (!code && password)) {
-      const pwdInfo = await client.invoke(new (await import('telegram')).Api.account.GetPassword())
+      const pwdInfo = await client.invoke(new Api.account.GetPassword())
       const check = await computeCheck(pwdInfo, password)
-      await client.invoke(new (await import('telegram')).Api.auth.CheckPassword({ password: check }))
+      await client.invoke(new Api.auth.CheckPassword({ password: check }))
     } else {
       await client.invoke(
-        new (await import('telegram')).Api.auth.SignIn({
+        new Api.auth.SignIn({
           phoneNumber: account.phone,
           phoneCodeHash: account.phoneCodeHash,
           phoneCode: code,
@@ -94,6 +95,6 @@ export async function POST(req: Request) {
     }).catch(() => {})
     return NextResponse.json({ error: msg }, { status: 400 })
   } finally {
-    try { await client.disconnect() } catch { /* already gone */ }
+    try { if (client) await client.disconnect() } catch { /* already gone */ }
   }
 }

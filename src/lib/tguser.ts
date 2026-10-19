@@ -78,14 +78,19 @@ export function normalizePhone(input: unknown): { phone: string } | { error: str
 
 /* ------------------------------------------------------------- gramjs glue */
 
-/** Dynamic import so routes that never touch MTProto don't pay for it. */
+/** Dynamic import so routes that never touch MTProto don't pay for it.
+ *  Everything comes from the SINGLE root entry: subpath imports
+ *  ('telegram/sessions', 'telegram/Password') get split into separate bundled
+ *  module copies by Next.js and then `instanceof` checks inside GramJS fail
+ *  ("Only StringSession and StoreSessions are supported"). */
 export async function gramjs() {
-  const [{ TelegramClient }, sessions, password] = await Promise.all([
-    import('telegram'),
-    import('telegram/sessions'),
-    import('telegram/Password'),
-  ])
-  return { TelegramClient, StringSession: sessions.StringSession, computeCheck: password.computeCheck }
+  const t = await import('telegram')
+  return {
+    TelegramClient: t.TelegramClient,
+    StringSession: t.sessions.StringSession,
+    computeCheck: t.password.computeCheck,
+    Api: t.Api,
+  }
 }
 
 export function clientOpts() {
