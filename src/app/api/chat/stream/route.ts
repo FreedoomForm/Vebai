@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
-import { createAnswerStreamFilter } from '@/lib/agent/answer'
+import { createAnswerStreamFilter, parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
 import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
 import { createOutboxTasks, createTgReadTasks } from '@/lib/agent/outbox'
 
@@ -328,93 +328,153 @@ export async function POST(req: NextRequest) {
   // T16: the model decides what the user sees — only <answer>…</answer>
   // content is forwarded; run-terminal/run-vterm blocks (outside <answer>)
   // are still dispatched below from the RAW text.
-  const answerFilter = createAnswerStreamFilter()
+  // T35 (owner request 2026-10-20): the protocol is now enforced MECHANICALLY.
+  // A reply that is empty / has an empty <answer> / has no <answer> at all
+  // triggers an AUTOMATIC repeat (up to 2) with a corrective note — the era of
+  // "модель пишет что хочет" and silent empty answers ends here.
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      // acquire the upstream with visible retries (overload bursts usually
-      // clear within seconds — keep the user informed instead of a dead 502)
-      const acqT0 = Date.now()
-      let attempt = 0
-      for (;;) {
-        try {
-          upstreamRef.current = await zai.streamChat({
-            messages,
-            stream: true,
-            // effort: 'max' → deep thinking; 'high' → fast answers, thinking off
-            thinking: { type: effort === 'max' ? 'enabled' : 'disabled' },
-            ...(model ? { model } : {}),
-          })
-          break
-        } catch (e) {
-          attempt++
-          const reason = e instanceof Error ? e.message.slice(0, 200) : 'Z.ai недоступен'
-          if (Date.now() - acqT0 > 45_000 || attempt >= 4) {
-            controller.enqueue(
-              sse({ type: 'error', message: `Z.ai недоступен: ${reason}`, code: 'upstream_error' }),
-            )
-            controller.close()
-            return
-          }
-          controller.enqueue(
-            sse({ type: 'notice', text: `Z.ai перегружен — переподключаюсь (попытка ${attempt + 1})…` }),
-          )
-          await new Promise((r) => setTimeout(r, 3500))
-        }
-      }
-      let buf = ''
+      const t0 = Date.now()
+      const RETRY_BUDGET_MS = 150_000
+      const MAX_FORMAT_RETRIES = 2
+      let formatRetries = 0
       let fullAnswer = ''
-      const reader = upstreamRef.current!.getReader()
-      try {
+      let answerFilter = createAnswerStreamFilter()
+
+      // one streaming attempt. Returns { raw, failed }: raw is the FULL model
+      // output of this attempt (visibility is decided per-delta by the
+      // filter), failed means the upstream died mid-flight (error event
+      // already emitted — no format retries on transport failures).
+      const streamOnce = async (): Promise<{ raw: string; failed: boolean }> => {
+        // acquire the upstream with visible retries (overload bursts usually
+        // clear within seconds — keep the user informed instead of a dead 502)
+        const acqT0 = Date.now()
+        let attempt = 0
         for (;;) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buf += decoder.decode(value, { stream: true })
-          let nl: number
-          while ((nl = buf.indexOf('\n')) >= 0) {
-            const line = buf.slice(0, nl).trim()
-            buf = buf.slice(nl + 1)
-            if (!line.startsWith('data:')) continue
-            const data = line.slice(5).trim()
-            if (!data || data === '[DONE]') continue
-            let parsed: {
-              model_used?: string
-              choices?: { delta?: { content?: string; reasoning_content?: string } }[]
-              error?: { message?: string; code?: string }
-            }
-            try {
-              parsed = JSON.parse(data)
-            } catch {
-              continue
-            }
-            if (parsed.model_used) {
-              controller.enqueue(sse({ type: 'start', model: parsed.model_used }))
-              continue
-            }
-            if (parsed.error) {
+          try {
+            upstreamRef.current = await zai.streamChat({
+              messages,
+              stream: true,
+              // effort: 'max' → deep thinking; 'high' → fast answers, thinking off
+              thinking: { type: effort === 'max' ? 'enabled' : 'disabled' },
+              ...(model ? { model } : {}),
+            })
+            break
+          } catch (e) {
+            attempt++
+            const reason = e instanceof Error ? e.message.slice(0, 200) : 'Z.ai недоступен'
+            if (Date.now() - acqT0 > 45_000 || attempt >= 4) {
               controller.enqueue(
-                sse({
-                  type: 'error',
-                  message: String(parsed.error.message || 'Z.ai вернул ошибку').slice(0, 300),
-                  code: String(parsed.error.code || 'upstream_error'),
-                }),
+                sse({ type: 'error', message: `Z.ai недоступен: ${reason}`, code: 'upstream_error' }),
               )
-              continue
+              return { raw: '', failed: true }
             }
-            const delta = parsed.choices?.[0]?.delta
-            if (!delta) continue
-            if (delta.reasoning_content)
-              controller.enqueue(sse({ type: 'reasoning', text: delta.reasoning_content.slice(0, 400) }))
-            if (delta.content) {
-              fullAnswer += delta.content
-              const visible = answerFilter.push(delta.content)
-              if (visible) controller.enqueue(sse({ type: 'delta', text: visible }))
-            }
+            controller.enqueue(
+              sse({ type: 'notice', text: `Z.ai перегружен — переподключаюсь (попытка ${attempt + 1})…` }),
+            )
+            await new Promise((r) => setTimeout(r, 3500))
           }
         }
-        // stream over: emit the tail of an unclosed <answer>, or the cleaned
-        // full text when the model ignored the <answer> protocol entirely
-        const tail = answerFilter.flush()
-        if (tail) controller.enqueue(sse({ type: 'delta', text: tail }))
+        let raw = ''
+        let buf = ''
+        const reader = upstreamRef.current!.getReader()
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += decoder.decode(value, { stream: true })
+            let nl: number
+            while ((nl = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, nl).trim()
+              buf = buf.slice(nl + 1)
+              if (!line.startsWith('data:')) continue
+              const data = line.slice(5).trim()
+              if (!data || data === '[DONE]') continue
+              let parsed: {
+                model_used?: string
+                choices?: { delta?: { content?: string; reasoning_content?: string } }[]
+                error?: { message?: string; code?: string }
+              }
+              try {
+                parsed = JSON.parse(data)
+              } catch {
+                continue
+              }
+              if (parsed.model_used) {
+                controller.enqueue(sse({ type: 'start', model: parsed.model_used }))
+                continue
+              }
+              if (parsed.error) {
+                controller.enqueue(
+                  sse({
+                    type: 'error',
+                    message: String(parsed.error.message || 'Z.ai вернул ошибку').slice(0, 300),
+                    code: String(parsed.error.code || 'upstream_error'),
+                  }),
+                )
+                continue
+              }
+              const delta = parsed.choices?.[0]?.delta
+              if (!delta) continue
+              if (delta.reasoning_content)
+                controller.enqueue(sse({ type: 'reasoning', text: delta.reasoning_content.slice(0, 400) }))
+              if (delta.content) {
+                raw += delta.content
+                const visible = answerFilter.push(delta.content)
+                if (visible) controller.enqueue(sse({ type: 'delta', text: visible }))
+              }
+            }
+          }
+        } catch (e) {
+          const message = e instanceof Error ? e.message.slice(0, 300) : 'поток прерван'
+          try {
+            controller.enqueue(sse({ type: 'error', message, code: 'stream_error' }))
+          } catch { /* controller already closed */ }
+          return { raw, failed: true }
+        } finally {
+          reader.releaseLock()
+        }
+        return { raw, failed: false }
+      }
+
+      let failed = false
+      for (;;) {
+        const { raw: attemptRaw, failed: upFailed } = await streamOnce()
+        if (upFailed) {
+          failed = true
+          break
+        }
+        fullAnswer = attemptRaw
+        const verdict = checkAnswerProtocol(attemptRaw)
+        if (verdict.ok) {
+          // stream over: emit the tail of an unclosed <answer>
+          const tail = answerFilter.flush()
+          if (tail) controller.enqueue(sse({ type: 'delta', text: tail }))
+          break
+        }
+        if (formatRetries >= MAX_FORMAT_RETRIES || Date.now() - t0 > RETRY_BUDGET_MS) {
+          // retries exhausted / no time left: deliver the cleaned text so the
+          // user still gets SOMETHING (legacy fallback behaviour)
+          const fb = parseAiAnswer(attemptRaw).text
+          if (fb) controller.enqueue(sse({ type: 'delta', text: fb }))
+          break
+        }
+        formatRetries++
+        const why =
+          verdict.reason === 'empty'
+            ? 'пустотой (пустое поле)'
+            : verdict.reason === 'empty_answer'
+              ? 'пустым тегом <answer></answer>'
+              : 'БЕЗ формата <answer>…</answer>'
+        controller.enqueue(sse({
+          type: 'notice',
+          text: `⚠️ Модель ответила ${why} — автоматически повторяю запрос (попытка ${formatRetries + 1}/${MAX_FORMAT_RETRIES + 1})…`,
+        }))
+        if (attemptRaw.trim()) messages.push({ role: 'assistant', content: attemptRaw.slice(0, 1500) })
+        messages.push({ role: 'user', content: formatRetryNote(verdict.reason) })
+        answerFilter = createAnswerStreamFilter()
+      }
+      if (!failed) {
         // ---- terminal dispatch: fenced run-agent blocks -> resident agent,
         // run-terminal blocks -> Linux worker
         if (conversationId) {
@@ -475,15 +535,8 @@ export async function POST(req: NextRequest) {
           } catch { /* terminal dispatch is best-effort */ }
         }
         controller.enqueue(sse({ type: 'done' }))
-      } catch (e) {
-        const message = e instanceof Error ? e.message.slice(0, 300) : 'поток прерван'
-        try {
-          controller.enqueue(sse({ type: 'error', message, code: 'stream_error' }))
-        } catch { /* controller already closed */ }
-      } finally {
-        reader.releaseLock()
-        try { controller.close() } catch { /* already closed */ }
       }
+      try { controller.close() } catch { /* already closed */ }
     },
     cancel() {
       void upstreamRef.current?.cancel().catch(() => {})

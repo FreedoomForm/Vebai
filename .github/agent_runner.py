@@ -56,7 +56,7 @@ HISTORY_SOFT_CAP = 60_000
 
 AGENT_MD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AGENT.md")
 
-RE_CMD = re.compile(r"<cmd(?:\s+to\s*=\s*\"?(\d+)\"?)?\s*>([\s\S]*?)</cmd>", re.I)
+RE_CMD = re.compile(r"<cmd(?:\s+to\s*=\s*[\"']?(\d+)[\"']?)?\s*>([\s\S]*?)</cmd>", re.I)
 RE_SEARCH = re.compile(r"<search>([\s\S]*?)</search>", re.I)
 RE_READ = re.compile(r"<read>([\s\S]*?)</read>", re.I)
 RE_SEND = re.compile(r"<send\b([^>]*?)/?>([\s\S]*?)</send>", re.I)
@@ -372,6 +372,91 @@ def truth_guard(final_text: str, system: str, history: list, send_files_ok: int)
     return final2
 
 
+# --------------------------------------------------- T35: format guard
+# Owner request 2026-10-20: the model used to obey the <answer>/<file>
+# protocol, then started writing "whatever it wants" — untagged finals,
+# empty <answer> fields, files delivered without <file> tags. The final is
+# now verified MECHANICALLY and the answer is AUTO-REPEATED (up to 2
+# corrective round-trips) until the format is right or retries run out.
+# Runs BEFORE the truth guard so honesty checks operate on a tagged final.
+
+def protocol_problems(final_text: str, started_ts: float) -> list:
+    """mechanical format check of the final. Returns a list of violations."""
+    txt = (final_text or "").strip()
+    answers = [m.group(1).strip() for m in RE_ANSWER.finditer(txt) if m.group(1).strip()]
+    problems = []
+    if not txt:
+        problems.append("финал ПУСТ — ответ модели был пустым полем")
+    elif not answers:
+        problems.append("финал БЕЗ обёртки <answer>…</answer> — текст вне тегов пользователю не показывается")
+    else:
+        listed = {m.group(1).strip().lower() for m in RE_FTAG.finditer(txt)}
+        new_files = [p for p, _s in list_new_files(started_ts)]
+        if new_files and not listed:
+            problems.append("в /tmp/ws есть НОВЫЕ файлы (" + ", ".join(new_files[:5]) +
+                            "), но ни ОДНОГО тега <file> — пользователь их не получит")
+    return problems
+
+
+def format_guard(final_text: str, system: str, history: list, started_ts: float,
+                 send_files_ok: int):
+    """T35 auto-repeat: bounce a broken final back to the model with a
+    corrective system note (owner request: «сделай авто повторения задачи,
+    если модель ошиблась и ответила пустым полем»). Up to 2 rounds; each
+    round may execute the model's corrective <cmd>/<send> actions, then
+    demands a proper <final>. Returns (final_text, send_files_ok)."""
+    for _ in range(2):
+        problems = protocol_problems(final_text, started_ts)
+        if not problems:
+            break
+        history.append({"role": "user", "content":
+            ("[СИСТЕМА] ПРОВЕРКА ФОРМАТА ФИНАЛА (авто-повтор): " + "; ".join(problems) +
+             ". Дай <final> ЗАНОВО по протоколу: весь текст для человека — ТОЛЬКО внутри "
+             "<answer>…</answer> (без служебного текста вне тегов); каждый ИТОГОВЫЙ файл, который "
+             "пользователь должен получить, — отдельным тегом <file>имя</file> (только реально "
+             "существующие файлы из /tmp/ws; промежуточные скрипты и черновики не перечисляй; "
+             "файлов для доставки нет — тегов <file> не ставь).")})
+        heartbeat()
+        try:
+            reply, _ = zai_client.chat(
+                [{"role": "system", "content": system}] + history,
+                temperature=0.2, max_tokens=3000)
+        except Exception:
+            break
+        final2, actions = parse_actions(reply)
+        if actions:
+            outs = []
+            for kind, arg, tmo in actions[:3]:
+                if kind == "cmd":
+                    rc, dt, outp = run_bash(arg, min(tmo, 300))
+                    outs.append(f"$ {arg[:200]}\n(exit {rc}, {dt} c)\n{outp or '(пусто)'}")
+                elif kind == "send":
+                    report, ok, n = do_send(*arg)
+                    if ok and n:
+                        send_files_ok += n
+                    outs.append(report)
+                else:
+                    continue
+            heartbeat()
+            history.append({"role": "assistant", "content": reply})
+            history.append({"role": "user", "content":
+                "=== вывод исправления формата ===\n" + "\n\n".join(outs) +
+                "\n\n[СИСТЕМА] Теперь дай <final> по протоколу: текст в <answer>…</answer>, файлы — <file>."})
+            try:
+                reply2, _ = zai_client.chat(
+                    [{"role": "system", "content": system}] + history,
+                    temperature=0.2, max_tokens=2500)
+                final3, _ = parse_actions(reply2)
+                final2 = final3 or final2
+            except Exception:
+                pass
+        if final2 and final2.strip():
+            final_text = final2
+        elif not (final_text or "").strip():
+            final_text = reply[:3000]  # at least deliver something
+    return final_text, send_files_ok
+
+
 # ---------------------------------------------------------------------- main
 
 def list_new_files(since_ts: float) -> list:
@@ -559,6 +644,10 @@ def run_agent(task, budget_min=None) -> str:
     # T21a: before anything leaves the runner, the final is checked against
     # reality — the agent either creates the promised file or the user gets
     # an honest system note instead of a phantom "created and sent".
+    # T35: the final must follow the <answer>/<file> protocol — a broken one
+    # (empty field / no <answer> / files without <file>) is AUTO-REPEATED with
+    # a corrective note before the honesty check runs.
+    final_text, send_files_ok = format_guard(final_text, system, history, started_ts, send_files_ok)
     final_text = truth_guard(final_text, system, history, send_files_ok)
     save_memory(task, final_text)
     return final_text or "(агент закончил без финального ответа)"

@@ -61,6 +61,66 @@ export function parseAiAnswer(raw: string): ParsedAnswer {
 }
 
 /**
+ * T35 (owner request 2026-10-20): the model used to obey the <answer>/<file>
+ * protocol, then started writing "whatever it wants" (untagged replies, empty
+ * <answer> fields) — and every surface silently fell back to showing the raw
+ * text or "(пустой ответ модели)". From now on every surface checks the
+ * protocol MECHANICALLY and auto-repeats the request with a corrective note
+ * when the model breaks it.
+ *
+ * ok=true  — protocol satisfied (a non-empty <answer> exists, or an unclosed
+ *            <answer> carries a non-empty tail: a cut stream still delivered).
+ * reason:
+ *   'empty'         — the model answered with an EMPTY field (nothing at all);
+ *   'empty_answer'  — <answer> tag(s) present but every one of them is empty;
+ *   'no_answer_tag' — non-empty text, but never wrapped in <answer>…</answer>.
+ */
+export type AnswerVerdictReason = 'empty' | 'empty_answer' | 'no_answer_tag'
+
+export interface AnswerVerdict {
+  ok: boolean
+  reason?: AnswerVerdictReason
+}
+
+export function checkAnswerProtocol(raw: string): AnswerVerdict {
+  const src = String(raw || '')
+  if (!src.trim()) return { ok: false, reason: 'empty' }
+  let sawTag = false
+  for (const m of src.matchAll(RE_ANSWER)) {
+    sawTag = true
+    if ((m[1] || '').trim()) return { ok: true }
+  }
+  if (sawTag) return { ok: false, reason: 'empty_answer' }
+  // unclosed <answer> (stream cut / truncated generation): the opened block
+  // is what the user was meant to see — accept it when it carries text
+  const mOpen = /<answer\s*>/i.exec(src)
+  if (mOpen && !/<\/answer\s*>/i.test(src.slice(mOpen.index))) {
+    const tail = src
+      .slice(mOpen.index + mOpen[0].length)
+      .replace(RE_INTERNAL, '')
+      .replace(/<\/?(?:answer|file|final)>/gi, '')
+      .trim()
+    if (tail) return { ok: true }
+  }
+  return { ok: false, reason: 'no_answer_tag' }
+}
+
+/** corrective user-turn sent back to the model when the protocol is broken */
+export function formatRetryNote(reason?: AnswerVerdictReason): string {
+  const what =
+    reason === 'empty'
+      ? 'Твой предыдущий ответ был ПУСТЫМ (пустое поле)'
+      : reason === 'empty_answer'
+        ? 'В твоём предыдущем ответе тег <answer> был ПУСТЫМ'
+        : 'Твой предыдущий ответ был БЕЗ обёртки <answer>…</answer>, поэтому пользователю НЕ показался никакой текст'
+  return (
+    `[СИСТЕМА] ${what}. ПОВТОРИ ответ строго по формату: весь текст для пользователя — ТОЛЬКО внутри ` +
+    '<answer> и </answer>; файлы для передачи — отдельными тегами <file>имя_файла</file> сразу после ' +
+    'закрывающего </answer>; служебный текст (план, рассуждения) — вне <answer>. Другой формат не будет показан пользователю.'
+  )
+}
+
+/**
  * Does a collected workspace file match one of the requested names?
  * Accepts exact relative path or basename match, case-insensitive.
  */
