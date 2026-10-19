@@ -72,7 +72,10 @@ export async function POST(req: Request) {
     let total = 0
     for (const rm of rawMsgs) {
       const date = String((rm as { date?: string }).date || '')
-      const d = /^\d{4}-\d{2}-\d{2}T/.test(date) ? date.slice(5, 16).replace('T', ' ') : date.slice(0, 16)
+      // ISO -> DD.MM HH:mm (RU-friendly); fallback: raw prefix
+      const d = /^\d{4}-\d{2}-\d{2}T/.test(date)
+        ? `${date.slice(8, 10)}.${date.slice(5, 7)} ${date.slice(11, 16)}`
+        : date.slice(0, 16)
       const from = String((rm as { from?: string }).from || '?').slice(0, 80)
       const text = String((rm as { text?: string }).text || '')
         .trim()

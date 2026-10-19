@@ -232,10 +232,12 @@ async function main() {
   check('F: chain=3 report accepted + completed', rep4.status === 200 && t4After && t4After.status === 'completed')
   await sleep(30_000)
   const cont4 = await prod.message.findFirst({
-    where: { conversationId: convId, meta: { contains: `"taskId":"${t4.id}"` } },
+    // only a CONTINUATION counts (autoContinue flag) — the transcript itself
+    // also carries meta.taskId and must not fail this check
+    where: { conversationId: convId, role: 'assistant', meta: { contains: '"autoContinue":true' }, AND: [{ meta: { contains: `"taskId":"${t4.id}"` } }] },
     orderBy: { createdAt: 'desc' },
   })
-  check('F: no auto-continuation at chain cap (only the transcript itself)', !cont4)
+  check('F: no auto-continuation at chain cap (transcript itself is not a continuation)', !cont4)
 
   // duplicate read report must be a no-op
   const rep2 = await fetch(SITE + '/api/tg/outbox-result', {
