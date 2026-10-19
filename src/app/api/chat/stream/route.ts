@@ -5,6 +5,7 @@ import { zai, type ChatMessage } from '@/lib/zai'
 import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { createAnswerStreamFilter } from '@/lib/agent/answer'
+import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 300
@@ -272,7 +273,26 @@ export async function POST(req: NextRequest) {
   if (clean.length === 0 || clean[clean.length - 1].role !== 'user')
     return new Response(JSON.stringify({ error: 'последнее сообщение должно быть от пользователя' }), { status: 400 })
 
-  const messages: ChatMessage[] = [{ role: 'system', content: systemPrompt() }]
+  // ---- T28: the «TG-агент» connector. When the conversation is the user's
+  // registered agent chat, the model answers as the OWNER'S PERSONAL
+  // TELEGRAM AGENT (not the generic Vebai assistant): the owner teaches it
+  // here, and this transcript later feeds /api/tg/incoming replies.
+  let sys = systemPrompt()
+  if (conversationId) {
+    const agentConvId = await readAgentConversationId(user.id)
+    if (agentConvId && agentConvId === conversationId) {
+      const acc = await db.tgAccount.findFirst({
+        where: { userId: user.id },
+        orderBy: { updatedAt: 'desc' },
+        include: { config: true },
+      })
+      let me: { firstName?: string; username?: string } = {}
+      try { me = JSON.parse(acc?.meInfo || '{}') } catch { /* ignore */ }
+      sys = compileAgentChatPrompt(me, acc?.config?.systemPrompt || '')
+    }
+  }
+
+  const messages: ChatMessage[] = [{ role: 'system', content: sys }]
 
   // ---- optional web search: RAG-inject fresh results into the context
   if (webSearch) {

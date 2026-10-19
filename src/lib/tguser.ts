@@ -259,6 +259,70 @@ export async function migrateRulesDraft(userId: string, accountId: string): Prom
   await clearRulesDraft(userId)
 }
 
+/* ------------------------------------------------------- agent chat (T28) */
+
+/** T28: the user's agent conversation on the site (one per user). Its
+ *  transcript IS the agent's memory: everything the owner tells the agent
+ *  here is what the agent uses when it answers people DM-ing the account.
+ *  Pointer lives in StudioState; the Conversation row is a normal chat row
+ *  (title badge only) so the usual chat history/UI/permissions apply. */
+const agentChatKey = (userId: string) => `tguser-chat:${userId}`
+export const AGENT_CONV_TITLE = '🤖 Telegram-агент'
+
+/** read-only: the registered agent conversation id (or null). Ownership is
+ *  re-verified against the Conversation row. */
+export async function readAgentConversationId(userId: string): Promise<string | null> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: agentChatKey(userId) } })
+    const id = row ? String((JSON.parse(row.data) as { conversationId?: string }).conversationId || '') : ''
+    if (!id) return null
+    const conv = await db.conversation.findUnique({ where: { id } })
+    return conv && (!conv.userId || conv.userId === userId) ? id : null
+  } catch {
+    return null
+  }
+}
+
+/** get-or-create the agent conversation (used by POST /api/tg/chat). */
+export async function getAgentConversation(userId: string): Promise<string> {
+  const existing = await readAgentConversationId(userId)
+  if (existing) return existing
+  const conv = await db.conversation.create({
+    data: { userId, title: AGENT_CONV_TITLE },
+  })
+  const data = JSON.stringify({ conversationId: conv.id })
+  await db.studioState.upsert({
+    where: { key: agentChatKey(userId) },
+    update: { data, updatedAt: new Date() },
+    create: { key: agentChatKey(userId), data },
+  })
+  return conv.id
+}
+
+/** The owner ↔ agent transcript (last turns), condensed for the reply prompt. */
+export async function loadAgentContext(userId: string, opts?: { maxTurns?: number; maxChars?: number }): Promise<string> {
+  const convId = await readAgentConversationId(userId)
+  if (!convId) return ''
+  const maxTurns = opts?.maxTurns ?? 40
+  const maxChars = opts?.maxChars ?? 6000
+  const msgs = await db.message.findMany({
+    where: { conversationId: convId },
+    orderBy: { createdAt: 'desc' },
+    take: maxTurns,
+  })
+  const lines: string[] = []
+  let budget = maxChars
+  for (const m of [...msgs].reverse()) {
+    const c = (m.content || '').trim()
+    if (!c) continue
+    const line = `${m.role === 'user' ? 'Владелец' : 'Агент'}: ${c.replace(/\s+/g, ' ').slice(0, 400)}`
+    budget -= line.length
+    if (budget < 0) break
+    lines.push(line)
+  }
+  return lines.join('\n')
+}
+
 /* --------------------------------------------------------- agent prompting */
 
 export const DEFAULT_AGENT_PROMPT = `Ты — личный Telegram-ассистент владельца аккаунта. Отвечаешь на входящие личные сообщения ОТ ЕГО ИМЕНИ, когда он занят.
@@ -301,6 +365,23 @@ export function compileAgentPrompt(me: { firstName?: string; username?: string }
   return s
 }
 
+/** T28: the persona used in the SITE CHAT when the owner talks to his agent
+ *  (the «TG-агент» connector). This conversation is the agent's memory — the
+ *  owner teaches it here; the transcript later feeds agentReply. */
+export function compileAgentChatPrompt(me: { firstName?: string; username?: string }, systemPrompt: string): string {
+  const who = [me.firstName, me.username ? `(@${me.username})` : ''].filter(Boolean).join(' ')
+  return [
+    `Ты — личный Telegram-агент пользователя ${who || '(владелец аккаунта)'} на сайте Vebai.`,
+    'Это ЛИЧНЫЙ чат владельца с тобой: он объясняет здесь, как тебе вести себя в его Telegram — тон, что отвечать конкретным людям, какие вопросы передавать ему лично.',
+    'ЗАПОМИНАЙ всё, что он говорит, — вся эта переписка становится твоим контекстом: по ней ты будешь отвечать на входящие личные сообщения В ЕГО TELEGRAM от его имени.',
+    'Веди себя как умный ассистент: уточняй детали, предлагай формулировки, показывай, как бы ты ответил на типичное входящее — владелец сразу видит результат.',
+    'Сейчас ты разговариваешь с ВЛАДЕЛЬЦЕМ (не с чужими людьми) — отвечай ему свободно и подробно, когда он просит разъяснений.',
+    'Это обычный чат-планирование: НЕ используй инструменты run-agent/run-terminal/run-vterm и не создавай видео/файлы — только обсуждение правил и поведения.',
+    `Базовые правила твоего поведения в чужом Telegram: ${(systemPrompt || DEFAULT_AGENT_PROMPT).trim()}`,
+    '- Текущая дата и время (UTC): ' + new Date().toISOString().slice(0, 19).replace('T', ' '),
+  ].join('\n')
+}
+
 /* --------------------------------------------------------------- zai calls */
 
 async function zaiText(messages: { role: 'system' | 'user' | 'assistant'; content: string }[], temperature = 0.4, maxTokens = 700): Promise<string> {
@@ -326,58 +407,24 @@ function extractJson<T>(raw: string): T | null {
   }
 }
 
-/** /api/tg/coach: the owner explains rules in words; AI updates the prompt. */
-export async function coachPrompt(currentPrompt: string, message: string): Promise<{ reply: string; prompt: string }> {
-  const sys =
-    'Ты помогаешь владельцу Telegram-аккаунта настраивать правила его личного агента, ' +
-    'который отвечает на входящие сообщения от его имени. Ты ведёшь ТЕКСТ ПРАВИЛ ' +
-    '(системный промпт агента). Пользователь сообщает правила обычными словами ' +
-    '(тон, что делать с конкретными людьми, какие файлы создавать, что передавать владельцу). ' +
-    'Обнови полный текст правил, сохранив всё важное из прежней версии и добавив новое. ' +
-    'Правила — только про поведение агента в Telegram: тон, запреты, приоритеты, имя/отношение к контактам. ' +
-    'Ответь СТРОГО JSON: {"reply": "короткий ответ пользователю по-русски (1-3 предложения, что изменил)", "prompt": "полный обновлённый текст правил"}'
-  const raw = await zaiText(
-    [
-      { role: 'system', content: sys },
-      { role: 'user', content: `ТЕКУЩИЕ ПРАВИЛА:\n"""\n${(currentPrompt || DEFAULT_AGENT_PROMPT).slice(0, 4000)}\n"""\n\nСООБЩЕНИЕ ВЛАДЕЛЬЦА:\n${message.slice(0, 2000)}` },
-    ],
-    0.3,
-    1600,
-  )
-  const parsed = extractJson<{ reply?: string; prompt?: string }>(raw)
-  if (!parsed || typeof parsed.prompt !== 'string' || parsed.prompt.trim().length < 20) {
-    throw new Error('модель не вернула обновлённые правила — переформулируй и попробуй ещё раз')
+/** /api/tg/incoming: the real reply for an incoming private message.
+ *  T28: `context` — the owner ↔ agent site-chat transcript; the agent must
+ *  follow whatever the owner taught it there (this is what makes it THE
+ *  owner's agent rather than a generic AI). */
+export async function agentReply(
+  me: { firstName?: string; username?: string },
+  systemPrompt: string,
+  examples: TgExample[],
+  fromName: string,
+  incoming: string,
+  context = '',
+): Promise<string> {
+  let sys = compileAgentPrompt(me, systemPrompt, examples)
+  if (context.trim()) {
+    sys +=
+      '\n\nПЕРЕПИСКА ВЛАДЕЛЬЦА С ТОБОЙ на сайте (твой КОНТЕКСТ — строго следуй инструкциям владельца из неё):\n' +
+      context.trim()
   }
-  return { reply: (parsed.reply || 'Правила обновлены.').trim(), prompt: parsed.prompt.trim() }
-}
-
-/** /api/tg/simulate: dry-run the agent against a sample incoming message. */
-export async function simulateVariants(systemPrompt: string, examples: TgExample[], fromName: string, incoming: string): Promise<{ style: string; text: string }[]> {
-  const base = compileAgentPrompt({ firstName: 'Владелец' }, systemPrompt, examples)
-  const sys =
-    base +
-    '\n\nСЕЙЧАС РЕЖИМ ТЕСТИРОВАНИЯ: сгенерируй ТРИ варианта ответа на пробное входящее сообщение ' +
-    '(короткий, официальный/деловой, тёплый/неформальный). ' +
-    'Ответь СТРОГО JSON: {"variants":[{"style":"короткий","text":"..."},{"style":"официальный","text":"..."},{"style":"тёплый","text":"..."}]} — каждый text это готовое сообщение от лица владельца.'
-  const raw = await zaiText(
-    [
-      { role: 'system', content: sys },
-      { role: 'user', content: `ВХОДЯЩЕЕ ОТ ${fromName || 'контакта'}: ${incoming.slice(0, 1000)}` },
-    ],
-    0.6,
-    900,
-  )
-  const parsed = extractJson<{ variants?: { style?: string; text?: string }[] }>(raw)
-  const variants = (parsed?.variants || [])
-    .filter((v) => v && typeof v.text === 'string' && v.text.trim())
-    .map((v) => ({ style: (v.style || 'вариант').slice(0, 40), text: v.text!.trim() }))
-  if (variants.length < 2) throw new Error('модель не вернула варианты ответа — попробуй ещё раз')
-  return variants.slice(0, 3)
-}
-
-/** /api/tg/incoming: the real reply for an incoming private message. */
-export async function agentReply(me: { firstName?: string; username?: string }, systemPrompt: string, examples: TgExample[], fromName: string, incoming: string): Promise<string> {
-  const sys = compileAgentPrompt(me, systemPrompt, examples)
   const raw = await zaiText(
     [
       { role: 'system', content: sys },

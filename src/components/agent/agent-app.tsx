@@ -61,6 +61,14 @@ const SUGGESTIONS = [
   { icon: '✨', text: 'Помоги придумать сценарий трейлера для IT-блога' },
 ]
 
+/** T28: hints shown instead of task suggestions while the Telegram-agent
+ *  connector is selected — this chat trains the agent's context */
+const TG_SUGGESTIONS = [
+  { icon: '👋', text: 'Всем, кто пишет «как дела» — отвечай коротко, что я занят' },
+  { icon: '📋', text: 'Мирсаиду скажи, что отчёт будет завтра до обеда' },
+  { icon: '🛡', text: 'Незнакомым — ничего не обещай, передавай вопрос мне' },
+]
+
 const GALLERY = [
   { grad: 'from-stone-800 via-stone-700 to-stone-900', label: 'Лендинг для продукта', dark: true },
   { grad: 'from-emerald-600 via-teal-600 to-emerald-800', label: 'Мини-игра', dark: true },
@@ -82,6 +90,14 @@ export function AgentApp() {
   const [activityOpen, setActivityOpen] = useState(false)
   const [tgLinkBusy, setTgLinkBusy] = useState(false)
   const [tgLinkNote, setTgLinkNote] = useState('')
+  // T28: Telegram-agent connector — when on, messages go to the agent
+  // conversation (its transcript IS the context the agent uses when it
+  // answers people DM-ing the user's account)
+  const [tgAgent, setTgAgent] = useState(false)
+  const [tgConnected, setTgConnected] = useState<boolean | null>(null) // null = unknown yet
+  const tgAgentRef = useRef(false)
+  tgAgentRef.current = tgAgent
+  const agentConvRef = useRef<string | null>(null)
   // live "thinking for Ns" ticker: the deep-thinking model can stay silent for
   // 1-2 minutes (owner feedback 2026-10-18: "не работает" — это долгая фаза
   // размышлений без видимого прогресса), so show elapsed seconds
@@ -149,6 +165,32 @@ export function AgentApp() {
     } catch { /* private mode */ }
   }, [])
 
+  useEffect(() => {
+    if (!session.user) return
+    // deep link (?agent=1 — from the /tgagent page and the bot's
+    // «Научить агента» button): land straight in the agent chat
+    try {
+      const p = new URLSearchParams(window.location.search)
+      if (p.get('agent') === '1') {
+        setTgAgent(true)
+        window.history.replaceState({}, '', window.location.pathname)
+      }
+    } catch { /* noop */ }
+    // account status for the connector hint (connected or not)
+    void (async () => {
+      try {
+        const res = await fetch('/api/tg/state', { cache: 'no-store' })
+        if (!res.ok) return
+        const s = (await res.json()) as { account?: { status: string } | null }
+        setTgConnected(s.account?.status === 'connected')
+      } catch { /* ignore */ }
+    })()
+  }, [session.user])
+
+  const toggleTgAgent = useCallback(() => {
+    setTgAgent((v) => !v)
+  }, [])
+
   const selectModel = useCallback((id: string) => {
     setModel(id)
     setModelOpen(false)
@@ -191,6 +233,40 @@ export function AgentApp() {
       setStream(null)
     } catch { /* offline */ }
   }, [])
+
+  // entering agent mode: open (create if missing) the agent conversation and
+  // refresh the connected status — the composer hint depends on it
+  useEffect(() => {
+    if (!tgAgent || !session.user) return
+    let stop = false
+    void (async () => {
+      try {
+        const res = await fetch('/api/tg/chat', { method: 'POST' })
+        const data = (await res.json().catch(() => ({}))) as { conversationId?: string; error?: string }
+        if (stop) return
+        if (!res.ok || !data.conversationId) {
+          setTgConnected(null)
+          return
+        }
+        agentConvRef.current = data.conversationId
+        if (!sendingRef.current && activeIdRef.current !== data.conversationId) {
+          stickToBottomRef.current = true
+          setActiveId(data.conversationId)
+          activeIdRef.current = data.conversationId
+          setMessages([])
+          setTasks([])
+          setErrorMsg(null)
+          setStream(null)
+          void fetchState(data.conversationId)
+          void loadConversations()
+        }
+        const st = await fetch('/api/tg/state', { cache: 'no-store' })
+        const s = (await st.json().catch(() => ({}))) as { account?: { status: string } | null }
+        if (!stop) setTgConnected(s.account?.status === 'connected')
+      } catch { /* ignore */ }
+    })()
+    return () => { stop = true }
+  }, [tgAgent, session.user, fetchState, loadConversations])
 
   /* -------------------------------------------------------------- events */
 
@@ -552,7 +628,7 @@ export function AgentApp() {
             const res = await fetch('/api/video-request', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ conversationId: activeIdRef.current, prompt: content }),
+              body: JSON.stringify({ conversationId: tgAgentRef.current ? agentConvRef.current : activeIdRef.current, prompt: content }),
             })
             const data = (await res.json().catch(() => ({}))) as {
               task?: AgentTaskDTO
@@ -570,7 +646,11 @@ export function AgentApp() {
         })()
       }
 
-      void runTurn(activeIdRef.current, content, Boolean(opts?.resume))
+      // T28: with the Telegram-agent connector on, the turn MUST land in the
+      // agent conversation (even if the user navigated elsewhere) — the
+      // server recognises it by id and answers with the agent persona
+      const targetConv = tgAgentRef.current ? agentConvRef.current : activeIdRef.current
+      void runTurn(targetConv, content, Boolean(opts?.resume))
     },
     [runTurn, onEvent],
   )
@@ -773,15 +853,30 @@ export function AgentApp() {
             </span>
           )}
         </a>
-        <a
-          href="/tgagent"
-          target="_blank"
-          rel="noreferrer"
-          className="flex w-full items-center justify-start gap-2 rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-100"
+        <button
+          type="button"
+          onClick={toggleTgAgent}
+          className={cn(
+            'mt-2 flex w-full items-center justify-start gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors',
+            tgAgent
+              ? 'border-sky-300 bg-sky-50 text-sky-700'
+              : 'border-stone-200 bg-white text-stone-700 hover:bg-stone-100',
+          )}
         >
           <Send className="h-4 w-4 text-sky-500" />
           Telegram-агент
-        </a>
+          {tgConnected === true && (
+            <span className="ml-auto text-[10px] font-semibold text-emerald-600">вкл</span>
+          )}
+        </button>
+        {tgConnected === false && (
+          <a
+            href="/tgagent"
+            className="mt-1.5 block px-1 text-[11px] leading-snug text-amber-700 hover:underline"
+          >
+            Telegram не подключён — привяжи номер, чтобы агент отвечал людям →
+          </a>
+        )}
       </div>
       <div className="mt-3 flex-1 overflow-y-auto px-2 pb-2 space-y-0.5">
         {conversations.map((c) => (
@@ -868,12 +963,21 @@ export function AgentApp() {
     <div className="mx-auto flex min-h-full max-w-3xl flex-col items-center justify-center gap-7 px-4 py-10 text-center">
       <div className="space-y-3">
         <h2 className="font-display text-4xl text-stone-900 sm:text-5xl">
-          Что мне построить для тебя?
+          {tgAgent ? 'Научи агента отвечать за тебя' : 'Что мне построить для тебя?'}
         </h2>
         <p className="text-sm leading-relaxed text-stone-500">
-          Введи задачу — агент сам спланирует, найдёт в интернете, нарисует и смонтирует видео.
+          {tgAgent
+            ? 'Этот чат — контекст твоего Telegram-агента: расскажи, как отвечать людям, и он будет вести переписку от твоего имени, помня всё, что ты ему сказал.'
+            : 'Введи задачу — агент сам спланирует, найдёт в интернете, нарисует и смонтирует видео.'}
         </p>
       </div>
+
+      {tgAgent && tgConnected === false && (
+        <div className="w-full rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-left text-[13px] text-amber-800">
+          Telegram-аккаунт ещё не подключён — агент пока не сможет отвечать людям.{' '}
+          <a href="/tgagent" className="font-semibold underline">Подключить номер →</a>
+        </div>
+      )}
 
       <Composer
         variant="hero"
@@ -888,10 +992,12 @@ export function AgentApp() {
         onEffortChange={changeEffort}
         video={video}
         onVideoToggle={toggleVideo}
+        tgAgent={tgAgent}
+        onTgAgentToggle={toggleTgAgent}
       />
 
       <div className="flex w-full flex-wrap justify-center gap-2">
-        {SUGGESTIONS.map((s) => (
+        {(tgAgent ? TG_SUGGESTIONS : SUGGESTIONS).map((s) => (
           <button
             key={s.text}
             onClick={() => handleSend(s.text)}
@@ -985,6 +1091,24 @@ export function AgentApp() {
             </Button>
           </div>
         </header>
+
+        {/* T28: honest status of the Telegram-agent connector */}
+        {tgAgent && tgConnected === false && (
+          <div className="px-3 sm:px-6">
+            <div className="mx-auto max-w-3xl rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2 text-[12px] leading-snug text-amber-800">
+              Telegram не подключён: агент отвечает в этом чате, но людям в твой Telegram пока не напишет.{' '}
+              <a href="/tgagent" className="font-semibold underline">Подключить номер →</a>
+            </div>
+          </div>
+        )}
+        {tgAgent && tgConnected && (
+          <div className="px-3 sm:px-6">
+            <div className="mx-auto max-w-3xl rounded-xl border border-sky-200 bg-sky-50 px-3.5 py-2 text-[12px] leading-snug text-sky-800">
+              Telegram-агент на связи: отвечает людям, которые пишут твоему аккаунту, исходя из этого чата.{' '}
+              <a href="/tgagent" className="font-semibold underline">настройки →</a>
+            </div>
+          </div>
+        )}
 
         <div
           ref={scrollRef}
@@ -1099,6 +1223,8 @@ export function AgentApp() {
               onEffortChange={changeEffort}
               video={video}
               onVideoToggle={toggleVideo}
+              tgAgent={tgAgent}
+              onTgAgentToggle={toggleTgAgent}
             />
             <p className="mt-2 hidden text-center text-[11px] text-stone-400 sm:block">
               Enter — отправить · Shift+Enter — новая строка · агент работает 24/7, результаты придут в чат

@@ -8,7 +8,7 @@
 import crypto from 'node:crypto'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { agentReply, parseExamples } from '@/lib/tguser'
+import { agentReply, loadAgentContext, parseExamples } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 45
@@ -59,12 +59,16 @@ export async function POST(req: Request) {
   let me: { firstName?: string; username?: string } = {}
   try { me = JSON.parse(account.meInfo || '{}') } catch { /* ignore */ }
   try {
+    // T28: the owner teaches the agent in the site chat («TG-агент» connector);
+    // that transcript IS the agent's memory — feed it into every reply
+    const context = await loadAgentContext(account.userId).catch(() => '')
     const reply = await agentReply(
       me,
       account.config?.systemPrompt || '',
       parseExamples(account.config?.examples),
       chatName || '',
       text,
+      context,
     )
     if (!reply) return NextResponse.json({ skip: 'empty-reply' })
     return NextResponse.json({ reply })

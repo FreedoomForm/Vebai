@@ -1,10 +1,10 @@
-import { TgAgentApp } from '@/components/tg/tg-app'
+import { TgConnectApp } from '@/components/tg/tg-app'
 
 export const metadata = {
-  title: 'Telegram-агент — Vebai',
-  description: 'Личный ИИ-агент, который отвечает в твоём Telegram по твоим правилам',
+  title: 'Подключить Telegram-агента — Vebai',
+  description: 'Подключи свой Telegram-аккаунт: номер + код, и агент ответит людям от твоего имени',
 }
 
 export default function TgAgentPage() {
-  return <TgAgentApp />
+  return <TgConnectApp />
 }

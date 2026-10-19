@@ -1,7 +1,7 @@
 'use client'
 
 import { useRef, useState } from 'react'
-import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown } from 'lucide-react'
+import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown, Send } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export interface SendOptions {
@@ -9,6 +9,11 @@ export interface SendOptions {
   /** 🎬 toggle: also queue the MiniMax H3 video pipeline for this prompt */
   videoRequest?: boolean
 }
+
+/** T28: the composer doubles as a connector bar — the paper-plane toggle
+ *  switches the chat into "Telegram agent" mode (talk to your personal
+ *  agent; everything you tell it becomes the context it uses when answering
+ *  people who DM your Telegram account). */
 
 export type Effort = 'high' | 'max'
 
@@ -37,6 +42,8 @@ export function Composer({
   onEffortChange,
   video,
   onVideoToggle,
+  tgAgent,
+  onTgAgentToggle,
 }: {
   onSend: (content: string, opts?: SendOptions) => void
   disabled: boolean
@@ -50,6 +57,8 @@ export function Composer({
   onEffortChange: (e: Effort) => void
   video: boolean
   onVideoToggle: () => void
+  tgAgent: boolean
+  onTgAgentToggle: () => void
 }) {
   const [effortOpen, setEffortOpen] = useState(false)
   const taRef = useRef<HTMLTextAreaElement | null>(null)
@@ -63,8 +72,9 @@ export function Composer({
     onSend(text, { videoRequest: video, ...opts })
   }
 
-  const placeholder =
-    variant === 'hero'
+  const placeholder = tgAgent
+    ? 'Научи агента: как отвечать людям, которые пишут в твой Telegram…'
+    : variant === 'hero'
       ? connected
         ? 'Чем я могу помочь сегодня?'
         : 'Соединение…'
@@ -151,6 +161,25 @@ export function Composer({
           >
             <Clapperboard className="h-[17px] w-[17px]" />
             {video && <span className="hidden sm:inline">Видео</span>}
+          </button>
+
+          {/* T28: Telegram-agent connector — switches this chat to the personal
+              Telegram agent; its answers to other people follow this context */}
+          <button
+            type="button"
+            aria-label="Telegram-агент"
+            aria-pressed={tgAgent}
+            onClick={onTgAgentToggle}
+            title={tgAgent ? 'Telegram-агент выбран: этот чат — его контекст' : 'Переключиться на Telegram-агента'}
+            className={cn(
+              'flex h-9 items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors',
+              tgAgent
+                ? 'bg-sky-50 text-sky-700 border border-sky-300'
+                : 'text-stone-500 hover:bg-stone-100',
+            )}
+          >
+            <Send className="h-[16px] w-[16px]" />
+            <span className={cn(tgAgent ? 'inline' : 'hidden sm:inline')}>TG-агент</span>
           </button>
 
           <div className="ml-auto flex items-center gap-2">
