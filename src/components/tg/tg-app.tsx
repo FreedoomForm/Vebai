@@ -31,6 +31,7 @@ interface TgState {
   worker: { lastWorkerAt: string | null }
   needApiCreds: boolean
   examplesCount: number
+  draft: { systemPrompt?: string; examples?: { from?: string; incoming: string; reply: string; at?: string }[] } | null
 }
 interface Variant { style: string; text: string }
 
@@ -92,7 +93,7 @@ export function TgAgentApp() {
     try {
       const s = await api<TgState>('/api/tg/state', undefined, 'GET')
       setState(s)
-      setPromptDraft((prev) => prev || s.account?.systemPrompt || '')
+      setPromptDraft((prev) => prev || s.account?.systemPrompt || s.draft?.systemPrompt || '')
       setErr('')
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'ошибка загрузки')
@@ -330,11 +331,11 @@ export function TgAgentApp() {
                   placeholder="например: с Мирсаидом — официально, всегда создавай файлы, что он попросит"
                   onKeyDown={(e) => { if (e.key === 'Enter' && coachInput.trim()) coach() }}
                 />
-                <button className={btnPrimary} onClick={coach} disabled={!!busy || !connected || coachInput.trim().length < 3}>
+                <button className={btnPrimary} onClick={coach} disabled={!!busy || coachInput.trim().length < 3}>
                   {busy === 'coach' ? 'думаю…' : 'Обновить'}
                 </button>
               </div>
-              {!connected && <p className="mt-2 text-xs text-amber-300/70">сначала подключи аккаунт — правила хранятся вместе с ним</p>}
+              {!connected && <p className="mt-2 text-xs text-amber-300/70">правила можно задать и до подключения — сохранятся как черновик и переедут в агента</p>}
               {coachReply && <p className="mt-2 text-sm text-emerald-300/90">🤖 {coachReply}</p>}
 
               <div className="mt-4">
@@ -346,26 +347,26 @@ export function TgAgentApp() {
                   onChange={(e) => setPromptDraft(e.target.value)}
                 />
                 <div className="mt-2 flex items-center gap-2">
-                  <button className={btnGhost} onClick={savePrompt} disabled={!!busy || !connected}>Сохранить правила</button>
+                  <button className={btnGhost} onClick={savePrompt} disabled={!!busy}>Сохранить правила</button>
                   {busy === 'save' && <span className="text-xs text-white/40">сохраняю…</span>}
                 </div>
               </div>
 
-              {connected && !!state?.account?.examples.length && (
+              {(() => { const examples = state?.account?.examples ?? state?.draft?.examples ?? []; return examples.length ? (
                 <div className="mt-4">
                   <div className="flex items-center justify-between">
-                    <span className={label}>Одобренные примеры ({state.account.examples.length})</span>
+                    <span className={label}>Одобренные примеры ({examples.length})</span>
                     <button className="text-xs text-white/40 hover:text-red-300" onClick={clearExamples} disabled={!!busy}>очистить</button>
                   </div>
                   <div className="mt-1 max-h-40 space-y-1.5 overflow-y-auto pr-1">
-                    {state.account.examples.map((ex, i) => (
+                    {examples.map((ex, i) => (
                       <div key={i} className="rounded-lg border border-white/5 bg-black/20 px-3 py-2 text-xs text-white/60">
                         <b className="text-white/80">{ex.from || 'контакт'}:</b> {ex.incoming.slice(0, 90)} → <span className="text-emerald-300/80">{ex.reply.slice(0, 90)}</span>
                       </div>
                     ))}
                   </div>
                 </div>
-              )}
+              ) })()}
             </section>
 
             {/* 3. test */}
@@ -380,7 +381,7 @@ export function TgAgentApp() {
                   <label className={label} htmlFor="test">Пробное входящее сообщение</label>
                   <input id="test" className={input} value={testText} onChange={(e) => setTestText(e.target.value)} placeholder="Салом, скинь отчёт по проекту" />
                 </div>
-                <button className={btnPrimary} onClick={simulate} disabled={!!busy || !connected || testText.trim().length < 1}>
+                <button className={btnPrimary} onClick={simulate} disabled={!!busy || testText.trim().length < 1}>
                   {busy === 'sim' ? 'генерирую…' : 'Варианты'}
                 </button>
               </div>

@@ -6,7 +6,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { simulateVariants, parseExamples } from '@/lib/tguser'
+import { simulateVariants, parseExamples, readRulesDraft } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 45
@@ -27,12 +27,12 @@ export async function POST(req: Request) {
     orderBy: { updatedAt: 'desc' },
     include: { config: true },
   })
-  if (!account) return NextResponse.json({ error: 'сначала подключи Telegram-аккаунт' }, { status: 400 })
+  const draft = await readRulesDraft(user.id)
 
   try {
     const variants = await simulateVariants(
-      account.config?.systemPrompt || '',
-      parseExamples(account.config?.examples),
+      account?.config?.systemPrompt ?? draft.systemPrompt ?? '',
+      account?.config ? parseExamples(account.config.examples) : (draft.examples || []),
       fromName, text,
     )
     return NextResponse.json({ ok: true, variants })

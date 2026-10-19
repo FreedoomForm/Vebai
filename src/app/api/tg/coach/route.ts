@@ -6,7 +6,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { coachPrompt } from '@/lib/tguser'
+import { coachPrompt, readRulesDraft, writeRulesDraft } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 45
@@ -26,16 +26,21 @@ export async function POST(req: Request) {
     orderBy: { updatedAt: 'desc' },
     include: { config: true },
   })
-  if (!account) return NextResponse.json({ error: 'сначала подключи Telegram-аккаунт' }, { status: 400 })
+  const draft = await readRulesDraft(user.id)
+  const current = account?.config?.systemPrompt ?? draft.systemPrompt ?? ''
 
   try {
-    const result = await coachPrompt(account.config?.systemPrompt || '', message)
-    await db.tgAgentConfig.upsert({
-      where: { accountId: account.id },
-      update: { systemPrompt: result.prompt },
-      create: { accountId: account.id, systemPrompt: result.prompt, examples: '[]' },
-    })
-    return NextResponse.json({ ok: true, reply: result.reply, systemPrompt: result.prompt })
+    const result = await coachPrompt(current, message)
+    if (account) {
+      await db.tgAgentConfig.upsert({
+        where: { accountId: account.id },
+        update: { systemPrompt: result.prompt },
+        create: { accountId: account.id, systemPrompt: result.prompt, examples: '[]' },
+      })
+    } else {
+      await writeRulesDraft(user.id, { systemPrompt: result.prompt })
+    }
+    return NextResponse.json({ ok: true, reply: result.reply, systemPrompt: result.prompt, storedAs: account ? 'account' : 'draft' })
   } catch (e) {
     return NextResponse.json({ error: `ИИ не смог обновить правила: ${e instanceof Error ? e.message.slice(0, 200) : 'ошибка'}` }, { status: 502 })
   }

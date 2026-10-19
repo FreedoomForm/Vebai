@@ -5,7 +5,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { parseExamples } from '@/lib/tguser'
+import { parseExamples, readRulesDraft, writeRulesDraft } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 
@@ -26,15 +26,18 @@ export async function POST(req: Request) {
     orderBy: { updatedAt: 'desc' },
     include: { config: true },
   })
-  if (!account) return NextResponse.json({ error: 'сначала подключи Telegram-аккаунт' }, { status: 400 })
-
-  const examples = parseExamples(account.config?.examples)
+  const draft = await readRulesDraft(user.id)
+  const examples = (account?.config ? parseExamples(account.config.examples) : (draft.examples || []))
   examples.push({ from, incoming, reply, at: new Date().toISOString() })
   const trimmed = examples.slice(-12)
-  const config = await db.tgAgentConfig.upsert({
-    where: { accountId: account.id },
-    update: { examples: JSON.stringify(trimmed) },
-    create: { accountId: account.id, systemPrompt: '', examples: JSON.stringify(trimmed) },
-  })
-  return NextResponse.json({ ok: true, examples: parseExamples(config.examples) })
+  if (account) {
+    await db.tgAgentConfig.upsert({
+      where: { accountId: account.id },
+      update: { examples: JSON.stringify(trimmed) },
+      create: { accountId: account.id, systemPrompt: '', examples: JSON.stringify(trimmed) },
+    })
+  } else {
+    await writeRulesDraft(user.id, { examples: trimmed })
+  }
+  return NextResponse.json({ ok: true, examples: trimmed })
 }

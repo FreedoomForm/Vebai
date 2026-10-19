@@ -6,7 +6,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { accountView, envApiCreds, parseExamples } from '@/lib/tguser'
+import { accountView, envApiCreds, parseExamples, readRulesDraft } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 
@@ -46,5 +46,6 @@ export async function GET(req: Request) {
     worker,
     needApiCreds: !envApiCreds(),
     examplesCount: account ? parseExamples(account.config?.examples).length : 0,
+    draft: account ? null : await readRulesDraft(user.id),
   })
 }

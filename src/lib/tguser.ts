@@ -257,6 +257,37 @@ export async function agentReply(me: { firstName?: string; username?: string }, 
 
 /* ---------------------------------------------------------------- helpers */
 
+export interface TgRulesDraft { systemPrompt?: string; examples?: TgExample[] }
+
+/** Rules BEFORE the account is connected live as a per-user draft
+ *  (StudioState); /verify migrates the draft into TgAgentConfig. The rules
+ *  conversation is the entry point of the service - it must not require a
+ *  connected Telegram account. */
+const draftKey = (userId: string) => `tguser-rules:${userId}`
+
+export async function readRulesDraft(userId: string): Promise<TgRulesDraft> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: draftKey(userId) } })
+    return row ? (JSON.parse(row.data) as TgRulesDraft) : {}
+  } catch { return {} }
+}
+
+export async function writeRulesDraft(userId: string, patch: Partial<TgRulesDraft>): Promise<TgRulesDraft> {
+  const cur = await readRulesDraft(userId)
+  const next: TgRulesDraft = { ...cur, ...patch }
+  const data = JSON.stringify(next)
+  await db.studioState.upsert({
+    where: { key: draftKey(userId) },
+    update: { data, updatedAt: new Date() },
+    create: { key: draftKey(userId), data },
+  })
+  return next
+}
+
+export async function clearRulesDraft(userId: string): Promise<void> {
+  await db.studioState.delete({ where: { key: draftKey(userId) } }).catch(() => {})
+}
+
 export async function getOwnedAccount(userId: string, accountId: string) {
   return db.tgAccount.findFirst({ where: { id: accountId, userId }, include: { config: true } })
 }

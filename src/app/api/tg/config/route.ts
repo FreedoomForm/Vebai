@@ -21,7 +21,6 @@ export async function POST(req: Request) {
     orderBy: { updatedAt: 'desc' },
     include: { config: true },
   })
-  if (!account) return NextResponse.json({ error: 'сначала подключи Telegram-аккаунт' }, { status: 400 })
 
   const data: { systemPrompt?: string; examples?: string; active?: boolean; updatedAt?: Date } = {}
   if (typeof body.systemPrompt === 'string') {
@@ -36,12 +35,22 @@ export async function POST(req: Request) {
     data.examples = JSON.stringify(cleaned)
   }
   if (typeof body.active === 'boolean') {
-    if (body.active && account.status !== 'connected')
+    if (!account || account.status !== 'connected')
       return NextResponse.json({ error: 'агента можно включить только после успешного подключения' }, { status: 400 })
     data.active = body.active
   }
   if (!Object.keys(data).length) return NextResponse.json({ error: 'нечего обновлять' }, { status: 400 })
   data.updatedAt = new Date()
+
+  if (!account) {
+    // rules draft (no Telegram account yet) - migrated into TgAgentConfig at /verify
+    const { writeRulesDraft } = await import('@/lib/tguser')
+    const patch: Record<string, unknown> = {}
+    if (data.systemPrompt !== undefined) patch.systemPrompt = data.systemPrompt
+    if (data.examples !== undefined) patch.examples = JSON.parse(data.examples)
+    const draft = await writeRulesDraft(user.id, patch)
+    return NextResponse.json({ ok: true, storedAs: 'draft', systemPrompt: draft.systemPrompt ?? '', examples: (draft.examples || []) })
+  }
 
   const config = await db.tgAgentConfig.upsert({
     where: { accountId: account.id },

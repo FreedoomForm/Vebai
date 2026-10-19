@@ -9,7 +9,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { gramjs, clientOpts, tgErrorText, decryptSecret, encryptSecret, getOwnedAccount, DEFAULT_AGENT_PROMPT } from '@/lib/tguser'
+import { gramjs, clientOpts, tgErrorText, decryptSecret, encryptSecret, getOwnedAccount, readRulesDraft, clearRulesDraft, DEFAULT_AGENT_PROMPT } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 30
@@ -73,11 +73,18 @@ export async function POST(req: Request) {
         loginSessionEnc: null,
       },
     })
+    // migrate the pre-connection rules draft into the agent config
+    const draft = await readRulesDraft(user.id)
     await db.tgAgentConfig.upsert({
       where: { accountId: account.id },
       update: {},
-      create: { accountId: account.id, systemPrompt: DEFAULT_AGENT_PROMPT, examples: '[]' },
+      create: {
+        accountId: account.id,
+        systemPrompt: draft.systemPrompt || DEFAULT_AGENT_PROMPT,
+        examples: JSON.stringify(draft.examples || []),
+      },
     })
+    await clearRulesDraft(user.id)
     return NextResponse.json({ ok: true, me: JSON.parse(meInfo) })
   } catch (e) {
     const msg = tgErrorText(e)
