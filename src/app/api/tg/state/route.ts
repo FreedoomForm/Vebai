@@ -6,9 +6,20 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { accountView, envApiCreds, parseExamples, readRulesDraft } from '@/lib/tguser'
+import { accountView, decryptSecret, encryptSecret, envApiCreds, parseExamples, readRulesDraft } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
+
+/** T30: server-config self-check surfaced to probes/UI: the AES key for
+ *  session secrets must be derivable (GH_TERM_SECRET in env), otherwise the
+ *  connect flow would fail AFTER Telegram already sent the login code. */
+function encReady(): boolean {
+  try {
+    return decryptSecret(encryptSecret('probe')) === 'probe'
+  } catch {
+    return false
+  }
+}
 
 export async function GET(req: Request) {
   const { user, unauthorized } = await requireAuth(req)
@@ -45,6 +56,7 @@ export async function GET(req: Request) {
     })),
     worker,
     needApiCreds: !envApiCreds(),
+    encReady: encReady(),
     examplesCount: account ? parseExamples(account.config?.examples).length : 0,
     draft: account ? null : await readRulesDraft(user.id),
   })

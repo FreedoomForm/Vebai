@@ -185,6 +185,12 @@ export async function mtprotoSendCode(
 ): Promise<SendCodeResult> {
   const creds = parseApiCreds(ownCreds || {})
   if ('error' in creds) throw new Error(creds.error)
+  // T30: encrypt the api_hash BEFORE touching MTProto — a missing/invalid
+  // encryption key is a server CONFIG error. If it threw inside the MTProto
+  // catch below, it would be reported as «Telegram недоступен» even though
+  // Telegram had already delivered the login code (exactly the owner-reported
+  // «GH_TERM_SECRET не задан» confusion).
+  const apiHashEnc = encryptSecret(creds.apiHash)
   const { TelegramClient, StringSession } = await gramjs()
   let client: InstanceType<typeof TelegramClient> | null = null
   try {
@@ -197,7 +203,7 @@ export async function mtprotoSendCode(
       viaApp: !!sent.isCodeViaApp,
       usingEnvCreds: !!envApiCreds(),
       apiId: creds.apiId,
-      apiHashEnc: encryptSecret(creds.apiHash),
+      apiHashEnc,
     }
   } catch (e) {
     logTgFailure('sendCode', e)
@@ -228,10 +234,13 @@ export interface VerifiedLogin {
  *  Throws NeedPasswordError when the cloud password is required. */
 export async function mtprotoVerifyCode(args: VerifyCodeArgs): Promise<VerifiedLogin> {
   const { TelegramClient, StringSession, computeCheck, Api } = await gramjs()
+  // T30: decrypt inputs BEFORE the MTProto try — decryption failures are
+  // server config problems (missing key / corrupted row), not Telegram errors.
+  const apiHash = decryptSecret(args.apiHashEnc)
+  const loginSession = decryptSecret(args.loginSessionEnc)
   let client: InstanceType<typeof TelegramClient> | null = null
   try {
-    const apiHash = decryptSecret(args.apiHashEnc)
-    client = new TelegramClient(new StringSession(decryptSecret(args.loginSessionEnc)), args.apiId, apiHash, clientOpts())
+    client = new TelegramClient(new StringSession(loginSession), args.apiId, apiHash, clientOpts())
     await client.connect()
     if (args.status === '2fa' || (!args.code && args.password)) {
       const pwdInfo = await client.invoke(new Api.account.GetPassword())
