@@ -18,10 +18,40 @@ function sse(payload: Record<string, unknown>): Uint8Array {
 
 /* ---- terminal dispatch ------------------------------------------------- */
 
+/** T22 (owner request 2026-10-19): the model hands a REAL job (PDF, report,
+ * xlsx, analysis...) to the RESIDENT AGENT with a ```run-agent``` fenced
+ * block containing the full natural-language task. The task is queued as an
+ * '#!agent' TerminalCommand — the GitHub Actions LLM loop plans its own
+ * steps, sees every command's output, fixes mistakes, verifies the result
+ * and delivers polished files. THIS is the feedback loop: unlike raw
+ * ```run-terminal``` one-shots, the agent reads what each command returns
+ * and iterates until the job is actually done. */
+async function launchAgentBlocks(text: string, conversationId: string): Promise<number> {
+  const re = /```run-agent\s*\n([\s\S]*?)```/g
+  let n = 0
+  for (let m = re.exec(text); m && n < 2; m = re.exec(text)) {
+    const task = m[1].trim().slice(0, 8000)
+    if (!task) continue
+    await db.agentTask.create({
+      data: {
+        conversationId,
+        type: 'terminal',
+        title: `🤖 ${task.replace(/\s+/g, ' ').slice(0, 90)}`,
+        status: 'queued',
+        progress: 'Автономный агент на GitHub Actions возьмёт задачу в течение минуты…',
+        payload: JSON.stringify({ command: `#!agent\n${task}`, terminalId: conversationId, timeoutS: 3600 }),
+      },
+    })
+    n++
+  }
+  return n
+}
+
 /** the model marks commands to ACTUALLY execute with fenced blocks:
  * ```run-terminal\n<cmd>\n``` — queue each as a terminal AgentTask; the agent
  * worker ships it to the GitHub Actions Linux executor (Kaggle is video-only
- * per owner rule) and posts the output back. */
+ * per owner rule) and posts the output back. Quick raw shell for small
+ * things — the output returns as a chat message but nothing iterates on it. */
 async function launchTerminalBlocks(text: string, conversationId: string): Promise<number> {
   const re = /```run-terminal\s*\n([\s\S]*?)```/g
   let n = 0
@@ -364,11 +394,19 @@ export async function POST(req: NextRequest) {
         // full text when the model ignored the <answer> protocol entirely
         const tail = answerFilter.flush()
         if (tail) controller.enqueue(sse({ type: 'delta', text: tail }))
-        // ---- terminal dispatch: fenced run-terminal blocks -> Linux worker
+        // ---- terminal dispatch: fenced run-agent blocks -> resident agent,
+        // run-terminal blocks -> Linux worker
         if (conversationId) {
           try {
             const conv = await db.conversation.findUnique({ where: { id: conversationId } })
             if (conv && (!conv.userId || conv.userId === user.id)) {
+              const na = await launchAgentBlocks(fullAnswer, conversationId)
+              if (na > 0) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: `🤖 ${na} задач(а) переданы автономному агенту (GitHub Actions, Ubuntu): он сам спланирует шаги, выполнит команды, проверит результат и пришлёт готовый ответ с файлами (обычно 2-15 минут)`,
+                }))
+              }
               const n = await launchTerminalBlocks(fullAnswer, conversationId)
               if (n > 0) {
                 controller.enqueue(sse({
