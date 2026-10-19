@@ -366,7 +366,7 @@ export function TgAgentApp() {
                     ))}
                   </div>
                 </div>
-              ) })()}
+              ) : null })()}
             </section>
 
             {/* 3. test */}
