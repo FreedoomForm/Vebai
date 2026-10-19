@@ -74,6 +74,16 @@ async function apiRetry(path, payload, timeoutMs = 60_000, attempts = 3) {
   throw lastErr
 }
 
+/** T34: a GramJS promise that never settles (dead DC route, stalled socket)
+ * used to freeze the WHOLE supervisor loop: no more polls, no more heartbeats,
+ * no more job reports. Bound every external await. */
+function withTimeout(p, ms, what) {
+  return Promise.race([
+    Promise.resolve(p),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${what}: не завершилось за ${Math.round(ms / 1000)} с`)), ms)),
+  ])
+}
+
 function makeClient(a) {
   const { TelegramClient } = require('telegram')
   const { StringSession } = require('telegram/sessions')
@@ -93,7 +103,7 @@ async function connectAccount(a, sig) {
   const { NewMessage } = require('telegram/events')
 
   const client = makeClient(a)
-  await client.connect()
+  await withTimeout(client.connect(), 45_000, 'Telegram connect (listener)')
 
   const lastPerChat = new Map() // high-water message id per chat (replay guard)
   const lastSentAt = new Map() // per-chat cooldown
@@ -272,7 +282,7 @@ async function outboxClient(t) {
     let so = sendOnly.get(t.accountId)
     if (!so) {
       so = makeClient({ session: t.session, apiId: t.apiId, apiHash: t.apiHash })
-      await so.connect()
+      await withTimeout(so.connect(), 45_000, 'Telegram connect')
       sendOnly.set(t.accountId, so)
     }
     entry = { client: so }
@@ -340,8 +350,10 @@ async function pollOutbox(res) {
   if (jobs.length > 0) log(`outbox: ${jobs.length} job(s) picked up`)
   for (const t of jobs) {
     try {
-      if (t.kind === 'read') await runReadJob(t)
-      else await runOutboxJob(t)
+      // T34: hard per-job cap — a hung job must fail honestly (the report
+      // still goes out) instead of freezing the poll loop / orphaning the claim
+      if (t.kind === 'read') await withTimeout(runReadJob(t), 300_000, 'задача чтения Telegram')
+      else await withTimeout(runOutboxJob(t), 180_000, 'задача отправки Telegram')
     } catch (e) {
       const msg = String((e && e.message) || e).slice(0, 300)
       log(`outbox ${String(t.id).slice(-6)} failed:`, msg)

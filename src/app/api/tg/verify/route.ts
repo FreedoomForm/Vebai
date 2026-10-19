@@ -57,6 +57,10 @@ export async function POST(req: Request) {
         sessionEnc: encryptSecret(res.session),
         status: 'connected',
         statusText: 'подключено',
+        // T34: connect creates the row with active:false (re-login safety);
+        // a VERIFIED session must be active, or /api/tg/work never hands the
+        // account to the worker and the personal agent never listens
+        active: true,
         meInfo,
         phoneCodeHash: null,
         loginSessionEnc: null,
