@@ -40,7 +40,11 @@ SECRET = os.environ.get("SECRET") or ""
 SESSION = os.environ.get("SESSION") or ""
 SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
-MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS") or "30")
+# T24 (owner request 2026-10-19): 0 / unset = NO step cap - the model works
+# until the task deadline (AGENT_BUDGET_MIN) or the shift deadline, exactly
+# like the Z.ai reference agent. The only remaining guards are the task
+# budget, the same-command-repeats detector and the truth guard.
+MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS") or "0")
 BUDGET_MIN = float(os.environ.get("AGENT_BUDGET_MIN") or "45")
 STEP_TMO_DEFAULT = 180   # seconds per bash command
 STEP_TMO_MAX = 900       # hard cap: keeps command-row heartbeat gaps < 25 min
@@ -454,7 +458,9 @@ def run_agent(task, budget_min=None) -> str:
 
     heartbeat()  # initial silent beat (T16: no user-visible "took the task" line)
 
-    for step in range(1, MAX_STEPS + 1):
+    # T24: AGENT_MAX_STEPS=0 means unlimited steps - bound only by the deadline
+    step_cap = MAX_STEPS if MAX_STEPS > 0 else 10 ** 9
+    for step in range(1, step_cap + 1):
         if time.time() > deadline:
             history.append({"role": "user",
                             "content": "[СИСТЕМА] время задачи истекло — больше не запускай команд, дай <final> о том, что сделано."})
@@ -526,7 +532,7 @@ def run_agent(task, budget_min=None) -> str:
             "content": ("=== вывод шага %d ===\n" % step) + "\n\n".join(outputs)})
         compact(history)
     else:
-        # step budget exhausted: force a final summary
+        # step cap reached (only possible when AGENT_MAX_STEPS > 0): force a final
         try:
             reply, _ = zai_client.chat(
                 [{"role": "system", "content": system}] + history +

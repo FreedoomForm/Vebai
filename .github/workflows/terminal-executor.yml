@@ -56,6 +56,9 @@ jobs:
           # agent mode ('#!agent' tasks): GLM brain + budget knobs
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_BASE_URL: ${{ secrets.ZAI_BASE_URL }}
-          AGENT_MAX_STEPS: '40'
-          AGENT_BUDGET_MIN: '45'
+          # T24: AGENT_MAX_STEPS '0' = no step cap (Z.ai-style: the only bounds
+          # are the task budget below and the shift deadline). Budget 45->90 min
+          # for long document jobs; per-shift queue still protected.
+          AGENT_MAX_STEPS: '0'
+          AGENT_BUDGET_MIN: '90'
         run: python3 .github/terminal_executor.py
