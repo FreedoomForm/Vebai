@@ -45,6 +45,9 @@ jobs:
             pillow pandas beautifulsoup4 lxml qrcode pypdf requests \
             || true
           python3 -c "import reportlab, matplotlib, docx, openpyxl, pptx, pypdf; print('agent libs OK')" || true
+          # T33: the Telegram app on the agent's computer (.github/tg.js)
+          npm install --no-save --no-audit --no-fund telegram \
+            || echo "tg.js will self-install on first use"
 
       - name: Execute queued terminal commands
         env:

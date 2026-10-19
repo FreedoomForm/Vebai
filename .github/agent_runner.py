@@ -39,6 +39,9 @@ SITE = (os.environ.get("SITE") or "https://vebai-six.vercel.app").rstrip("/")
 SECRET = os.environ.get("SECRET") or ""
 SESSION = os.environ.get("SESSION") or ""
 SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+# T33: the Telegram APP on the agent's computer (full MTProto API from the
+# owner's connected account). Exposed to every bash command as "$TG".
+TG_APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg.js")
 
 # T24 (owner request 2026-10-19): 0 / unset = NO step cap - the model works
 # until the task deadline (AGENT_BUDGET_MIN) or the shift deadline, exactly
@@ -419,6 +422,11 @@ def run_agent(task, budget_min=None) -> str:
     WS = os.environ.get("AGENT_WS") or "/tmp/ws"
     MEMORY = os.environ.get("AGENT_MEMORY") or "/tmp/agent_memory.md"
     os.makedirs(WS, exist_ok=True)
+    # T33: the Telegram app is on the computer only when the repo checkout
+    # actually contains it (guards against stale runner workspaces)
+    tg_path = TG_APP if os.path.isfile(TG_APP) else ""
+    if tg_path:
+        os.environ["TG"] = tg_path  # inherited by every <cmd> subprocess
     started_ts = time.time()
 
     try:
@@ -443,7 +451,8 @@ def run_agent(task, budget_min=None) -> str:
         f"- utcnow: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n"
         f"- скиллы (плейбуки): {SKILLS_DIR} — там есть: {skills}\n"
         "  перед задачей типа pdf/charts/docx/xlsx/pptx/media/web прочитай нужный плейбук\n"
-        f"- память смены (итоги прошлых задач):\n{load_memory()}\n"
+        + (f"- приложение Telegram: node \"$TG\" help (действует от имени личного аккаунта владельца; как комбинировать с компьютером — см. AGENT.md)\n" if tg_path else "")
+        + f"- память смены (итоги прошлых задач):\n{load_memory()}\n"
     )
     if os.environ.get("AGENT_GUEST"):
         header += (
