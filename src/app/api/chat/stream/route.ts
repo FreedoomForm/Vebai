@@ -6,7 +6,7 @@ import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { createAnswerStreamFilter } from '@/lib/agent/answer'
 import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
-import { createOutboxTasks } from '@/lib/agent/outbox'
+import { createOutboxTasks, createTgReadTasks } from '@/lib/agent/outbox'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 300
@@ -454,6 +454,21 @@ export async function POST(req: NextRequest) {
                 controller.enqueue(sse({
                   type: 'notice',
                   text: `📤 ${nt} задача(и) на отправку через твой Telegram-аккаунт поставлены в очередь — если указан файл, он уйдёт, как только агент его создаст; отчёт придёт в чат`,
+                }))
+              }
+              // T32: ```run-tg-read``` blocks -> the worker READS messages from
+              // the owner's chats; the transcript lands in the chat and the
+              // agent auto-continues the order (continueAfterRead)
+              const nr = await createTgReadTasks(fullAnswer, conversationId, user.id)
+              if (nr === -1) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: '📖 Задачу чтения Telegram выполнить нельзя: твой аккаунт Telegram ещё не подключён — подключи его на странице /tgagent и попроси повторить',
+                }))
+              } else if (nr > 0) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: `📖 ${nr} задача(и) на чтение Telegram поставлены в очередь — воркер прочитает сообщения (до 200 за блок), транскрипт придёт в чат, и агент продолжит выполнение сам`,
                 }))
               }
             }

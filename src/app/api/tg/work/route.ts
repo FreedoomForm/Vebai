@@ -9,7 +9,7 @@ import crypto from 'node:crypto'
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { decryptSecret, parseExamples } from '@/lib/tguser'
-import { readyOutboxForWorker } from '@/lib/agent/outbox'
+import { readyOutboxForWorker, readyTgReadForWorker } from '@/lib/agent/outbox'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -68,6 +68,16 @@ export async function POST(req: Request) {
   // the resident workers ever need to be stopped from the site side.
   // T31: also hand out pending tg_outbox jobs (send a message/file FROM the
   // owner's own account to a requested contact) — claimed atomically.
-  const outbox = await readyOutboxForWorker(5).catch(() => [])
-  return NextResponse.json({ accounts: out, outbox, now: new Date().toISOString(), resident: true })
+  // T32: plus tg_read jobs (fetch the last N messages of a chat) — same
+  // auth, same claim pattern; the worker branches on `kind`.
+  const [sends, reads] = await Promise.all([
+    readyOutboxForWorker(5).catch(() => []),
+    readyTgReadForWorker(5).catch(() => []),
+  ])
+  return NextResponse.json({
+    accounts: out,
+    outbox: [...sends, ...reads],
+    now: new Date().toISOString(),
+    resident: true,
+  })
 }

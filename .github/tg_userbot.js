@@ -14,6 +14,14 @@
  * /api/tg/outbox-result. Only person-to-person chats: channels/groups/bots
  * are refused; nothing about message texts is logged (ids and lengths only).
  *
+ * T32: the same outbox array also carries `kind:'read'` jobs — the site
+ * agent's ```run-tg-read``` blocks. The worker fetches the LAST N messages of
+ * the requested chat (DMs and groups; broadcast channels and bots refused),
+ * serializes {from,date,text} (media marked, no media downloads) and reports
+ * the transcript to /api/tg/outbox-result (kind=read) — the site feeds it
+ * back to the agent, which continues the order on its own. NOTHING textual
+ * from the read messages is ever logged (count/lengths only).
+ *
  * Safety: private chats only, never bots, never first messages, replay guard
  * (msg age < 4 min + per-chat high-water id), 30 s per-chat cooldown, 25
  * replies/hour cap, and NOTHING about message text is ever logged (ids and
@@ -203,16 +211,7 @@ async function findPeer(client, q) {
 /** one outbox job: resolve the peer, send message/document from the owner's
  * account, report to /api/tg/outbox-result. Only person-to-person chats. */
 async function runOutboxJob(t) {
-  let entry = clients.get(t.accountId)
-  if (!entry) {
-    let so = sendOnly.get(t.accountId)
-    if (!so) {
-      so = makeClient({ session: t.session, apiId: t.apiId, apiHash: t.apiHash })
-      await so.connect()
-      sendOnly.set(t.accountId, so)
-    }
-    entry = { client: so }
-  }
+  const entry = await outboxClient(t)
   const peer = await findPeer(entry.client, t.peer)
   const cls = peer.className || (peer.constructor && peer.constructor.name) || ''
   if (cls === 'Channel' || cls === 'Chat') {
@@ -245,12 +244,86 @@ async function runOutboxJob(t) {
   await api('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, info })
 }
 
+/* ------------------------------------------------------------ T32 reads */
+
+/** shared client pool for outbox jobs (send AND read): reuse the listening
+ * client when the account is already connected, else a send-only client */
+async function outboxClient(t) {
+  let entry = clients.get(t.accountId)
+  if (!entry) {
+    let so = sendOnly.get(t.accountId)
+    if (!so) {
+      so = makeClient({ session: t.session, apiId: t.apiId, apiHash: t.apiHash })
+      await so.connect()
+      sendOnly.set(t.accountId, so)
+    }
+    entry = { client: so }
+  }
+  return entry
+}
+
+/** one read job (T32): resolve the chat, fetch the LAST N messages (optionally
+ * Telegram-searched), report the transcript to /api/tg/outbox-result with
+ * kind=read. Allowed: personal chats and groups the owner is inside.
+ * Refused: broadcast channels and bots. Media is MARKED, never downloaded.
+ * The Actions log keeps only counts/lengths — never any message text. */
+async function runReadJob(t) {
+  const entry = await outboxClient(t)
+  const peer = await findPeer(entry.client, t.chat)
+  const cls = peer.className || (peer.constructor && peer.constructor.name) || ''
+  if (cls === 'Channel' && !peer.megagroup) {
+    throw new Error('чтение доступно только из личных чатов и групп — каналы запрещены')
+  }
+  if (peer.bot) throw new Error('чтение переписки с ботом отключено')
+  const limit = Math.min(Math.max(Number(t.limit) || 50, 1), 200)
+  const opts = { limit }
+  if (t.search) opts.search = String(t.search)
+  const msgs = await entry.client.getMessages(peer.id, opts)
+  const senderCache = new Map() // fromId -> display name (one getSender per peer)
+  const out = []
+  for (const m of msgs) {
+    if (!m || m.action) continue // service messages skipped
+    let from
+    if (m.out) from = 'Я (владелец)'
+    else {
+      const pid = String((m.fromId && (m.fromId.userId || m.fromId.channelId || m.fromId.chatId)) || '')
+      if (senderCache.has(pid)) from = senderCache.get(pid)
+      else {
+        let s = null
+        try { s = await m.getSender() } catch { /* privacy/entity miss */ }
+        from = s ? entityName(s) : pid ? `id${pid}` : '?'
+        senderCache.set(pid, from)
+      }
+    }
+    let text = String(m.message || '').trim()
+    if (!text && m.media) {
+      const mc = String((m.media.className || m.media.constructor && m.media.constructor.name) || '')
+      text = `[медиа: ${mc.replace(/^MessageMedia/, '').toLowerCase() || 'вложение'}]`
+    }
+    if (!text) continue
+    out.push({
+      id: String(m.id),
+      out: !!m.out,
+      date: new Date((m.date || 0) * 1000).toISOString(),
+      from,
+      text: text.slice(0, 2000),
+    })
+    if (out.length >= limit) break
+  }
+  out.reverse() // oldest first — natural reading order for the transcript
+  const info = { peerId: String(peer.id), peerName: entityName(peer), count: out.length }
+  const chars = out.reduce((a, x) => a + x.text.length, 0)
+  log(`read ${t.id.slice(-6)}: chat=${info.peerName} count=${out.length} chars=${chars} search=${t.search ? 'yes' : 'no'}`)
+  await api('/api/tg/outbox-result', { secret: SECRET, id: t.id, ok: true, kind: 'read', info, messages: out }, 120_000)
+}
+
 async function pollOutbox(res) {
   const jobs = Array.isArray(res.outbox) ? res.outbox : []
   if (jobs.length > 0) log(`outbox: ${jobs.length} job(s) picked up`)
   for (const t of jobs) {
     try {
-      await runOutboxJob(t)
+      if (t.kind === 'read') await runReadJob(t)
+      else await runOutboxJob(t)
     } catch (e) {
       const msg = String((e && e.message) || e).slice(0, 300)
       log(`outbox ${String(t.id).slice(-6)} failed:`, msg)

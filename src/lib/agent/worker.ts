@@ -582,8 +582,10 @@ async function tick() {
 
     // T31: telegram outbox (send from the owner's account) — honest failures,
     // stale retries and file waits are maintained here every tick
-    const { syncOutboxTasks } = await import('./outbox')
+    const { syncOutboxTasks, syncTgReadTasks } = await import('./outbox')
     await syncOutboxTasks()
+    // T32: telegram reads (run-tg-read) — stale-worker retries
+    await syncTgReadTasks()
 
     await ghResidentKeepalive()
   } catch (e) {
