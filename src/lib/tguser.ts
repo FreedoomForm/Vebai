@@ -70,10 +70,19 @@ export function parseApiCreds(input: { apiId?: unknown; apiHash?: unknown }):
 }
 
 export function normalizePhone(input: unknown): { phone: string } | { error: string } {
-  const raw = String(input || '').replace(/[^\d+]/g, '')
-  const digits = raw.startsWith('+') ? raw.slice(1) : raw
-  if (!/^\d{8,15}$/.test(digits)) return { error: 'номер в международном формате, например +998901234567' }
-  return { phone: `+${digits}` }
+  let raw = String(input || '').replace(/[^\d+]/g, '')
+  if (!raw.startsWith('+')) {
+    // bare national numbers: guess the country instead of failing with a
+    // cryptic PHONE_NUMBER_INVALID (the audience is Uzbekistan first)
+    if (/^8\d{10}$/.test(raw)) raw = `+7${raw.slice(1)}` // 8XXXXXXXXXX (legacy) -> +7
+    else if (/^998\d{9}$/.test(raw)) raw = `+${raw}` // 998XXXXXXXXX without +
+    else if (/^\d{9}$/.test(raw)) raw = `+998${raw}` // 9 digits -> Uzbekistan
+    else raw = `+${raw}`
+  }
+  const digits = raw.slice(1)
+  if (!/^\d{8,15}$/.test(digits))
+    return { error: 'номер в международном формате, например +998901234567 (можно просто 9 цифр — добавлю +998)' }
+  return { phone: raw }
 }
 
 /* ------------------------------------------------------------- gramjs glue */
@@ -109,6 +118,9 @@ export function clientOpts() {
  *  are the T21 rule: never swallow, never fake success). */
 export function tgErrorText(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e)
+  const flood = raw.match(/FLOOD_WAIT_(\d+)/i)
+  if (flood)
+    return `Telegram: слишком много попыток входа — подожди ${flood[1]} сек и попробуй снова (FLOOD_WAIT)`
   const map: [RegExp, string][] = [
     [/PHONE_NUMBER_INVALID/i, 'Telegram отклонил номер: PHONE_NUMBER_INVALID'],
     [/PHONE_NUMBER_UNEXISTED/i, 'Telegram: номер не зарегистрирован (PHONE_NUMBER_UNEXISTED)'],
@@ -117,11 +129,134 @@ export function tgErrorText(e: unknown): string {
     [/SESSION_PASSWORD_NEEDED/i, 'Включена двухфакторная защита — нужен облачный пароль'],
     [/PASSWORD_HASH_INVALID/i, 'Неверный облачный пароль (2FA)'],
     [/API_ID_INVALID|API_ID_PUBLISHED_FLOOD/i, 'api_id отклонён Telegram (API_ID_INVALID/PUBLISHED_FLOOD) — проверь api_id/api_hash с my.telegram.org'],
-    [/FLOOD_WAIT_(\d+)/i, 'Telegram: слишком много попыток, подожди немного (FLOOD_WAIT)'],
     [/AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED/i, 'сессия недействительна — переподключи аккаунт'],
   ]
   for (const [re, msg] of map) if (re.test(raw)) return msg
   return raw.slice(0, 240)
+}
+
+/* ------------------------------------------------ shared MTProto login flow */
+
+/** Mark of an MTProto-level failure (already humanized) — callers prefix it
+ *  with «Telegram недоступен» while passing validation errors as-is. */
+export class TgMtprotoError extends Error {}
+
+/** thrown by mtprotoVerifyCode when Telegram demands the 2FA cloud password */
+export class NeedPasswordError extends Error {}
+
+export interface SendCodeResult {
+  phoneCodeHash: string
+  loginSession: string // StringSession created during sendCode (MUST match at signIn)
+  viaApp: boolean
+  usingEnvCreds: boolean
+  apiId: number
+  apiHashEnc: string
+}
+
+/** Ask Telegram to send the login code for `phone`. A fresh MTProto connection
+ *  is made each time (Vercel lambdas are stateless) — Telegram validates the
+ *  code against phoneCodeHash, not against the socket. Throws TgMtprotoError
+ *  (humanized) on MTProto failures, plain Error on validation problems. */
+export async function mtprotoSendCode(
+  phone: string,
+  ownCreds?: { apiId?: unknown; apiHash?: unknown },
+): Promise<SendCodeResult> {
+  const creds = parseApiCreds(ownCreds || {})
+  if ('error' in creds) throw new Error(creds.error)
+  const { TelegramClient, StringSession } = await gramjs()
+  let client: InstanceType<typeof TelegramClient> | null = null
+  try {
+    client = new TelegramClient(new StringSession(''), creds.apiId, creds.apiHash, clientOpts())
+    await client.connect()
+    const sent = await client.sendCode({ apiId: creds.apiId, apiHash: creds.apiHash }, phone)
+    return {
+      phoneCodeHash: sent.phoneCodeHash,
+      loginSession: (client.session.save() as unknown as string) || '',
+      viaApp: !!sent.isCodeViaApp,
+      usingEnvCreds: !!envApiCreds(),
+      apiId: creds.apiId,
+      apiHashEnc: encryptSecret(creds.apiHash),
+    }
+  } catch (e) {
+    throw new TgMtprotoError(tgErrorText(e))
+  } finally {
+    try { if (client) await client.disconnect() } catch { /* already gone */ }
+  }
+}
+
+export interface VerifyCodeArgs {
+  apiId: number
+  apiHashEnc: string
+  loginSessionEnc: string
+  phone: string
+  phoneCodeHash: string
+  status: string // 'pending' | '2fa'
+  code: string
+  password: string
+}
+
+export interface VerifiedLogin {
+  session: string // long-lived StringSession (encrypt before storing!)
+  me: { id: string; firstName: string; username: string; phone: string }
+}
+
+/** Verify the login code (auth.signIn) on the SAME login session created by
+ *  mtprotoSendCode; handles the 2FA path (account.GetPassword + SRP check).
+ *  Throws NeedPasswordError when the cloud password is required. */
+export async function mtprotoVerifyCode(args: VerifyCodeArgs): Promise<VerifiedLogin> {
+  const { TelegramClient, StringSession, computeCheck, Api } = await gramjs()
+  let client: InstanceType<typeof TelegramClient> | null = null
+  try {
+    const apiHash = decryptSecret(args.apiHashEnc)
+    client = new TelegramClient(new StringSession(decryptSecret(args.loginSessionEnc)), args.apiId, apiHash, clientOpts())
+    await client.connect()
+    if (args.status === '2fa' || (!args.code && args.password)) {
+      const pwdInfo = await client.invoke(new Api.account.GetPassword())
+      const check = await computeCheck(pwdInfo, args.password)
+      await client.invoke(new Api.auth.CheckPassword({ password: check }))
+    } else {
+      await client.invoke(
+        new Api.auth.SignIn({
+          phoneNumber: args.phone,
+          phoneCodeHash: args.phoneCodeHash,
+          phoneCode: args.code,
+        }),
+      )
+    }
+    const me = await client.getMe()
+    return {
+      session: (client.session.save() as unknown as string) || '',
+      me: { id: String(me.id), firstName: me.firstName || '', username: me.username || '', phone: args.phone },
+    }
+  } catch (e) {
+    const raw = e instanceof Error ? e.message : String(e)
+    if (/SESSION_PASSWORD_NEEDED/i.test(raw)) throw new NeedPasswordError()
+    throw new TgMtprotoError(tgErrorText(e))
+  } finally {
+    try { if (client) await client.disconnect() } catch { /* already gone */ }
+  }
+}
+
+/** human error for UI/chat: MTProto failures get the «Telegram недоступен» tag */
+export function humanTgError(e: unknown): string {
+  if (e instanceof TgMtprotoError) return `Telegram недоступен: ${e.message}`
+  return e instanceof Error ? e.message : String(e)
+}
+
+/** Move the pre-connection rules draft into the agent config (after a
+ *  successful login). Used by BOTH the site /verify and the bot connect FSM. */
+export async function migrateRulesDraft(userId: string, accountId: string): Promise<void> {
+  const draft = await readRulesDraft(userId)
+  await db.tgAgentConfig.upsert({
+    where: { accountId },
+    update: {},
+    create: {
+      accountId,
+      systemPrompt: draft.systemPrompt || DEFAULT_AGENT_PROMPT,
+      examples: JSON.stringify(draft.examples || []),
+    },
+  })
+  await clearRulesDraft(userId)
 }
 
 /* --------------------------------------------------------- agent prompting */

@@ -52,7 +52,11 @@ async function api<T>(url: string, body?: unknown, method = 'POST'): Promise<T> 
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const data = (await res.json().catch(() => ({}))) as T & { error?: string }
-  if (!res.ok) throw new Error(data.error || `ошибка ${res.status}`)
+  if (!res.ok) {
+    const err = new Error(data.error || `ошибка ${res.status}`) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
   return data
 }
 
@@ -66,6 +70,7 @@ export function TgAgentApp() {
   const [state, setState] = useState<TgState | null>(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
+  const [errStatus, setErrStatus] = useState(0)
 
   // connect form
   const [step, setStep] = useState<'phone' | 'code'>('phone')
@@ -94,9 +99,11 @@ export function TgAgentApp() {
       const s = await api<TgState>('/api/tg/state', undefined, 'GET')
       setState(s)
       setPromptDraft((prev) => prev || s.account?.systemPrompt || s.draft?.systemPrompt || '')
-      setErr('')
+      setErr(''); setErrStatus(0)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'ошибка загрузки')
+      const er = e as Error & { status?: number }
+      setErr(er instanceof Error ? er.message : 'ошибка загрузки')
+      setErrStatus(er?.status || 0)
     } finally {
       setLoading(false)
     }
@@ -109,8 +116,12 @@ export function TgAgentApp() {
   }, [refresh])
 
   const run = async (key: string, fn: () => Promise<void>) => {
-    setBusy(key); setErr('')
-    try { await fn() } catch (e) { setErr(e instanceof Error ? e.message : 'ошибка') } finally { setBusy('') }
+    setBusy(key); setErr(''); setErrStatus(0)
+    try { await fn() } catch (e) {
+      const er = e as Error & { status?: number }
+      setErr(er instanceof Error ? er.message : 'ошибка')
+      setErrStatus(er?.status || 0)
+    } finally { setBusy('') }
   }
 
   const connected = state?.account?.status === 'connected'
@@ -226,11 +237,16 @@ export function TgAgentApp() {
           <a href="/" className="inline-block text-xs text-emerald-400/80 hover:text-emerald-300">← в Vebai</a>
         </header>
 
-        {err && (
+        {err && (errStatus === 401 || /unauthorized/i.test(err) ? (
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            Ты не вошёл в аккаунт сайта — подключение Telegram привязывается к твоему аккаунту Vebai.
+            {' '}<a href="/" className="font-semibold underline">Открой главную и войди</a>, затем вернись сюда.
+          </div>
+        ) : (
           <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
             {err}
           </div>
-        )}
+        ))}
 
         {loading ? (
           <div className={`${card} text-sm text-white/50`}>загружаю состояние…</div>
@@ -286,6 +302,9 @@ export function TgAgentApp() {
                           {busy === 'code' ? 'отправляю…' : 'Получить код'}
                         </button>
                       </div>
+                      <p className="mt-1.5 text-xs text-white/40">
+                        Формат: +998901234567 — можно просто 9 цифр, +998 добавится сам. Код придёт в твоё Telegram-приложение.
+                      </p>
                     </div>
                   ) : (
                     <div className="space-y-3">

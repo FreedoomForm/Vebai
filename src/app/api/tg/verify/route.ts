@@ -1,15 +1,22 @@
 /**
- * T26: POST /api/tg/verify — step 2 of the login: { accountId, code, password? }.
+ * T26/T27: POST /api/tg/verify — step 2 of the login: { accountId, code, password? }.
  * Verifies the code (auth.signIn) on the SAME login session created by
  * /connect; handles the 2FA path (SESSION_PASSWORD_NEEDED → account.GetPassword
  * + computeCheck + auth.CheckPassword). On success the long-lived GramJS
  * StringSession is encrypted and stored, the account becomes 'connected' and
- * gets a default agent config.
+ * gets a default agent config (rules draft migrates here too).
  */
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { gramjs, clientOpts, tgErrorText, decryptSecret, encryptSecret, getOwnedAccount, readRulesDraft, clearRulesDraft, DEFAULT_AGENT_PROMPT } from '@/lib/tguser'
+import {
+  mtprotoVerifyCode,
+  NeedPasswordError,
+  humanTgError,
+  encryptSecret,
+  getOwnedAccount,
+  migrateRulesDraft,
+} from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 30
@@ -32,40 +39,22 @@ export async function POST(req: Request) {
   if (account.status === '2fa' && !password)
     return NextResponse.json({ needPassword: true, error: 'введи облачный пароль (2FA)' }, { status: 400 })
 
-  const { TelegramClient, StringSession, computeCheck, Api } = await gramjs()
-  const apiHash = decryptSecret(account.apiHashEnc)
-  let client
   try {
-    client = new TelegramClient(
-      new StringSession(decryptSecret(account.loginSessionEnc)),
-      account.apiId, apiHash, clientOpts(),
-    )
-    await client.connect()
-    if (account.status === '2fa' || (!code && password)) {
-      const pwdInfo = await client.invoke(new Api.account.GetPassword())
-      const check = await computeCheck(pwdInfo, password)
-      await client.invoke(new Api.auth.CheckPassword({ password: check }))
-    } else {
-      await client.invoke(
-        new Api.auth.SignIn({
-          phoneNumber: account.phone,
-          phoneCodeHash: account.phoneCodeHash,
-          phoneCode: code,
-        }),
-      )
-    }
-    const me = await client.getMe()
-    const meInfo = JSON.stringify({
-      id: String(me.id),
-      firstName: me.firstName || '',
-      username: me.username || '',
+    const res = await mtprotoVerifyCode({
+      apiId: account.apiId,
+      apiHashEnc: account.apiHashEnc,
+      loginSessionEnc: account.loginSessionEnc,
       phone: account.phone,
+      phoneCodeHash: account.phoneCodeHash,
+      status: account.status,
+      code,
+      password,
     })
-    const sessionEnc = encryptSecret((client.session.save() as unknown as string) || '')
+    const meInfo = JSON.stringify(res.me)
     await db.tgAccount.update({
       where: { id: account.id },
       data: {
-        sessionEnc,
+        sessionEnc: encryptSecret(res.session),
         status: 'connected',
         statusText: 'подключено',
         meInfo,
@@ -74,34 +63,21 @@ export async function POST(req: Request) {
       },
     })
     // migrate the pre-connection rules draft into the agent config
-    const draft = await readRulesDraft(user.id)
-    await db.tgAgentConfig.upsert({
-      where: { accountId: account.id },
-      update: {},
-      create: {
-        accountId: account.id,
-        systemPrompt: draft.systemPrompt || DEFAULT_AGENT_PROMPT,
-        examples: JSON.stringify(draft.examples || []),
-      },
-    })
-    await clearRulesDraft(user.id)
-    return NextResponse.json({ ok: true, me: JSON.parse(meInfo) })
+    await migrateRulesDraft(user.id, account.id)
+    return NextResponse.json({ ok: true, me: res.me })
   } catch (e) {
-    const msg = tgErrorText(e)
-    if (/двухфакторн|SESSION_PASSWORD_NEEDED/i.test(msg)) {
+    if (e instanceof NeedPasswordError) {
       await db.tgAccount.update({
         where: { id: account.id },
         data: { status: '2fa', statusText: 'включена двухфакторная защита — введи облачный пароль' },
       }).catch(() => {})
-      return NextResponse.json({ needPassword: true, error: msg }, { status: 400 })
+      return NextResponse.json({ needPassword: true, error: 'Включена двухфакторная защита — нужен облачный пароль' }, { status: 400 })
     }
     // keep 'pending' so the user can retry code/2FA without a fresh code
     await db.tgAccount.update({
       where: { id: account.id },
-      data: { statusText: msg },
+      data: { statusText: humanTgError(e) },
     }).catch(() => {})
-    return NextResponse.json({ error: msg }, { status: 400 })
-  } finally {
-    try { if (client) await client.disconnect() } catch { /* already gone */ }
+    return NextResponse.json({ error: humanTgError(e) }, { status: 400 })
   }
 }

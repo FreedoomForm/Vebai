@@ -1,16 +1,14 @@
 /**
- * T26: POST /api/tg/connect — step 1 of the my.telegram.org-style login.
+ * T26/T27: POST /api/tg/connect — step 1 of the my.telegram.org-style login.
  * Body: { phone, apiId?, apiHash? } (api creds optional when the service has
  * TELEGRAM_API_ID/TELEGRAM_API_HASH in env). Sends the Telegram login code to
  * the phone via MTProto and stores the transient login state encrypted.
+ * Bare 9-digit numbers get +998 prepended (Uzbekistan default).
  */
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import {
-  gramjs, clientOpts, tgErrorText,
-  encryptSecret, parseApiCreds, normalizePhone, envApiCreds,
-} from '@/lib/tguser'
+import { mtprotoSendCode, normalizePhone, encryptSecret, humanTgError } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 30
@@ -20,32 +18,26 @@ export async function POST(req: Request) {
   if (unauthorized) return unauthorized
   if (!user) return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
 
-  const body = await req.json().catch(() => ({}))
+  const body = (await req.json().catch(() => ({}))) as { phone?: unknown; apiId?: unknown; apiHash?: unknown }
   const phoneRes = normalizePhone(body.phone)
   if ('error' in phoneRes) return NextResponse.json({ error: phoneRes.error }, { status: 400 })
   const phone = phoneRes.phone
-  const creds = parseApiCreds(body)
-  if ('error' in creds) return NextResponse.json({ error: creds.error }, { status: 400 })
 
-  const { TelegramClient, StringSession } = await gramjs()
-  let client
   try {
-    client = new TelegramClient(new StringSession(''), creds.apiId, creds.apiHash, clientOpts())
-    await client.connect()
-    const sent = await client.sendCode({ apiId: creds.apiId, apiHash: creds.apiHash }, phone)
-    const loginSession = (client.session.save() as unknown as string) || ''
+    const res = await mtprotoSendCode(phone, body)
     const existing = await db.tgAccount.findFirst({ where: { userId: user.id, phone } })
     const data = {
-      apiId: creds.apiId,
-      apiHashEnc: encryptSecret(creds.apiHash),
-      phoneCodeHash: sent.phoneCodeHash,
-      loginSessionEnc: encryptSecret(loginSession),
+      apiId: res.apiId,
+      apiHashEnc: res.apiHashEnc,
+      phoneCodeHash: res.phoneCodeHash,
+      loginSessionEnc: encryptSecret(res.loginSession),
       status: 'pending',
-      statusText: sent.isCodeViaApp
+      statusText: res.viaApp
         ? 'код отправлен в Telegram-приложение на этот номер'
         : 'код отправлен SMS на этот номер',
       meInfo: null,
       sessionEnc: null,
+      active: false, // a re-login of an old account must not leave it active
       updatedAt: new Date(),
     }
     const account = existing
@@ -54,12 +46,10 @@ export async function POST(req: Request) {
     return NextResponse.json({
       ok: true,
       accountId: account.id,
-      viaApp: !!sent.isCodeViaApp,
-      usingEnvCreds: !!envApiCreds(),
+      viaApp: res.viaApp,
+      usingEnvCreds: res.usingEnvCreds,
     })
   } catch (e) {
-    return NextResponse.json({ error: `Telegram недоступен: ${tgErrorText(e)}` }, { status: 400 })
-  } finally {
-    try { if (client) await client.disconnect() } catch { /* already gone */ }
+    return NextResponse.json({ error: humanTgError(e) }, { status: 400 })
   }
 }

@@ -3,6 +3,15 @@ import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { parseAiAnswer } from '@/lib/agent/answer'
+import {
+  mtprotoSendCode,
+  mtprotoVerifyCode,
+  NeedPasswordError,
+  humanTgError,
+  normalizePhone,
+  encryptSecret,
+  migrateRulesDraft,
+} from '@/lib/tguser'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -21,13 +30,23 @@ export const maxDuration = 60
  * Guests are rate-limited (concurrent + daily caps) because one resident
  * runner serves everyone sequentially.
  *
+ * T27: the menu carries «📱 Подключить Telegram аккаунт» — a per-chat FSM
+ * (phone -> code -> optional 2FA password) that connects the user's OWN
+ * Telegram account (MTProto, same TgAccount row as the site /tgagent). While
+ * not connected the button shows; once connected it disappears in the bot AND
+ * on the site, and the personal agent can answer incoming DMs on the user's
+ * behalf (resident worker, .github/tg_userbot.js). Messages containing the
+ * phone/code/password are deleted from the chat right after processing.
+ *
  * Setup (one-time): setWebhook with url + secret_token=TELEGRAM_WEBHOOK_SECRET.
  */
 
 const CACHE_KEY = 'telegramBot'
 const USERS_KEY = 'tgUsers'
 const LINK_TOKENS_KEY = 'tgLinkTokens'
+const CONNECT_KEY = 'tgBotConnect' // T27: per-chat connect FSM (phone/code/password)
 const MINI_APP_URL = process.env.VEBAI_MINI_APP_URL || 'https://vebai-six.vercel.app/tg'
+const SITE_BASE = MINI_APP_URL.replace(/\/tg$/, '') // for deep links to site pages
 
 /** guests: no more than this many running/queued tasks at once ... */
 const GUEST_MAX_ACTIVE = 1
@@ -90,6 +109,54 @@ async function writeUsersMap(map: TgUsersMap): Promise<void> {
   })
 }
 
+/* -------------------------------------------------- T27: connect-own-account */
+
+/** per-chat FSM for connecting the user's OWN Telegram account:
+ *  phone -> code -> optional 2FA password (the same TgAccount row the site
+ *  /tgagent creates, so connected state is visible in BOTH places) */
+interface ConnectFsm {
+  step: 'phone' | 'code' | 'password'
+  accountId?: string
+  phone?: string
+  exp: number
+}
+
+type ConnectMap = Record<string, ConnectFsm>
+
+async function readConnectMap(): Promise<ConnectMap> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: CONNECT_KEY } })
+    if (row) return JSON.parse(row.data) as ConnectMap
+  } catch { /* fall through */ }
+  return {}
+}
+
+async function writeConnectMap(map: ConnectMap): Promise<void> {
+  await db.studioState.upsert({
+    where: { key: CONNECT_KEY },
+    create: { key: CONNECT_KEY, data: JSON.stringify(map) },
+    update: { data: JSON.stringify(map) },
+  })
+}
+
+async function setConnect(chatId: string, fsm: ConnectFsm): Promise<void> {
+  const map = await readConnectMap()
+  map[chatId] = fsm
+  await writeConnectMap(map)
+}
+
+async function clearConnect(chatId: string): Promise<void> {
+  const map = await readConnectMap()
+  if (!map[chatId]) return
+  delete map[chatId]
+  await writeConnectMap(map)
+}
+
+/** the user's connected MTProto account (same row the site /tgagent uses) */
+function connectedAccount(userId: string) {
+  return db.tgAccount.findFirst({ where: { userId, status: 'connected' }, orderBy: { updatedAt: 'desc' } })
+}
+
 async function tgSend(
   chatId: number | string,
   text: string,
@@ -109,21 +176,33 @@ async function tgSend(
   } catch { /* best-effort */ }
 }
 
-const appButton = () => ({
-  inline_keyboard: [[{ text: '🌐 Открыть Vebai (аккаунт)', web_app: { url: MINI_APP_URL } }]],
-})
+const appButtonRow = (): { text: string; web_app: { url: string } }[] => [
+  { text: '🌐 Открыть Vebai (аккаунт)', web_app: { url: MINI_APP_URL } },
+]
 
-/** inline menu attached to every bot message: «Создать чат» и «Чаты» живут
- * ВНУТРИ чата под сообщениями (owner request 2026-10-18: кнопки в чате, не
- * внизу экрана). Pressing them clears the bot window down to the last /start. */
-const replyKeyboard = () => ({
-  inline_keyboard: [
+/** menu keyboard (T27): the «📱 Подключить Telegram аккаунт» button exists
+ *  ONLY while the user's account is not connected — once connected it
+ *  disappears here AND on the site (one shared TgAccount row), and the agent
+ *  toggle + rules link take its place. */
+async function menuKb(userId: string): Promise<Record<string, unknown>> {
+  const rows: Record<string, unknown>[][] = [
     [
       { text: '🆕 Создать чат', callback_data: 'newchat' },
       { text: '📂 Чаты', callback_data: 'chatlist' },
     ],
-  ],
-})
+    appButtonRow(),
+  ]
+  const acc = await connectedAccount(userId)
+  if (!acc) {
+    rows.push([{ text: '📱 Подключить Telegram аккаунт', callback_data: 'tgconnect' }])
+  } else {
+    rows.push([
+      { text: acc.active ? '🤖 Агент: ВКЛ — выключить' : '🤖 Агент: ВЫКЛ — включить', callback_data: 'tgagent' },
+      { text: '⚙️ Правила', url: `${SITE_BASE}/tgagent` },
+    ])
+  }
+  return { inline_keyboard: rows }
+}
 
 async function patchUserEntry(chatId: string, patch: Partial<TgUserEntry>): Promise<void> {
   const map = await readUsersMap()
@@ -149,6 +228,21 @@ async function clearBotWindow(chatId: string, currentMsgId: number, anchorMsgId?
       })
     } catch { /* best-effort */ }
   }
+}
+
+/** delete the user's message (T27 privacy: phone/code/password must not
+ * linger in the chat history). Bots may delete private-chat messages. */
+async function deleteMsg(chatId: string, messageId: number): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!token || !messageId) return
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+      signal: AbortSignal.timeout(10_000),
+    })
+  } catch { /* best-effort */ }
 }
 
 async function answerCallback(queryId: string, text: string): Promise<void> {
@@ -181,11 +275,18 @@ async function chatListKeyboard(userId: string): Promise<Record<string, unknown>
 }
 
 /** header text of the morphing control panel (menu state) */
-const menuPanelText = () =>
-  '🤖 Vebai — панель управления:\n\n' +
-  '• «🆕 Создать чат» — новый чат для задач\n' +
-  '• «📂 Чаты» — список чатов (история откроется одним сообщением)\n' +
-  'Обычный текст = задача агенту, «?текст» = быстрый вопрос. Кнопки: /menu'
+const menuPanelText = (connected: boolean) =>
+  connected
+    ? '🤖 Vebai — панель управления:\n\n' +
+      '• «🆕 Создать чат» — новый чат для задач\n' +
+      '• «📂 Чаты» — список чатов (история откроется одним сообщением)\n' +
+      '✅ твой Telegram подключён: агент отвечает на входящие личные сообщения от твоего имени (тумблер ниже, правила — «⚙️ Правила»)\n\n' +
+      'Обычный текст = задача агенту, «?текст» = быстрый вопрос. Кнопки: /menu'
+    : '🤖 Vebai — панель управления:\n\n' +
+      '• «🆕 Создать чат» — новый чат для задач\n' +
+      '• «📂 Чаты» — список чатов (история откроется одним сообщением)\n' +
+      '• «📱 Подключить Telegram аккаунт» — номер + код из Telegram, и агент сможет отвечать на входящие от твоего имени\n\n' +
+      'Обычный текст = задача агенту, «?текст» = быстрый вопрос. Кнопки: /menu'
 
 /** chat history condensed into ONE message (Telegram cap ~4096 chars) */
 async function chatDigest(convId: string, title?: string): Promise<string> {
@@ -279,7 +380,7 @@ async function createChat(chatId: string, entry: TgUserEntry, currentMsgId: numb
   await tgSend(
     chatId,
     '🆕 Новый чат создан — пиши задачу. Прежняя история и файлы остались в аккаунте на сайте.',
-    replyKeyboard(),
+    await menuKb(entry.userId),
   )
 }
 
@@ -342,6 +443,127 @@ async function connectAccount(
   return `✅ Telegram подключён к аккаунту ${siteUser.email}. История чатов с ботом объединена с аккаунтом — видно на сайте и в мини-аппе.`
 }
 
+/** T27: one step of the connect-your-own-account FSM. The user's message
+ *  (phone / code / 2FA password) is DELETED right after processing so
+ *  credentials never linger in the chat. */
+async function handleConnectStep(
+  chatId: string,
+  entry: TgUserEntry,
+  fsm: ConnectFsm,
+  text: string,
+  msgId: number,
+): Promise<void> {
+  try {
+    if (fsm.step === 'phone') {
+      const norm = normalizePhone(text)
+      if ('error' in norm) {
+        await tgSend(chatId, `⚠️ ${norm.error}.\nОтправь номер ещё раз (или /start — отмена).`)
+        return
+      }
+      try {
+        const res = await mtprotoSendCode(norm.phone)
+        const data = {
+          phone: norm.phone,
+          apiId: res.apiId,
+          apiHashEnc: res.apiHashEnc,
+          phoneCodeHash: res.phoneCodeHash,
+          loginSessionEnc: encryptSecret(res.loginSession),
+          status: 'pending',
+          statusText: res.viaApp ? 'код отправлен в Telegram-приложение' : 'код отправлен SMS',
+          meInfo: null,
+          sessionEnc: null,
+          active: false,
+          updatedAt: new Date(),
+        }
+        const existing = await db.tgAccount.findFirst({ where: { userId: entry.userId } })
+        const account = existing
+          ? await db.tgAccount.update({ where: { id: existing.id }, data })
+          : await db.tgAccount.create({ data: { userId: entry.userId, ...data } })
+        await setConnect(chatId, { step: 'code', accountId: account.id, phone: norm.phone, exp: Date.now() + 15 * 60_000 })
+        await tgSend(
+          chatId,
+          `2️⃣ Код отправлен ${res.viaApp ? 'в твоё Telegram-приложение' : 'SMS-кой'} на ${norm.phone}.\n\n` +
+            'Введи код следующим сообщением — я сразу удалю его из чата.',
+        )
+      } catch (e) {
+        await tgSend(chatId, `⚠️ Не вышло отправить код: ${humanTgError(e)}\n\nПроверь номер и отправь снова (или /start — отмена).`)
+      }
+      return
+    }
+
+    // ---- code / password steps
+    const acc = fsm.accountId ? await db.tgAccount.findUnique({ where: { id: fsm.accountId } }) : null
+    if (!acc || acc.userId !== entry.userId || !acc.phoneCodeHash || !acc.loginSessionEnc) {
+      await clearConnect(chatId)
+      await tgSend(chatId, '⚠️ Сессия подключения истекла. Нажми «📱 Подключить Telegram аккаунт» ещё раз.')
+      return
+    }
+    const code = fsm.step === 'code' ? text.replace(/\D/g, '') : ''
+    const password = fsm.step === 'password' ? text : ''
+    if (fsm.step === 'code' && code.length < 4) {
+      await tgSend(chatId, 'Код подтверждения — это цифры, которые Telegram прислал в приложение. Отправь их одним сообщением.')
+      return
+    }
+    try {
+      const res = await mtprotoVerifyCode({
+        apiId: acc.apiId,
+        apiHashEnc: acc.apiHashEnc,
+        loginSessionEnc: acc.loginSessionEnc,
+        phone: acc.phone,
+        phoneCodeHash: acc.phoneCodeHash,
+        status: acc.status,
+        code,
+        password,
+      })
+      const meInfo = JSON.stringify(res.me)
+      await db.tgAccount.update({
+        where: { id: acc.id },
+        data: {
+          sessionEnc: encryptSecret(res.session),
+          status: 'connected',
+          statusText: 'подключено',
+          meInfo,
+          phoneCodeHash: null,
+          loginSessionEnc: null,
+          active: true, // the point of the flow: the agent may answer DMs now
+        },
+      })
+      await migrateRulesDraft(entry.userId, acc.id)
+      await clearConnect(chatId)
+      const who = [res.me.firstName, res.me.username ? `(@${res.me.username})` : ''].filter(Boolean).join(' ')
+      await tgSend(
+        chatId,
+        `✅ Telegram аккаунт подключён: ${who || 'аккаунт'} (${acc.phone}).\n\n` +
+          'Кнопка «📱 Подключить Telegram аккаунт» исчезла — здесь и на сайте.\n' +
+          '🤖 Агент ВКЛЮЧЁН: отвечает на новые входящие ЛИЧНЫЕ сообщения от твоего имени по твоим правилам (никогда не пишет первым). ' +
+          'Выключить — кнопкой «🤖 Агент», правила — «⚙️ Правила».',
+        await menuKb(entry.userId),
+      )
+    } catch (e) {
+      if (e instanceof NeedPasswordError) {
+        await db.tgAccount.update({
+          where: { id: acc.id },
+          data: { status: '2fa', statusText: 'включена двухфакторная защита — отправь облачный пароль' },
+        }).catch(() => {})
+        await setConnect(chatId, { ...fsm, step: 'password', exp: Date.now() + 15 * 60_000 })
+        await tgSend(chatId, '🔒 На аккаунте включена двухфакторная защита. Отправь облачный пароль Telegram следующим сообщением — удалю его сразу после проверки.')
+        return
+      }
+      await db.tgAccount.update({ where: { id: acc.id }, data: { statusText: humanTgError(e) } }).catch(() => {})
+      const msg = humanTgError(e)
+      const hint = /Неверный код/i.test(msg)
+        ? ' Проверь код и отправь ещё раз.'
+        : /истёк/i.test(msg)
+          ? ' Нажми «📱 Подключить Telegram аккаунт» заново — пришлю свежий код.'
+          : ' Попробуй ещё раз или /start — отмена.'
+      await tgSend(chatId, `⚠️ ${msg}.${hint}`)
+    }
+  } finally {
+    // privacy: phone/code/password messages must not linger in the chat
+    await deleteMsg(chatId, msgId)
+  }
+}
+
 /** inline button presses: open a chat from the list / create a chat */
 async function handleCallback(cb: { id?: string; data?: string; from?: { id?: number; username?: string; first_name?: string }; message?: { message_id?: number } }): Promise<void> {
   if (!cb.id || !cb.data || !cb.from?.id) return
@@ -353,7 +575,45 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
   const carrierMsgId = cb.message?.message_id || 0
   if (data === 'back') {
     await answerCallback(cb.id, 'Меню')
-    await editPanel(chatId, carrierMsgId, menuPanelText(), replyKeyboard())
+    await editPanel(chatId, carrierMsgId, menuPanelText(!!(await connectedAccount(entry.userId))), await menuKb(entry.userId))
+    return
+  }
+  // ---- T27: connect your own Telegram account (MTProto phone+code in-chat)
+  if (data === 'tgconnect') {
+    const already = await connectedAccount(entry.userId)
+    if (already) {
+      await answerCallback(cb.id, 'Уже подключено ✅')
+      await editPanel(chatId, carrierMsgId, menuPanelText(true), await menuKb(entry.userId))
+      return
+    }
+    await setConnect(chatId, { step: 'phone', exp: Date.now() + 15 * 60_000 })
+    await answerCallback(cb.id, 'Отправь номер телефона')
+    await editPanel(
+      chatId,
+      carrierMsgId,
+      '📱 Подключение твоего Telegram-аккаунта\n\n' +
+        '1️⃣ Отправь сюда свой номер: например +998901234567 (можно просто 9 цифр — добавлю +998).\n\n' +
+        '2️⃣ Telegram пришлёт код в твоё приложение — введи код следующим сообщением.\n\n' +
+        '🔐 Сообщение с номером/кодом/паролем я удаляю из чата сразу после проверки. /start — отмена.',
+      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'tgcancel' }]] },
+    )
+    return
+  }
+  if (data === 'tgcancel') {
+    await clearConnect(chatId)
+    await answerCallback(cb.id, 'Отменено')
+    await editPanel(chatId, carrierMsgId, menuPanelText(!!(await connectedAccount(entry.userId))), await menuKb(entry.userId))
+    return
+  }
+  if (data === 'tgagent') {
+    const acc = await connectedAccount(entry.userId)
+    if (!acc) {
+      await answerCallback(cb.id, 'Сначала подключи аккаунт кнопкой «📱 Подключить Telegram аккаунт»')
+      return
+    }
+    await db.tgAccount.update({ where: { id: acc.id }, data: { active: !acc.active } })
+    await answerCallback(cb.id, !acc.active ? '🤖 Агент ВКЛЮЧЁН — отвечает на входящие от твоего имени' : '🤖 Агент выключен — входящие остаются без ответа')
+    await editPanel(chatId, carrierMsgId, menuPanelText(true), await menuKb(entry.userId))
     return
   }
   if (data === 'newchat') {
@@ -573,9 +833,25 @@ export async function POST(req: NextRequest) {
   const entry = await ensureUserConv(chatId, from)
   let convId = entry.convId
 
+  // ---- T27: connect-own-account FSM (phone -> code -> 2FA). Runs BEFORE
+  // everything else so credential messages never reach the agent/history;
+  // any '/'-command cancels the FSM and falls through to normal handling.
+  const connectMap = await readConnectMap()
+  const fsm = connectMap[chatId]
+  if (fsm && fsm.exp < Date.now()) {
+    await clearConnect(chatId)
+  }
+  if (fsm && fsm.exp >= Date.now() && !text.startsWith('/')) {
+    await handleConnectStep(chatId, entry, fsm, text, msg.message_id || 0)
+    return NextResponse.json({ ok: true })
+  }
+  if (fsm && fsm.exp >= Date.now() && text.startsWith('/')) {
+    await clearConnect(chatId) // the command doubles as a cancel
+  }
+
   // ---- /commands (all users)
   if (/^\/menu/i.test(text)) {
-    await tgSend(chatId, menuPanelText(), replyKeyboard())
+    await tgSend(chatId, menuPanelText(!!(await connectedAccount(entry.userId))), await menuKb(entry.userId))
     return NextResponse.json({ ok: true })
   }
   if (/^\/status/i.test(text)) {
@@ -593,21 +869,22 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true })
     }
     if (isOwner) {
-      await tgSend(chatId, 'Уже привязано 👌 Просто пиши задачу. Кнопки — под этим сообщением.', replyKeyboard())
+      await tgSend(chatId, 'Уже привязано 👌 Просто пиши задачу. Кнопки — под этим сообщением.', await menuKb(entry.userId))
     } else {
       await tgSend(
         chatId,
         `Привет! Я агент Vebai — сделаю документ, график, отчёт, найду инфу в интернете и пришлю файлы сюда.\n\n` +
           '🤖 обычный текст — задача агенту (создаёт файлы, доводит до конца; ты увидишь только готовый результат)\n' +
           '❓ «?текст» — быстрый вопрос без запуска задач\n' +
+          '📱 «Подключить Telegram аккаунт» — кнопка ниже: подключи СВОЙ аккаунт (номер + код), и агент будет отвечать на входящие личные сообщения от твоего имени\n' +
           '• /app — аккаунт на сайте: вся история задач и файлов',
-        { inline_keyboard: [...appButton().inline_keyboard, ...replyKeyboard().inline_keyboard] },
+        await menuKb(entry.userId),
       )
     }
     return NextResponse.json({ ok: true })
   }
   if (/^\/app/i.test(text)) {
-    await tgSend(chatId, 'Открывай аккаунт — история задач и файлов синхронизирована с сайтом:', { inline_keyboard: [...appButton().inline_keyboard, ...replyKeyboard().inline_keyboard] })
+    await tgSend(chatId, 'Открывай аккаунт — история задач и файлов синхронизирована с сайтом:', await menuKb(entry.userId))
     return NextResponse.json({ ok: true })
   }
 
@@ -642,7 +919,7 @@ export async function POST(req: NextRequest) {
     await tgSend(
       chatId,
       '🚫 Сначала открой чат: нажми «🆕 Создать чат» или «📂 Чаты» и выбери существующий.\nБез выбранного чата агент не примет задачу — истории некуда сохраняться.',
-      replyKeyboard(),
+      await menuKb(entry.userId),
     )
     return NextResponse.json({ ok: true })
   }
