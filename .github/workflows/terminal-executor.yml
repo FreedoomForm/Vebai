@@ -83,3 +83,36 @@ jobs:
           SITE: ${{ secrets.VEBAI_SITE_URL }}
           SECRET: ${{ secrets.GH_TERM_SECRET }}
         run: node .github/tg_userbot.js
+
+  # T30: self-perpetuating resident chain. GitHub Actions cron throttles
+  # low-activity repos (heartbeat.yml */5 actually fired twice in 8 hours),
+  # so the shift queues its own successor: the concurrency group keeps at
+  # most one running + one pending run, and the pending one starts the moment
+  # this shift ends - zero-gap 24/7 for the terminal executor AND the
+  # personal telegram agents. GITHUB_TOKEN can trigger workflow_dispatch
+  # (documented exception to the no-recursive-runs rule). Kill switch: the
+  # site's /api/tg/work responds {"resident":false} -> chain stops.
+  chain:
+    name: queue the next resident shift
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: dispatch successor unless the site says stop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SITE: ${{ secrets.VEBAI_SITE_URL }}
+          SECRET: ${{ secrets.GH_TERM_SECRET }}
+        run: |
+          R=$(curl -s -m 30 -X POST -H 'content-type: application/json' \
+              -d "{\"secret\":\"$SECRET\"}" "$SITE/api/tg/work" || echo '{}')
+          echo "site says: $(printf '%s' "$R" | head -c 160)"
+          if printf '%s' "$R" | grep -q '"resident":false'; then
+            echo "site asked to stop the resident chain - not dispatching"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/terminal-executor.yml/dispatches" \
+            -f ref=main \
+            -f "inputs[session]=${{ github.event.inputs.session }}" \
+            -f "inputs[timeout]=${{ github.event.inputs.timeout }}" \
+            && echo "successor shift queued"

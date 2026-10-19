@@ -61,5 +61,9 @@ export async function POST(req: Request) {
     update: { data: heartbeat, updatedAt: new Date() },
     create: { key: 'tguser', data: heartbeat },
   }).catch(() => {})
-  return NextResponse.json({ accounts: out, now: new Date().toISOString() })
+  // T30: `resident` is the kill switch for the GH self-perpetuating shift
+  // chain (.github/workflows/terminal-executor.yml job 'chain' greps for
+  // resident:false before queueing the next shift). Set it conditionally if
+  // the resident workers ever need to be stopped from the site side.
+  return NextResponse.json({ accounts: out, now: new Date().toISOString(), resident: true })
 }
