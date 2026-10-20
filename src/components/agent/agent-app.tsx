@@ -5,7 +5,7 @@ import {
   Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
   Loader2, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal, Send,
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatBytes } from '@/lib/utils'
 import { plural } from '@/lib/plural'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -600,7 +600,7 @@ export function AgentApp() {
 
   const handleSend = useCallback(
     (content: string, opts?: SendOptions) => {
-      if (sendingRef.current || !content.trim()) return
+      if (sendingRef.current || (!content.trim() && !opts?.files?.length)) return
       sendingRef.current = true
       setSending(true)
       stickToBottomRef.current = true
@@ -608,49 +608,87 @@ export function AgentApp() {
       setErrorMsg(null)
       if (!opts?.resume) lastSentRef.current = { content }
 
-      if (!opts?.resume) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: 'temp-user',
-            role: 'user',
-            kind: 'text',
-            content,
-            createdAt: new Date().toISOString(),
-          },
-        ])
+      const launch = (finalContent: string, videoPrompt: string) => {
+        if (!opts?.resume) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: 'temp-user',
+              role: 'user',
+              kind: 'text',
+              content: finalContent,
+              createdAt: new Date().toISOString(),
+            },
+          ])
+        }
+
+        if (opts?.videoRequest) {
+          // 🎬 composer toggle: also queue the Kaggle H3 video pipeline
+          void (async () => {
+            try {
+              const res = await fetch('/api/video-request', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ conversationId: tgAgentRef.current ? agentConvRef.current : activeIdRef.current, prompt: videoPrompt }),
+              })
+              const data = (await res.json().catch(() => ({}))) as {
+                task?: AgentTaskDTO
+                error?: string
+                code?: string
+              }
+              if (!res.ok || !data.task) {
+                onEvent({ type: 'error', message: data.error || `video ${res.status}`, code: data.code })
+              } else {
+                onEvent({ type: 'task', task: data.task })
+              }
+            } catch {
+              onEvent({ type: 'error', message: 'не удалось поставить видео в очередь' })
+            }
+          })()
+        }
+
+        // T28: with the Telegram-agent connector on, the turn MUST land in the
+        // agent conversation (even if the user navigated elsewhere) — the
+        // server recognises it by id and answers with the agent persona
+        const targetConv = tgAgentRef.current ? agentConvRef.current : activeIdRef.current
+        void runTurn(targetConv, finalContent, Boolean(opts?.resume))
       }
 
-      if (opts?.videoRequest) {
-        // 🎬 composer toggle: also queue the Kaggle H3 video pipeline
+      // T40: attached files go to the Telegram channel BEFORE the turn — the
+      // message carries an honest annotation of what was attached; a failed
+      // upload blocks the send (the user sees why instead of a fake "saved")
+      if (opts?.files?.length) {
+        onEvent({ type: 'notice', text: '📎 Загружаю файл(ы) в Telegram-канал…' })
         void (async () => {
           try {
-            const res = await fetch('/api/video-request', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ conversationId: tgAgentRef.current ? agentConvRef.current : activeIdRef.current, prompt: content }),
-            })
+            const form = new FormData()
+            form.set('conversationId', (tgAgentRef.current ? agentConvRef.current : activeIdRef.current) || '')
+            for (const f of opts.files!) form.append('files', f)
+            const res = await fetch('/api/chat/attach', { method: 'POST', body: form })
             const data = (await res.json().catch(() => ({}))) as {
-              task?: AgentTaskDTO
+              ok?: boolean
               error?: string
-              code?: string
+              files?: { name: string; size: number }[]
             }
-            if (!res.ok || !data.task) {
-              onEvent({ type: 'error', message: data.error || `video ${res.status}`, code: data.code })
-            } else {
-              onEvent({ type: 'task', task: data.task })
-            }
-          } catch {
-            onEvent({ type: 'error', message: 'не удалось поставить видео в очередь' })
+            if (!res.ok || !data.ok || !data.files?.length)
+              throw new Error(data.error || `сервер ответил ${res.status}`)
+            const list = data.files.map((f) => `• ${f.name} (${formatBytes(f.size)})`).join('\n')
+            const ann = `📎 Вложения (сохранены в Telegram-канал):\n${list}`
+            launch(content.trim() ? `${content.trim()}\n\n${ann}` : ann, content)
+          } catch (e) {
+            sendingRef.current = false
+            setSending(false)
+            onEvent({
+              type: 'error',
+              message: `📎 Файл(ы) не сохранены: ${e instanceof Error ? e.message.slice(0, 220) : 'ошибка загрузки'}`,
+              code: 'attach_failed',
+            })
           }
         })()
+        return
       }
 
-      // T28: with the Telegram-agent connector on, the turn MUST land in the
-      // agent conversation (even if the user navigated elsewhere) — the
-      // server recognises it by id and answers with the agent persona
-      const targetConv = tgAgentRef.current ? agentConvRef.current : activeIdRef.current
-      void runTurn(targetConv, content, Boolean(opts?.resume))
+      launch(content, content)
     },
     [runTurn, onEvent],
   )
@@ -993,7 +1031,6 @@ export function AgentApp() {
         video={video}
         onVideoToggle={toggleVideo}
         tgAgent={tgAgent}
-        onTgAgentToggle={toggleTgAgent}
       />
 
       <div className="flex w-full flex-wrap justify-center gap-2">
@@ -1224,7 +1261,6 @@ export function AgentApp() {
               video={video}
               onVideoToggle={toggleVideo}
               tgAgent={tgAgent}
-              onTgAgentToggle={toggleTgAgent}
             />
             <p className="mt-2 hidden text-center text-[11px] text-stone-400 sm:block">
               Enter — отправить · Shift+Enter — новая строка · агент работает 24/7, результаты придут в чат

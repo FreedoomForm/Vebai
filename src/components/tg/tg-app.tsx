@@ -179,7 +179,8 @@ export function TgConnectApp() {
               Открыть чат с агентом →
             </a>
             <p className="text-xs leading-relaxed text-white/40">
-              Правила агенту задаются прямо в чате: кнопка «TG-агент» в панели ввода.
+              Правила агенту задаются в чате «TG-агент» на сайте — кнопка «Telegram-агент» в боковом
+              меню (или «💬 Научить агента» в меню бота).
               Всё, что ты ему расскажешь, он учтёт при ответах людям.
             </p>
             <button className={btnGhost} onClick={disconnect} disabled={!!busy}>

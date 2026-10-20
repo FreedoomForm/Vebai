@@ -182,3 +182,33 @@ export async function sendTelegramText(text: string, chatIdOverride?: string): P
     return !!json.ok
   } catch { return false }
 }
+
+/**
+ * T40: download a file the BOT received (Bot API getFile). The Bot API caps
+ * bot-downloadable files at 20 MB — anything bigger returns an honest error.
+ */
+export async function downloadTgFile(fileId: string): Promise<{ data: Buffer } | { error: string }> {
+  const token = botToken()
+  if (!token) return { error: 'токен бота не настроен' }
+  try {
+    const meta = await fetch(
+      `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`,
+      { signal: AbortSignal.timeout(12_000) },
+    )
+    const j = (await meta.json()) as {
+      ok?: boolean
+      description?: string
+      result?: { file_path?: string; file_size?: number }
+    }
+    if (!j.ok || !j.result?.file_path) return { error: j.description || 'Telegram не отдал файл' }
+    if ((j.result.file_size || 0) > 20 * 1024 * 1024)
+      return { error: 'файл больше 20 МБ — Bot API не даёт боту скачать его' }
+    const res = await fetch(`https://api.telegram.org/file/bot${token}/${j.result.file_path}`, {
+      signal: AbortSignal.timeout(45_000),
+    })
+    if (!res.ok) return { error: `скачивание не удалось (HTTP ${res.status})` }
+    return { data: Buffer.from(await res.arrayBuffer()) }
+  } catch (e) {
+    return { error: e instanceof Error ? e.message.slice(0, 140) : 'сетевая ошибка' }
+  }
+}

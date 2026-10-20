@@ -1,19 +1,22 @@
 'use client'
 
 import { useRef, useState } from 'react'
-import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown, Send } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown, X } from 'lucide-react'
+import { cn, formatBytes } from '@/lib/utils'
 
 export interface SendOptions {
   resume?: boolean
   /** 🎬 toggle: also queue the MiniMax H3 video pipeline for this prompt */
   videoRequest?: boolean
+  /** T40: files attached in the composer — the app uploads them to the
+   *  Telegram channel before the turn starts */
+  files?: File[]
 }
 
-/** T28: the composer doubles as a connector bar — the paper-plane toggle
- *  switches the chat into "Telegram agent" mode (talk to your personal
- *  agent; everything you tell it becomes the context it uses when answering
- *  people who DM your Telegram account). */
+/** T40: the «TG-агент» toggle is gone from the composer (owner request:
+ *  "убери кнопку телеграм мод рядом с панелью ввода") — the agent chat is
+ *  still reachable via the sidebar button and the ?agent=1 deep link.
+ *  The paperclip is REAL now: attached files go to the Telegram channel. */
 
 export type Effort = 'high' | 'max'
 
@@ -28,6 +31,8 @@ const EFFORT_LABEL: Record<Effort, string> = {
  *  - dock: the compact bottom box of an ongoing conversation
  * The 🌐 web-search toggle, the effort (Deep-Think) selector and the 🎬
  * video toggle are real switches wired into the chat/video pipeline.
+ * T40: the paperclip is real — picked files ride along in SendOptions.files
+ * and land in the owner's Telegram channel (see /api/chat/attach).
  */
 export function Composer({
   onSend,
@@ -43,7 +48,6 @@ export function Composer({
   video,
   onVideoToggle,
   tgAgent,
-  onTgAgentToggle,
 }: {
   onSend: (content: string, opts?: SendOptions) => void
   disabled: boolean
@@ -58,18 +62,41 @@ export function Composer({
   video: boolean
   onVideoToggle: () => void
   tgAgent: boolean
-  onTgAgentToggle: () => void
 }) {
   const [effortOpen, setEffortOpen] = useState(false)
+  const [files, setFiles] = useState<File[]>([])
+  const [fileNote, setFileNote] = useState('')
   const taRef = useRef<HTMLTextAreaElement | null>(null)
+  const pickRef = useRef<HTMLInputElement | null>(null)
   const value = draft
+
+  const addFiles = (list: FileList | null) => {
+    if (!list || list.length === 0) return
+    const next = [...files]
+    const skipped: string[] = []
+    for (const f of Array.from(list)) {
+      if (next.length >= 5) {
+        skipped.push(`${f.name} — максимум 5 файлов`)
+        continue
+      }
+      if (f.size > 4 * 1024 * 1024) {
+        skipped.push(`${f.name} — больше 4 МБ`)
+        continue
+      }
+      next.push(f)
+    }
+    setFiles(next)
+    setFileNote(skipped.join(' · '))
+  }
 
   const submit = (opts?: SendOptions) => {
     const text = value.trim()
-    if (!text || disabled) return
+    if ((!text && files.length === 0) || disabled) return
     onDraftChange('')
     if (taRef.current) taRef.current.style.height = 'auto'
-    onSend(text, { videoRequest: video, ...opts })
+    onSend(text, { videoRequest: video, files: [...files], ...opts })
+    setFiles([])
+    setFileNote('')
   }
 
   const placeholder = tgAgent
@@ -115,17 +142,54 @@ export function Composer({
           )}
         />
 
+        {/* T40: picked files — chips above the actions row */}
+        {files.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {files.map((f, i) => (
+              <span
+                key={`${f.name}-${i}`}
+                className="flex max-w-full items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-50 px-2 py-1 text-[12px] text-stone-600"
+              >
+                <Paperclip className="h-3 w-3 shrink-0 text-stone-400" />
+                <span className="max-w-[220px] truncate">{f.name}</span>
+                <span className="shrink-0 text-stone-400">{formatBytes(f.size)}</span>
+                <button
+                  type="button"
+                  aria-label={`Убрать ${f.name}`}
+                  onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))}
+                  className="shrink-0 rounded text-stone-400 hover:text-stone-700"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        {fileNote && (
+          <p className="mt-2 text-[11px] leading-snug text-amber-700">⚠️ {fileNote}</p>
+        )}
+
         <div className="mt-1.5 flex items-center gap-1.5">
-          {/* attach — stub for now, mirrors z.ai's + button position */}
+          {/* attach — T40: real file picker; files land in the Telegram channel */}
           <button
             type="button"
-            aria-label="Вложение — скоро"
-            title="Вложения файлов — скоро"
-            disabled
-            className="flex h-9 w-9 items-center justify-center rounded-full text-stone-400 hover:bg-stone-100 cursor-not-allowed"
+            aria-label="Прикрепить файл"
+            title="Прикрепить файл (до 5 файлов × 4 МБ — уйдут в Telegram-канал)"
+            onClick={() => pickRef.current?.click()}
+            className="flex h-9 w-9 items-center justify-center rounded-full text-stone-400 hover:bg-stone-100"
           >
             <Paperclip className="h-[18px] w-[18px]" />
           </button>
+          <input
+            ref={pickRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              addFiles(e.target.files)
+              e.target.value = ''
+            }}
+          />
 
           {/* web-search toggle — real switch into the upstream payload */}
           <button
@@ -161,25 +225,6 @@ export function Composer({
           >
             <Clapperboard className="h-[17px] w-[17px]" />
             {video && <span className="hidden sm:inline">Видео</span>}
-          </button>
-
-          {/* T28: Telegram-agent connector — switches this chat to the personal
-              Telegram agent; its answers to other people follow this context */}
-          <button
-            type="button"
-            aria-label="Telegram-агент"
-            aria-pressed={tgAgent}
-            onClick={onTgAgentToggle}
-            title={tgAgent ? 'Telegram-агент выбран: этот чат — его контекст' : 'Переключиться на Telegram-агента'}
-            className={cn(
-              'flex h-9 items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors',
-              tgAgent
-                ? 'bg-sky-50 text-sky-700 border border-sky-300'
-                : 'text-stone-500 hover:bg-stone-100',
-            )}
-          >
-            <Send className="h-[16px] w-[16px]" />
-            <span className={cn(tgAgent ? 'inline' : 'hidden sm:inline')}>TG-агент</span>
           </button>
 
           <div className="ml-auto flex items-center gap-2">
@@ -234,11 +279,11 @@ export function Composer({
             <button
               type="button"
               onClick={() => submit()}
-              disabled={disabled || !value.trim()}
+              disabled={disabled || (!value.trim() && files.length === 0)}
               aria-label="Отправить сообщение"
               className={cn(
                 'flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-all',
-                value.trim() && !disabled
+                (value.trim() || files.length > 0) && !disabled
                   ? 'bg-stone-900 text-white hover:bg-stone-700'
                   : 'bg-stone-200 text-stone-400 cursor-not-allowed',
               )}

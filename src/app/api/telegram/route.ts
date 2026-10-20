@@ -3,6 +3,8 @@ import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
+import { downloadTgFile, uploadToTelegram } from '@/lib/telegram'
+import { formatBytes } from '@/lib/utils'
 import {
   mtprotoSendCode,
   mtprotoVerifyCode,
@@ -895,6 +897,102 @@ async function ensureUserConv(
   return entry
 }
 
+/* -------------------------------------------------- T40: attached files ---- */
+
+/** the media fields of a private-chat message we care about (T40) */
+interface BotMessage {
+  message_id?: number
+  text?: string
+  caption?: string
+  chat?: { id?: number; type?: string }
+  from?: { id?: number; first_name?: string; last_name?: string; username?: string }
+  document?: { file_id?: string; file_name?: string; mime_type?: string; file_size?: number }
+  photo?: { file_id?: string; file_size?: number }[]
+  video?: { file_id?: string; file_name?: string; mime_type?: string; file_size?: number }
+  audio?: { file_id?: string; file_name?: string; title?: string; mime_type?: string; file_size?: number }
+  voice?: { file_id?: string; mime_type?: string; file_size?: number }
+  video_note?: { file_id?: string; mime_type?: string; file_size?: number }
+}
+
+type BotMedia = { fileId: string; name: string; mime?: string; kind: string }
+
+/** the FIRST media attachment of a message (document/photo/video/audio/voice/
+ * video_note); stickers, contacts etc. are not archived */
+function extractMedia(msg: BotMessage): BotMedia | null {
+  if (msg.document?.file_id)
+    return {
+      fileId: msg.document.file_id,
+      name: msg.document.file_name || 'document',
+      mime: msg.document.mime_type,
+      kind: 'документ',
+    }
+  const photo = msg.photo?.[Math.max(msg.photo.length - 1, 0)] // largest size
+  if (photo?.file_id)
+    return { fileId: photo.file_id, name: `photo_${Date.now()}.jpg`, mime: 'image/jpeg', kind: 'фото' }
+  if (msg.video?.file_id)
+    return {
+      fileId: msg.video.file_id,
+      name: msg.video.file_name || 'video.mp4',
+      mime: msg.video.mime_type || 'video/mp4',
+      kind: 'видео',
+    }
+  if (msg.audio?.file_id)
+    return {
+      fileId: msg.audio.file_id,
+      name: msg.audio.title ? `${msg.audio.title}.mp3` : msg.audio.file_name || 'audio.mp3',
+      mime: msg.audio.mime_type || 'audio/mpeg',
+      kind: 'аудио',
+    }
+  if (msg.voice?.file_id)
+    return {
+      fileId: msg.voice.file_id,
+      name: `voice_${Date.now()}.ogg`,
+      mime: msg.voice.mime_type || 'audio/ogg',
+      kind: 'голосовое',
+    }
+  if (msg.video_note?.file_id)
+    return {
+      fileId: msg.video_note.file_id,
+      name: `videonote_${Date.now()}.mp4`,
+      mime: msg.video_note.mime_type || 'video/mp4',
+      kind: 'видеосообщение',
+    }
+  return null
+}
+
+/** T40 (owner request: файлы из сайта и бота сохраняются в Telegram-канале,
+ * как и остальные): download the user's file via the Bot API, mirror it to
+ * the owner's channel (the same archive terminal/video files land in) and
+ * log a Message row so the attachment shows in the site account history. */
+async function archiveBotFile(
+  entry: TgUserEntry,
+  media: BotMedia,
+  caption: string,
+): Promise<{ ok: true; name: string; size: number } | { ok: false; error: string }> {
+  const dl = await downloadTgFile(media.fileId)
+  if ('error' in dl) return { ok: false, error: dl.error }
+  const stamp = new Date().toLocaleString('ru-RU', {
+    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  })
+  const who = [entry.name, entry.username ? `@${entry.username}` : ''].filter(Boolean).join(' ') || 'пользователь'
+  const cap = `📎 ${media.kind} от ${who} • бот Vebai • ${stamp}${caption ? `\n${caption.slice(0, 600)}` : ''}`
+  const saved = await uploadToTelegram([{ name: media.name, data: dl.data, mime: media.mime }], cap)
+  await db.message.create({
+    data: {
+      conversationId: entry.convId,
+      role: 'user',
+      kind: 'text',
+      content:
+        `📎 Файл: ${media.name} (${formatBytes(dl.data.length)})` +
+        (caption ? `\n\n${caption.slice(0, 2000)}` : '') +
+        (saved ? '' : '\n⚠️ не удалось сохранить в Telegram-канал'),
+    },
+  })
+  await db.conversation.update({ where: { id: entry.convId }, data: { updatedAt: new Date() } }).catch(() => {})
+  if (!saved) return { ok: false, error: 'Telegram-канал недоступен (бот не админ канала?)' }
+  return { ok: true, name: media.name, size: dl.data.length }
+}
+
 /** fast conversational answer via the site LLM (the "?вопрос" escape) */
 async function chatAnswer(convId: string, q: string): Promise<string> {
   await db.message.create({
@@ -971,12 +1069,7 @@ export async function POST(req: NextRequest) {
 
   const update = (await req.json().catch(() => null)) as {
     update_id?: number
-    message?: {
-      message_id?: number
-      text?: string
-      chat?: { id?: number; type?: string }
-      from?: { id?: number; first_name?: string; last_name?: string; username?: string }
-    }
+    message?: BotMessage
     callback_query?: {
       id?: string
       data?: string
@@ -1001,12 +1094,13 @@ export async function POST(req: NextRequest) {
   }
 
   const msg = update.message
-  if (!msg?.text || msg.chat?.type !== 'private' || !msg.from?.id)
+  if (!msg || msg.chat?.type !== 'private' || !msg.from?.id)
     return NextResponse.json({ ok: true })
   const chatId = String(msg.from.id)
   const isOwner = cache.ownerChatId === chatId
-  const text = String(msg.text).trim()
-  if (!text) return NextResponse.json({ ok: true })
+  const text = String(msg.text || '').trim()
+  const media = extractMedia(msg)
+  if (!text && !media) return NextResponse.json({ ok: true })
 
   // ---- first /start ever: bind the owner (full powers)
   if (!cache.ownerChatId) {
@@ -1043,6 +1137,12 @@ export async function POST(req: NextRequest) {
   if (fsm && fsm.exp < Date.now()) {
     await clearConnect(chatId)
   }
+  // T40: during the connect/draft FSM a file makes no sense — the FSM is
+  // waiting for a TEXT step (phone / code / password / new draft text)
+  if (media && fsm && fsm.exp >= Date.now()) {
+    await tgSend(chatId, 'Сначала заверши текущее действие — жду текст (номер/код/пароль или новый текст черновика). Файлы пришли после. /start — отмена.')
+    return NextResponse.json({ ok: true })
+  }
   // T39: the owner is retyping a draft (✏️) — the message IS the new text
   if (fsm && fsm.exp >= Date.now() && fsm.step === 'draftedit' && !text.startsWith('/')) {
     await handleDraftEditText(chatId, entry.userId, fsm, text)
@@ -1054,6 +1154,32 @@ export async function POST(req: NextRequest) {
   }
   if (fsm && fsm.exp >= Date.now() && text.startsWith('/')) {
     await clearConnect(chatId) // the command doubles as a cancel
+  }
+
+  // ---- T40 (owner request): attached files are archived to the owner's
+  // Telegram channel — the same place every terminal/video file lands. A
+  // caption (or text sent together with the file) keeps flowing through the
+  // normal paths below with an honest attachment note appended.
+  let attachNote = ''
+  if (media) {
+    const cap = String(msg.caption || '').trim()
+    const archived = await archiveBotFile(entry, media, cap)
+    if (!archived.ok) {
+      await tgSend(chatId, `⚠️ Файл не сохранён: ${archived.error}`)
+      if (!text) return NextResponse.json({ ok: true })
+    } else {
+      attachNote = `\n\n📎 Вложение: ${archived.name} (${formatBytes(archived.size)}) — файл сохранён в Telegram-канал`
+      if (!text) {
+        await tgSend(
+          chatId,
+          `📎 «${archived.name}» (${formatBytes(archived.size)}) сохранён в Telegram-канал.` +
+            (entry.chatPicked
+              ? ''
+              : '\n\nЧтобы задача по файлу ушла агенту — сначала открой чат: «🆕 Создать чат» или «📂 Чаты».'),
+        )
+        return NextResponse.json({ ok: true })
+      }
+    }
   }
 
   // ---- /commands (all users)
@@ -1138,7 +1264,7 @@ export async function POST(req: NextRequest) {
       await tgSend(chatId, 'Напиши вопрос после знака «?». А обычные задачи (без «?») уходят агенту на GitHub Actions.')
       return NextResponse.json({ ok: true })
     }
-    await tgSend(chatId, await chatAnswer(convId, q))
+    await tgSend(chatId, await chatAnswer(convId, q + attachNote))
     return NextResponse.json({ ok: true })
   }
 
@@ -1195,7 +1321,7 @@ export async function POST(req: NextRequest) {
     }
   }
   await db.message.create({
-    data: { conversationId: convId, role: 'user', kind: 'text', content: text.slice(0, 4000) },
+    data: { conversationId: convId, role: 'user', kind: 'text', content: (text + attachNote).slice(0, 4000) },
   })
   await db.agentTask.create({
     data: {
