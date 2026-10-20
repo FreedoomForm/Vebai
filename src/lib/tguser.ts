@@ -469,14 +469,16 @@ export interface AgentDecision {
 }
 
 /** Mechanical parse of the decision protocol (<action> + <text>) — same
- *  enforce-the-format philosophy as the t35 <answer>/<file> protocol. */
+ *  enforce-the-format philosophy as the t35 <answer>/<file> protocol.
+ *  <action>owner</action> without <text> is VALID (silent escalation: the
+ *  owner gets notified, the person gets no message). */
 export function parseDecision(raw: string): AgentDecision | null {
   const am = raw.match(/<action>\s*(reply|ignore|owner)\s*<\/action>/i)
   if (!am) return null
   const action = am[1].toLowerCase() as AgentDecision['action']
   const tm = raw.match(/<text>([\s\S]*?)<\/text>/i)
   const text = (tm ? tm[1] : '').replace(/^["'`«]+|["'`»]+$/g, '').trim().slice(0, 1200)
-  if (action === 'ignore') return { action, text: '' }
+  if (action === 'ignore' || (action === 'owner' && !text)) return { action, text: '' }
   if (!text) return null
   return { action, text }
 }
