@@ -1098,7 +1098,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true })
   const chatId = String(msg.from.id)
   const isOwner = cache.ownerChatId === chatId
-  const text = String(msg.text || '').trim()
+  let text = String(msg.text || '').trim()
   const media = extractMedia(msg)
   if (!text && !media) return NextResponse.json({ ok: true })
 
@@ -1170,14 +1170,20 @@ export async function POST(req: NextRequest) {
     } else {
       attachNote = `\n\n📎 Вложение: ${archived.name} (${formatBytes(archived.size)}) — файл сохранён в Telegram-канал`
       if (!text) {
-        await tgSend(
-          chatId,
-          `📎 «${archived.name}» (${formatBytes(archived.size)}) сохранён в Telegram-канал.` +
-            (entry.chatPicked
-              ? ''
-              : '\n\nЧтобы задача по файлу ушла агенту — сначала открой чат: «🆕 Создать чат» или «📂 Чаты».'),
-        )
-        return NextResponse.json({ ok: true })
+        if (cap) {
+          // a file + caption IS a message with an attachment: the caption
+          // keeps flowing through the normal text paths below (agent, "?"…)
+          text = cap
+        } else {
+          await tgSend(
+            chatId,
+            `📎 «${archived.name}» (${formatBytes(archived.size)}) сохранён в Telegram-канал.` +
+              (entry.chatPicked
+                ? ''
+                : '\n\nЧтобы задача по файлу ушла агенту — сначала открой чат: «🆕 Создать чат» или «📂 Чаты» (или пришли файл с подписью-задачей).'),
+          )
+          return NextResponse.json({ ok: true })
+        }
       }
     }
   }
