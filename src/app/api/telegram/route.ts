@@ -616,6 +616,11 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     await editPanel(chatId, carrierMsgId, menuPanelText(!!(await connectedAccount(entry.userId))), await menuKb(entry.userId))
     return
   }
+  if (data === 'menu') {
+    await answerCallback(cb.id, 'Меню')
+    await editPanel(chatId, carrierMsgId, menuPanelText(!!(await connectedAccount(entry.userId))), await menuKb(entry.userId))
+    return
+  }
   // ---- T27: connect your own Telegram account (MTProto phone+code in-chat)
   if (data === 'tgconnect') {
     const already = await connectedAccount(entry.userId)
