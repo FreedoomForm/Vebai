@@ -46,7 +46,9 @@ async function postResultMessage(
 
 interface ShotSpec {
   title: string
-  h3_prompt: string
+  video_prompt?: string
+  /** legacy payload key (MiniMax H3 era, kept for queued tasks written before T43) */
+  h3_prompt?: string
   seconds: number
   first_frame_task_id: string | null
 }
@@ -103,7 +105,7 @@ async function startVideoTask(taskId: string) {
       const prepped = await prepFrameData(frameOrig)
       const job = await db.job.create({
         data: {
-          prompt: shot.h3_prompt,
+          prompt: shot.video_prompt || shot.h3_prompt || '',
           seconds: shot.seconds,
           frameOrigData: frameOrig ? toBytes(frameOrig) : null,
           framePrepped: toBytes(prepped),

@@ -23,8 +23,14 @@ import {
   KERNEL_RMC_STUDIO_WORKER_TEST,
 } from '@/lib/kernels'
 
-// MiniMax H3 frame counts used by the proven storyboard pipeline
-const FRAMES_BY_SECONDS: Record<number, number> = { 5: 124, 10: 243 }
+// Lightricks LTX-2.5 frame counts (25 fps, the model's 8k+1 grid — replaces
+// the MiniMax H3 n%17==5 counts): 129 frames ≈ 5.2 s, 249 frames ≈ 10.0 s.
+const FRAMES_BY_SECONDS: Record<number, number> = { 5: 129, 10: 249 }
+/** frames for a duration on the LTX 8k+1 grid at 25 fps (worker does the same) */
+function ltxFrameCount(seconds: number): number {
+  const n = Math.max(9, Math.round(seconds * 25))
+  return n + ((1 - (n % 8)) % 8)
+}
 const BATCH_CAP = 6
 const TERMINAL_KERNEL = new Set([
   'COMPLETE', 'ERROR', 'CANCEL_ACKNOWLEDGED', 'CANCELLED', 'CANCEL_REQUESTED', 'NOT_FOUND',
@@ -87,7 +93,8 @@ async function writeState(patch: Partial<StudioState>): Promise<StudioState> {
 
 /* --------------------------------------------------------------- frame prep */
 
-/** first frame -> 864x480 canvas (the H3 geometry anchor; plain stretch otherwise) */
+/** first frame -> 864x480 canvas (the LTX gear-0.4 geometry anchor; plain
+ *  stretch otherwise — LTXVImgToVideoInplace rescales to the latent geometry) */
 export async function prepFrameData(orig: Buffer | null): Promise<Buffer> {
   const sharp = (await import('sharp')).default
   const bg = { r: 0x15, g: 0x1a, b: 0x20 }
@@ -136,9 +143,9 @@ function kernelDefs(): Record<'real' | 'test' | 'workerReal' | 'workerTest', Ker
 }
 
 /* ------------------------------- accelerator configuration ----------------
- * GPU only (owner request, 2026-10-16: TPU path removed). The H3 pipeline is
- * CUDA-only — it cannot run on a TPU (no PyTorch-XLA port exists), so the
- * proven 2x T4 (NvidiaTeslaT4, ~47 TFLOPS fp16 aggregate) is the only target.
+ * GPU only (owner request, 2026-10-16: TPU path removed). The LTX-2.5 pipeline
+ * is CUDA-only (ComfyUI + GGUF kernels) — the proven 2x T4 (NvidiaTeslaT4,
+ * ~47 TFLOPS fp16 aggregate, one ComfyUI server per GPU) is the only target.
  */
 const MACHINE_SHAPE = process.env.KAGGLE_MACHINE_SHAPE || 'NvidiaTeslaT4'
 
@@ -162,7 +169,7 @@ async function ensureOutputsDataset() {
   const lu = await datasetLatestFileTime(OUTPUTS_DATASET)
   if (lu) return
   const r = await datasetPush(
-    [{ name: 'README.txt', data: Buffer.from('H3 studio insurance outputs are pushed here by the kernel.\n') }],
+    [{ name: 'README.txt', data: Buffer.from('LTX-2.5 studio insurance outputs are pushed here by the kernel.\n') }],
     OUTPUTS_DATASET,
     'studio outputs seed',
   )
@@ -232,9 +239,9 @@ async function buildJobsFiles(jobs: {
       num,
       title: j.prompt.slice(0, 60),
       seconds: j.seconds,
-      frames: FRAMES_BY_SECONDS[j.seconds] || j.seconds * 24 + 4,
+      frames: FRAMES_BY_SECONDS[j.seconds] || ltxFrameCount(j.seconds),
       gear_primary: '0.4',
-      gear_fallback: '0.3',
+      gear_fallback: '0.2',
       prompt: j.prompt,
       frame: frameName,
       job_id: j.id,

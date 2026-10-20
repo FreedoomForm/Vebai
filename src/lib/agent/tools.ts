@@ -150,18 +150,18 @@ async function execGenerateVideo(
   const shots = rawShots
     .map((s) => {
       const o = (s ?? {}) as Record<string, unknown>
-      const h3 = String(o.h3_prompt || o.prompt || '').trim()
-      if (!h3) return null
+      const vp = String(o.video_prompt || o.h3_prompt || o.prompt || '').trim()
+      if (!vp) return null
       return {
         title: String(o.title || 'Кадр').slice(0, 120),
-        h3_prompt: h3,
+        video_prompt: vp,
         seconds: [5, 10].includes(Number(o.seconds)) ? Number(o.seconds) : 5,
         first_frame_task_id: typeof o.first_frame_task_id === 'string' ? o.first_frame_task_id : null,
       }
     })
     .filter((s): s is NonNullable<typeof s> => s !== null)
     .slice(0, 8)
-  if (shots.length === 0) throw new Error('generate_video: нужен хотя бы один кадр с h3_prompt')
+  if (shots.length === 0) throw new Error('generate_video: нужен хотя бы один кадр с video_prompt')
 
   const testMode = args.test_mode === true
   const task = await db.agentTask.create({
