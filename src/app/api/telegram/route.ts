@@ -377,7 +377,7 @@ async function editPanel(chatId: string, messageId: number, text: string, kb?: R
   await tgSend(chatId, text, kb)
 }
 
-async function statusText(): Promise<string> {
+async function statusText(userId: string): Promise<string> {
   const lines: string[] = []
   try {
     const jobs = await db.job.groupBy({ by: ['status'], _count: { _all: true } })
@@ -390,6 +390,14 @@ async function statusText(): Promise<string> {
     }
     const cmds = await db.terminalCommand.count({ where: { session: { kind: 'gh' }, status: { in: ['pending', 'running'] } } })
     lines.push(`Терминал (GitHub Actions): ${cmds === 0 ? 'свободен' : `${cmds} в работе`}`)
+    // honest personal-account state: without it reads/sends from the owner's
+    // own account are impossible — make that visible instead of silent
+    const acc = await connectedAccount(userId)
+    lines.push(
+      acc
+        ? `Личный Telegram-аккаунт: подключён (${acc.active ? 'агент ВКЛ' : 'агент ВЫКЛ — включи кнопкой «🤖 Агент»'})`
+        : 'Личный Telegram-аккаунт: НЕ подключён — жми «📱 Подключить Telegram аккаунт» (без него агент не читает и не отправляет от твоего имени)',
+    )
     const users = Object.keys(await readUsersMap()).length
     lines.push(`Пользователей бота: ${users + 1}+`)
   } catch {
@@ -903,7 +911,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true })
   }
   if (/^\/status/i.test(text)) {
-    await tgSend(chatId, await statusText())
+    await tgSend(chatId, await statusText(entry.userId), await menuKb(entry.userId))
     return NextResponse.json({ ok: true })
   }
   if (/^\/start/i.test(text)) {
