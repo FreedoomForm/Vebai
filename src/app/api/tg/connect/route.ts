@@ -8,7 +8,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
-import { mtprotoSendCode, normalizePhone, encryptSecret, humanTgError } from '@/lib/tguser'
+import { mtprotoSendCode, normalizePhone, encryptSecret, humanTgError, markCodeRequested, freshCodeRequest } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 30
@@ -24,6 +24,18 @@ export async function POST(req: Request) {
   const phone = phoneRes.phone
 
   try {
+    // T42: a newer sendCode KILLS every previous login code for the phone —
+    // while the previous request is fresh, do not fire a second one (the bot
+    // FSM shares the same marker, so site and bot never invalidate each other)
+    const fresh = await freshCodeRequest(user.id, phone)
+    if (fresh !== null)
+      return NextResponse.json(
+        {
+          error: `код уже отправлен ${fresh} сек назад и ещё действует — введи его. Каждый новый запрос убивает предыдущий код; не пришёл — повтори запрос через пару минут`,
+          fresh: true,
+        },
+        { status: 400 },
+      )
     const res = await mtprotoSendCode(phone, body)
     const existing = await db.tgAccount.findFirst({ where: { userId: user.id, phone } })
     const data = {
@@ -43,6 +55,7 @@ export async function POST(req: Request) {
     const account = existing
       ? await db.tgAccount.update({ where: { id: existing.id }, data })
       : await db.tgAccount.create({ data: { userId: user.id, phone, ...data } })
+    await markCodeRequested(user.id, phone)
     return NextResponse.json({
       ok: true,
       accountId: account.id,

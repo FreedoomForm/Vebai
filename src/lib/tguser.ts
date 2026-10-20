@@ -276,6 +276,80 @@ export function humanTgError(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+/* -------------------- login-code freshness + resend (T42) ------------------
+ * A NEWER auth.SendCode for the same phone KILLS every previous login code —
+ * the owner then enters a code whose hash is already dead and gets
+ * PHONE_CODE_EXPIRED «even though a minute has not passed» (reproduced 2026-10-20:
+ * same auth key + own hash -> EXPIRED once a newer request had superseded it).
+ * Within the freshness window a second sendCode must NOT fire; the user is
+ * told to enter the code or explicitly ask for a resend (auth.ResendCode). */
+
+export const CODE_FRESH_MS = 3 * 60_000
+
+const codeReqKey = (userId: string) => `tg-code-req:${userId}`
+
+/** remember the moment a login code was REQUESTED (shared by the site
+ *  /api/tg/connect and the bot FSM — one marker per user, last write wins) */
+export async function markCodeRequested(userId: string, phone: string): Promise<void> {
+  await db.studioState.upsert({
+    where: { key: codeReqKey(userId) },
+    create: { key: codeReqKey(userId), data: JSON.stringify({ phone, at: Date.now() }) },
+    update: { data: JSON.stringify({ phone, at: Date.now() }) },
+  })
+}
+
+/** seconds since a code was requested for THIS phone (null when nothing is
+ *  fresh) — callers must not fire a second sendCode while it is not null */
+export async function freshCodeRequest(userId: string, phone: string): Promise<number | null> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: codeReqKey(userId) } })
+    if (!row) return null
+    const rec = JSON.parse(row.data) as { phone?: string; at?: number }
+    if (!rec?.at || rec.phone !== phone) return null
+    const age = Date.now() - rec.at
+    return age >= 0 && age < CODE_FRESH_MS ? Math.round(age / 1000) : null
+  } catch {
+    return null
+  }
+}
+
+export interface ResendCodeArgs {
+  apiId: number
+  apiHashEnc: string
+  loginSessionEnc: string
+  phone: string
+  phoneCodeHash: string
+}
+
+/** Re-deliver the login code for the SAME request (auth.ResendCode on the SAME
+ *  session + phoneCodeHash) — unlike a fresh sendCode it does not invalidate
+ *  the pending request. Throws TgMtprotoError when the old hash is dead
+ *  (PHONE_CODE_EXPIRED) — the caller must fall back to a full phone step. */
+export async function mtprotoResendCode(args: ResendCodeArgs): Promise<{ phoneCodeHash: string; viaApp: boolean }> {
+  const apiHash = decryptSecret(args.apiHashEnc)
+  const loginSession = decryptSecret(args.loginSessionEnc)
+  const { TelegramClient, StringSession, Api } = await gramjs()
+  let client: InstanceType<typeof TelegramClient> | null = null
+  try {
+    client = new TelegramClient(new StringSession(loginSession), args.apiId, apiHash, clientOpts())
+    await client.connect()
+    const res = await client.invoke(
+      new Api.auth.ResendCode({ phoneNumber: args.phone, phoneCodeHash: args.phoneCodeHash }),
+    )
+    if (res instanceof Api.auth.SentCodeSuccess) throw new TgMtprotoError('запрос уже завершился — отправь номер заново')
+    return {
+      phoneCodeHash: String(res.phoneCodeHash),
+      viaApp: res.type instanceof Api.auth.SentCodeTypeApp,
+    }
+  } catch (e) {
+    if (e instanceof TgMtprotoError) throw e
+    logTgFailure('resendCode', e)
+    throw new TgMtprotoError(tgErrorText(e))
+  } finally {
+    try { if (client) await client.disconnect() } catch { /* already gone */ }
+  }
+}
+
 /** Move the pre-connection rules draft into the agent config (after a
  *  successful login). Used by BOTH the site /verify and the bot connect FSM. */
 export async function migrateRulesDraft(userId: string, accountId: string): Promise<void> {

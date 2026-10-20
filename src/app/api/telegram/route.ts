@@ -22,6 +22,9 @@ import {
   renderDraftMessage,
   setDraftStatus,
   adoptConnectedAccountByChatId,
+  mtprotoResendCode,
+  markCodeRequested,
+  freshCodeRequest,
 } from '@/lib/tguser'
 
 export const dynamic = 'force-dynamic'
@@ -542,6 +545,24 @@ async function handleConnectStep(
         await tgSend(chatId, `⚠️ ${norm.error}.\nОтправь номер ещё раз (или /start — отмена).`)
         return
       }
+      // T42: a NEWER sendCode KILLS every previous login code — the user then
+      // enters a dead code and gets PHONE_CODE_EXPIRED «even though a minute
+      // has not passed». While the previous request is fresh: do NOT re-send,
+      // steer the user to enter the code (or «новый код» = honest resend).
+      const fresh = await freshCodeRequest(entry.userId, norm.phone)
+      if (fresh !== null) {
+        const pending = await db.tgAccount.findFirst({ where: { userId: entry.userId, phone: norm.phone } })
+        if (pending?.phoneCodeHash && pending?.loginSessionEnc) {
+          await setConnect(chatId, { step: 'code', accountId: pending.id, phone: norm.phone, exp: Date.now() + 15 * 60_000 })
+          await tgSend(
+            chatId,
+            `2️⃣ Код уже отправлен ${Math.max(fresh, 1)} сек назад — он ещё действует.\n\n` +
+              'Введи его следующим сообщением (удалю из чата). Не пришёл — напиши «новый код», это повторная отправка БЕЗ нового запроса.\n\n' +
+              '⚠️ ВАЖНО: каждый новый запрос кода убивает предыдущий — вводи код только из САМОГО последнего сообщения от Telegram. /start — отмена.',
+          )
+          return
+        }
+      }
       try {
         const res = await mtprotoSendCode(norm.phone)
         const data = {
@@ -561,11 +582,13 @@ async function handleConnectStep(
         const account = existing
           ? await db.tgAccount.update({ where: { id: existing.id }, data })
           : await db.tgAccount.create({ data: { userId: entry.userId, ...data } })
+        await markCodeRequested(entry.userId, norm.phone)
         await setConnect(chatId, { step: 'code', accountId: account.id, phone: norm.phone, exp: Date.now() + 15 * 60_000 })
         await tgSend(
           chatId,
           `2️⃣ Код отправлен ${res.viaApp ? 'в твоё Telegram-приложение' : 'SMS-кой'} на ${norm.phone}.\n\n` +
-            'Введи код следующим сообщением — я сразу удалю его из чата.',
+            'Введи код следующим сообщением — я сразу удалю его из чата.\n' +
+            '⚠️ Вводи только код из САМОГО последнего сообщения от Telegram (старые коды уже недействительны). Если код не пришёл — напиши «новый код».',
         )
       } catch (e) {
         await tgSend(chatId, `⚠️ Не вышло отправить код: ${humanTgError(e)}\n\nПроверь номер и отправь снова (или /start — отмена).`)
@@ -582,8 +605,32 @@ async function handleConnectStep(
     }
     const code = fsm.step === 'code' ? text.replace(/\D/g, '') : ''
     const password = fsm.step === 'password' ? text : ''
+    // T42: an explicit resend of the SAME request (auth.ResendCode) — does not
+    // burn a new sendCode and keeps the same auth key/session pairing
+    if (fsm.step === 'code' && /^(?:новый код|новый|еще код|ещё код|еще|ещё|повтори|повтор|resend|снова)\s*$/i.test(text.trim())) {
+      try {
+        const res = await mtprotoResendCode({
+          apiId: acc.apiId,
+          apiHashEnc: acc.apiHashEnc,
+          loginSessionEnc: acc.loginSessionEnc,
+          phone: acc.phone,
+          phoneCodeHash: acc.phoneCodeHash,
+        })
+        await db.tgAccount.update({
+          where: { id: acc.id },
+          data: { phoneCodeHash: res.phoneCodeHash, statusText: res.viaApp ? 'код отправлен повторно в приложение' : 'код отправлен повторно SMS' },
+        })
+        await markCodeRequested(entry.userId, acc.phone)
+        await tgSend(chatId, `🔁 Код отправлен повторно ${res.viaApp ? 'в Telegram-приложение' : 'SMS'}. Введи ИМЕННО его — из последнего сообщения.`)
+      } catch (e) {
+        const msg = humanTgError(e)
+        await setConnect(chatId, { step: 'phone', exp: Date.now() + 15 * 60_000 })
+        await tgSend(chatId, `⚠️ Повторная отправка не вышла: ${msg}.\nСтарый запрос уже недействителен — отправь номер телефона заново, запрошу свежий код.`)
+      }
+      return
+    }
     if (fsm.step === 'code' && code.length < 4) {
-      await tgSend(chatId, 'Код подтверждения — это цифры, которые Telegram прислал в приложение. Отправь их одним сообщением.')
+      await tgSend(chatId, 'Код подтверждения — это цифры, которые Telegram прислал в приложение. Отправь их одним сообщением. Не пришёл код — напиши «новый код».')
       return
     }
     try {
@@ -634,9 +681,9 @@ async function handleConnectStep(
       await db.tgAccount.update({ where: { id: acc.id }, data: { statusText: humanTgError(e) } }).catch(() => {})
       const msg = humanTgError(e)
       const hint = /Неверный код/i.test(msg)
-        ? ' Проверь код и отправь ещё раз.'
+        ? ' Проверь код и отправь ещё раз (код должен быть из САМОГО последнего сообщения Telegram).'
         : /истёк/i.test(msg)
-          ? ' Нажми «📱 Подключить Telegram аккаунт» заново — пришлю свежий код.'
+          ? ' Скорее всего это был код из СТАРОГО запроса — новый запрос кода убивает предыдущий. Напиши «новый код», дождись последнего сообщения от Telegram и введи код из него (или отправь номер заново).'
           : ' Попробуй ещё раз или /start — отмена.'
       await tgSend(chatId, `⚠️ ${msg}.${hint}`)
     }
