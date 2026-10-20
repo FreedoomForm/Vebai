@@ -146,8 +146,13 @@ export function tgErrorText(e: unknown): string {
   const map: [RegExp, string][] = [
     [/PHONE_NUMBER_INVALID/i, 'Telegram отклонил номер: PHONE_NUMBER_INVALID'],
     [/PHONE_NUMBER_UNEXISTED/i, 'Telegram: номер не зарегистрирован (PHONE_NUMBER_UNEXISTED)'],
-    [/PHONE_CODE_INVALID/i, 'Неверный код подтверждения'],
-    [/PHONE_CODE_EXPIRED/i, 'Код истёк — запроси новый'],
+    // T42b: Telegram's anti-phishing revokes a login code that was SENT as a
+    // chat message and blocks the login («код введён верно, но вход
+    // заблокирован — вы сообщили код со своего аккаунта»). Both the site and
+    // the bot surface these texts, so they must teach the safe path: enter the
+    // code on /tgagent, never in a chat.
+    [/PHONE_CODE_INVALID/i, 'Telegram отклонил код. Причины: опечатка, код из СТАРОГО запроса — или код отправили в чат (Telegram отзывает коды, отправленные сообщением). Запроси новый код и введи его на странице /tgagent, не в чате'],
+    [/PHONE_CODE_EXPIRED/i, 'Код истёк или отозван (истекает сам, убивается новым запросом кода или отправкой кода в чат) — запроси новый и введи его на странице /tgagent, не в чате'],
     [/SESSION_PASSWORD_NEEDED/i, 'Включена двухфакторная защита — нужен облачный пароль'],
     [/PASSWORD_HASH_INVALID/i, 'Неверный облачный пароль (2FA)'],
     [/API_ID_INVALID|API_ID_PUBLISHED_FLOOD/i, 'api_id отклонён Telegram (API_ID_INVALID/PUBLISHED_FLOOD) — проверь api_id/api_hash с my.telegram.org'],

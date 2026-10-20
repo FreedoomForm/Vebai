@@ -6,13 +6,6 @@ import { parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent
 import { downloadTgFile, uploadToTelegram } from '@/lib/telegram'
 import { formatBytes } from '@/lib/utils'
 import {
-  mtprotoSendCode,
-  mtprotoVerifyCode,
-  NeedPasswordError,
-  humanTgError,
-  normalizePhone,
-  encryptSecret,
-  migrateRulesDraft,
   readAgentMemory,
   appendAgentMemory,
   draftKeyboard,
@@ -22,9 +15,6 @@ import {
   renderDraftMessage,
   setDraftStatus,
   adoptConnectedAccountByChatId,
-  mtprotoResendCode,
-  markCodeRequested,
-  freshCodeRequest,
 } from '@/lib/tguser'
 
 export const dynamic = 'force-dynamic'
@@ -44,13 +34,16 @@ export const maxDuration = 60
  * Guests are rate-limited (concurrent + daily caps) because one resident
  * runner serves everyone sequentially.
  *
- * T27: the menu carries «📱 Подключить Telegram аккаунт» — a per-chat FSM
- * (phone -> code -> optional 2FA password) that connects the user's OWN
- * Telegram account (MTProto, same TgAccount row as the site /tgagent). While
- * not connected the button shows; once connected it disappears in the bot AND
- * on the site, and the personal agent can answer incoming DMs on the user's
- * behalf (resident worker, .github/tg_userbot.js). Messages containing the
- * phone/code/password are deleted from the chat right after processing.
+ * T27/T42b: the menu carries «📱 Подключить Telegram аккаунт» — it opens the
+ * SITE connection page (/tgagent). The old in-chat FSM (phone -> code -> 2FA)
+ * is RETIRED: Telegram's anti-phishing auto-invalidates a login code that was
+ * sent as a chat message and blocks the login (owner hit exactly this: «Код
+ * был введен верно, но вход был заблокирован, поскольку ранее Вы сообщили
+ * этот код со своего аккаунта»). The code is now entered on the website only
+ * (HTTPS, never travels through a Telegram chat). While not connected the
+ * button shows; once connected it disappears in the bot AND on the site, and
+ * the personal agent can answer incoming DMs on the user's behalf (resident
+ * worker, .github/tg_userbot.js).
  *
  * Setup (one-time): setWebhook with url + secret_token=TELEGRAM_WEBHOOK_SECRET.
  */
@@ -58,7 +51,7 @@ export const maxDuration = 60
 const CACHE_KEY = 'telegramBot'
 const USERS_KEY = 'tgUsers'
 const LINK_TOKENS_KEY = 'tgLinkTokens'
-const CONNECT_KEY = 'tgBotConnect' // T27: per-chat connect FSM (phone/code/password)
+const CONNECT_KEY = 'tgBotConnect' // per-chat FSM: T39 draft retype + legacy T27 connect states
 const MINI_APP_URL = process.env.VEBAI_MINI_APP_URL || 'https://vebai-six.vercel.app/tg'
 const SITE_BASE = MINI_APP_URL.replace(/\/tg$/, '') // for deep links to site pages
 
@@ -125,9 +118,10 @@ async function writeUsersMap(map: TgUsersMap): Promise<void> {
 
 /* -------------------------------------------------- T27: connect-own-account */
 
-/** per-chat FSM for connecting the user's OWN Telegram account:
- *  phone -> code -> optional 2FA password (the same TgAccount row the site
- *  /tgagent creates, so connected state is visible in BOTH places) */
+/** per-chat FSM storage. T27 in-chat connect steps (phone/code/password) are
+ *  RETIRED (T42b: Telegram blocks logins whose code was sent in a chat) — the
+ *  only live producer now is T39's draftedit; legacy phone/code/password
+ *  entries are cancelled by handleRetiredConnectStep. */
 interface ConnectFsm {
   step: 'phone' | 'code' | 'password' | 'draftedit' // draftedit: T39 owner is retyping a draft
   accountId?: string
@@ -291,21 +285,6 @@ async function clearBotWindow(chatId: string, currentMsgId: number, anchorMsgId?
   }
 }
 
-/** delete the user's message (T27 privacy: phone/code/password must not
- * linger in the chat history). Bots may delete private-chat messages. */
-async function deleteMsg(chatId: string, messageId: number): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN || ''
-  if (!token || !messageId) return
-  try {
-    await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
-      signal: AbortSignal.timeout(10_000),
-    })
-  } catch { /* best-effort */ }
-}
-
 async function answerCallback(queryId: string, text: string): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN || ''
   if (!token) return
@@ -346,7 +325,7 @@ const menuPanelText = (connected: boolean) =>
     : '🤖 Vebai — панель управления:\n\n' +
       '• «🆕 Создать чат» — новый чат для задач\n' +
       '• «📂 Чаты» — список чатов (история откроется одним сообщением)\n' +
-      '• «📱 Подключить Telegram аккаунт» — номер + код из Telegram, и агент сможет отвечать на входящие от твоего имени\n\n' +
+      '• «📱 Подключить Telegram аккаунт» — откроет страницу подключения на сайте: номер и код вводятся ТАМ (в чате код нельзя — Telegram отзывает коды, отправленные сообщением), и агент сможет отвечать на входящие от твоего имени\n\n' +
       'Обычный текст = задача агенту, «?текст» = быстрый вопрос. Кнопки: /menu'
 
 /** chat history condensed into ONE message (Telegram cap ~4096 chars) */
@@ -427,7 +406,7 @@ async function statusText(chatId: string, userId: string): Promise<string> {
     lines.push(
       acc
         ? `Личный Telegram-аккаунт: подключён (${acc.active ? 'агент ВКЛ' : 'агент ВЫКЛ — включи кнопкой «🤖 Агент»'})`
-        : 'Личный Telegram-аккаунт: НЕ подключён — жми «📱 Подключить Telegram аккаунт» (без него агент не читает и не отправляет от твоего имени)',
+        : 'Личный Telegram-аккаунт: НЕ подключён — жми «📱 Подключить Telegram аккаунт» (подключение на сайте; без него агент не читает и не отправляет от твоего имени)',
     )
     // T38: the agent's durable memory (memory.md) — grows silently after
     // every incoming message the agent decided about
@@ -528,169 +507,29 @@ async function connectAccount(
   return `✅ Telegram подключён к аккаунту ${siteUser.email}. История чатов с ботом объединена с аккаунтом — видно на сайте и в мини-аппе.`
 }
 
-/** T27: one step of the connect-your-own-account FSM. The user's message
- *  (phone / code / 2FA password) is DELETED right after processing so
- *  credentials never linger in the chat. */
-async function handleConnectStep(
-  chatId: string,
-  entry: TgUserEntry,
-  fsm: ConnectFsm,
-  text: string,
-  msgId: number,
-): Promise<void> {
-  try {
-    if (fsm.step === 'phone') {
-      const norm = normalizePhone(text)
-      if ('error' in norm) {
-        await tgSend(chatId, `⚠️ ${norm.error}.\nОтправь номер ещё раз (или /start — отмена).`)
-        return
-      }
-      // T42: a NEWER sendCode KILLS every previous login code — the user then
-      // enters a dead code and gets PHONE_CODE_EXPIRED «even though a minute
-      // has not passed». While the previous request is fresh: do NOT re-send,
-      // steer the user to enter the code (or «новый код» = honest resend).
-      const fresh = await freshCodeRequest(entry.userId, norm.phone)
-      if (fresh !== null) {
-        const pending = await db.tgAccount.findFirst({ where: { userId: entry.userId, phone: norm.phone } })
-        if (pending?.phoneCodeHash && pending?.loginSessionEnc) {
-          await setConnect(chatId, { step: 'code', accountId: pending.id, phone: norm.phone, exp: Date.now() + 15 * 60_000 })
-          await tgSend(
-            chatId,
-            `2️⃣ Код уже отправлен ${Math.max(fresh, 1)} сек назад — он ещё действует.\n\n` +
-              'Введи его следующим сообщением (удалю из чата). Не пришёл — напиши «новый код», это повторная отправка БЕЗ нового запроса.\n\n' +
-              '⚠️ ВАЖНО: каждый новый запрос кода убивает предыдущий — вводи код только из САМОГО последнего сообщения от Telegram. /start — отмена.',
-          )
-          return
-        }
-      }
-      try {
-        const res = await mtprotoSendCode(norm.phone)
-        const data = {
-          phone: norm.phone,
-          apiId: res.apiId,
-          apiHashEnc: res.apiHashEnc,
-          phoneCodeHash: res.phoneCodeHash,
-          loginSessionEnc: encryptSecret(res.loginSession),
-          status: 'pending',
-          statusText: res.viaApp ? 'код отправлен в Telegram-приложение' : 'код отправлен SMS',
-          meInfo: null,
-          sessionEnc: null,
-          active: false,
-          updatedAt: new Date(),
-        }
-        const existing = await db.tgAccount.findFirst({ where: { userId: entry.userId } })
-        const account = existing
-          ? await db.tgAccount.update({ where: { id: existing.id }, data })
-          : await db.tgAccount.create({ data: { userId: entry.userId, ...data } })
-        await markCodeRequested(entry.userId, norm.phone)
-        await setConnect(chatId, { step: 'code', accountId: account.id, phone: norm.phone, exp: Date.now() + 15 * 60_000 })
-        await tgSend(
-          chatId,
-          `2️⃣ Код отправлен ${res.viaApp ? 'в твоё Telegram-приложение' : 'SMS-кой'} на ${norm.phone}.\n\n` +
-            'Введи код следующим сообщением — я сразу удалю его из чата.\n' +
-            '⚠️ Вводи только код из САМОГО последнего сообщения от Telegram (старые коды уже недействительны). Если код не пришёл — напиши «новый код».',
-        )
-      } catch (e) {
-        await tgSend(chatId, `⚠️ Не вышло отправить код: ${humanTgError(e)}\n\nПроверь номер и отправь снова (или /start — отмена).`)
-      }
-      return
-    }
-
-    // ---- code / password steps
-    const acc = fsm.accountId ? await db.tgAccount.findUnique({ where: { id: fsm.accountId } }) : null
-    if (!acc || acc.userId !== entry.userId || !acc.phoneCodeHash || !acc.loginSessionEnc) {
-      await clearConnect(chatId)
-      await tgSend(chatId, '⚠️ Сессия подключения истекла. Нажми «📱 Подключить Telegram аккаунт» ещё раз.')
-      return
-    }
-    const code = fsm.step === 'code' ? text.replace(/\D/g, '') : ''
-    const password = fsm.step === 'password' ? text : ''
-    // T42: an explicit resend of the SAME request (auth.ResendCode) — does not
-    // burn a new sendCode and keeps the same auth key/session pairing
-    if (fsm.step === 'code' && /^(?:новый код|новый|еще код|ещё код|еще|ещё|повтори|повтор|resend|снова)\s*$/i.test(text.trim())) {
-      try {
-        const res = await mtprotoResendCode({
-          apiId: acc.apiId,
-          apiHashEnc: acc.apiHashEnc,
-          loginSessionEnc: acc.loginSessionEnc,
-          phone: acc.phone,
-          phoneCodeHash: acc.phoneCodeHash,
-        })
-        await db.tgAccount.update({
-          where: { id: acc.id },
-          data: { phoneCodeHash: res.phoneCodeHash, statusText: res.viaApp ? 'код отправлен повторно в приложение' : 'код отправлен повторно SMS' },
-        })
-        await markCodeRequested(entry.userId, acc.phone)
-        await tgSend(chatId, `🔁 Код отправлен повторно ${res.viaApp ? 'в Telegram-приложение' : 'SMS'}. Введи ИМЕННО его — из последнего сообщения.`)
-      } catch (e) {
-        const msg = humanTgError(e)
-        await setConnect(chatId, { step: 'phone', exp: Date.now() + 15 * 60_000 })
-        await tgSend(chatId, `⚠️ Повторная отправка не вышла: ${msg}.\nСтарый запрос уже недействителен — отправь номер телефона заново, запрошу свежий код.`)
-      }
-      return
-    }
-    if (fsm.step === 'code' && code.length < 4) {
-      await tgSend(chatId, 'Код подтверждения — это цифры, которые Telegram прислал в приложение. Отправь их одним сообщением. Не пришёл код — напиши «новый код».')
-      return
-    }
-    try {
-      const res = await mtprotoVerifyCode({
-        apiId: acc.apiId,
-        apiHashEnc: acc.apiHashEnc,
-        loginSessionEnc: acc.loginSessionEnc,
-        phone: acc.phone,
-        phoneCodeHash: acc.phoneCodeHash,
-        status: acc.status,
-        code,
-        password,
-      })
-      const meInfo = JSON.stringify(res.me)
-      await db.tgAccount.update({
-        where: { id: acc.id },
-        data: {
-          sessionEnc: encryptSecret(res.session),
-          status: 'connected',
-          statusText: 'подключено',
-          meInfo,
-          phoneCodeHash: null,
-          loginSessionEnc: null,
-          active: true, // the point of the flow: the agent may answer DMs now
-        },
-      })
-      await migrateRulesDraft(entry.userId, acc.id)
-      await clearConnect(chatId)
-      const who = [res.me.firstName, res.me.username ? `(@${res.me.username})` : ''].filter(Boolean).join(' ')
-      await tgSend(
-        chatId,
-        `✅ Telegram аккаунт подключён: ${who || 'аккаунт'} (${acc.phone}).\n\n` +
-          'Кнопка «📱 Подключить Telegram аккаунт» исчезла — здесь и на сайте.\n' +
-          '🤖 Агент ВКЛЮЧЁН: отвечает на новые входящие ЛИЧНЫЕ сообщения от твоего имени (никогда не пишет первым). ' +
-          'Выключить — кнопкой «🤖 Агент»; научить его — кнопкой «💬 Научить агента (чат)»: расскажешь ему в чате на сайте, он запомнит и будет отвечать людям по этому контексту.',
-        await menuKb(chatId, entry.userId),
-      )
-    } catch (e) {
-      if (e instanceof NeedPasswordError) {
-        await db.tgAccount.update({
-          where: { id: acc.id },
-          data: { status: '2fa', statusText: 'включена двухфакторная защита — отправь облачный пароль' },
-        }).catch(() => {})
-        await setConnect(chatId, { ...fsm, step: 'password', exp: Date.now() + 15 * 60_000 })
-        await tgSend(chatId, '🔒 На аккаунте включена двухфакторная защита. Отправь облачный пароль Telegram следующим сообщением — удалю его сразу после проверки.')
-        return
-      }
-      await db.tgAccount.update({ where: { id: acc.id }, data: { statusText: humanTgError(e) } }).catch(() => {})
-      const msg = humanTgError(e)
-      const hint = /Неверный код/i.test(msg)
-        ? ' Проверь код и отправь ещё раз (код должен быть из САМОГО последнего сообщения Telegram).'
-        : /истёк/i.test(msg)
-          ? ' Скорее всего это был код из СТАРОГО запроса — новый запрос кода убивает предыдущий. Напиши «новый код», дождись последнего сообщения от Telegram и введи код из него (или отправь номер заново).'
-          : ' Попробуй ещё раз или /start — отмена.'
-      await tgSend(chatId, `⚠️ ${msg}.${hint}`)
-    }
-  } finally {
-    // privacy: phone/code/password messages must not linger in the chat
-    await deleteMsg(chatId, msgId)
-  }
+/** T42b: the T27 in-chat connect FSM (phone -> code -> 2FA) is RETIRED.
+ *  Telegram's anti-phishing auto-invalidates a login code that was SENT as a
+ *  chat message and then blocks the login with «Незавершённая попытка входа…
+ *  код был введен верно, но вход заблокирован, поскольку ранее Вы сообщили
+ *  этот код» — so collecting the code in the chat can never work. Any live or
+ *  legacy phone/code/password FSM step now gets this honest redirect to the
+ *  site page where the code entry is safe (HTTPS, no chat involved) and is
+ *  cancelled. */
+async function handleRetiredConnectStep(chatId: string, fsm: ConnectFsm, text: string): Promise<void> {
+  await clearConnect(chatId)
+  const sentCode = fsm.step === 'code' || /^\d{4,8}$/.test(text.trim())
+  const sentPwd = fsm.step === 'password'
+  await tgSend(
+    chatId,
+    '🔐 Подключение аккаунта теперь происходит ТОЛЬКО на сайте.\n\n' +
+      'Причина: Telegram отзывает код входа, если он был отправлен в каком-либо чате, и блокирует вход ' +
+      '(«незавершённая попытка входа — код введён верно, но заблокирован, поскольку вы сообщили код со своего аккаунта»). ' +
+      'Поэтому собирать код в чате больше нельзя — это ломает вход даже при верном коде.\n\n' +
+      (sentCode ? '⚠️ Похоже, ты только что отправил код в чат — этот код уже отозван. Запроси новый на странице подключения и введи его ТАМ.\n\n' : '') +
+      (sentPwd ? '⚠️ Облачный пароль (2FA) тоже нельзя отправлять в чат — введи его на странице подключения.\n\n' : '') +
+      'Жми кнопку ниже: там введи свой номер и код из Telegram прямо на странице. Это безопасно — код идёт по HTTPS сразу в Telegram и не задерживается в чатах.',
+    { inline_keyboard: [[{ text: '📱 Подключить на сайте', url: `${SITE_BASE}/tgagent` }]] },
+  )
 }
 
 /** T39: the owner is retyping a draft (✏️ Изменить) — the next message IS
@@ -742,7 +581,9 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     await editPanel(chatId, carrierMsgId, menuPanelText(!!(await resolveConnected(chatId, entry.userId))), await menuKb(chatId, entry.userId))
     return
   }
-  // ---- T27: connect your own Telegram account (MTProto phone+code in-chat)
+  // ---- T27/T42b: connect your own Telegram account — via the SITE page.
+  // The code can no longer be collected in-chat: Telegram revokes codes sent
+  // as messages and blocks the login (owner hit this exact case).
   if (data === 'tgconnect') {
     const already = await resolveConnected(chatId, entry.userId)
     if (already) {
@@ -750,16 +591,15 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
       await editPanel(chatId, carrierMsgId, menuPanelText(true), await menuKb(chatId, entry.userId))
       return
     }
-    await setConnect(chatId, { step: 'phone', exp: Date.now() + 15 * 60_000 })
-    await answerCallback(cb.id, 'Отправь номер телефона')
+    await answerCallback(cb.id, 'Открываю страницу подключения')
     await editPanel(
       chatId,
       carrierMsgId,
       '📱 Подключение твоего Telegram-аккаунта\n\n' +
-        '1️⃣ Отправь сюда свой номер: например +998901234567 (можно просто 9 цифр — добавлю +998).\n\n' +
-        '2️⃣ Telegram пришлёт код в твоё приложение — введи код следующим сообщением.\n\n' +
-        '🔐 Сообщение с номером/кодом/паролем я удаляю из чата сразу после проверки. /start — отмена.',
-      { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'tgcancel' }]] },
+        '⚠️ Код входа больше НЕЛЬЗЯ вводить здесь, в чате: Telegram отзывает коды, отправленные сообщением, и блокирует вход («незавершённая попытка входа»).\n\n' +
+        '➡️ Жми кнопку ниже — откроется страница подключения. Введи там свой номер и код из Telegram прямо на сайте. Это безопасно: код идёт по HTTPS сразу в Telegram, не задерживаясь в чатах.\n\n' +
+        'Когда подключишь — бот сам покажет «подключён» (меню/статус обновятся). /start — меню.',
+      { inline_keyboard: [[{ text: '📱 Подключить на сайте', url: `${SITE_BASE}/tgagent` }]] },
     )
     return
   }
@@ -1214,10 +1054,10 @@ export async function POST(req: NextRequest) {
   if (fsm && fsm.exp < Date.now()) {
     await clearConnect(chatId)
   }
-  // T40: during the connect/draft FSM a file makes no sense — the FSM is
-  // waiting for a TEXT step (phone / code / password / new draft text)
+  // T40: during the draft-FSM (or a legacy connect state) a file makes no
+  // sense — the FSM is waiting for a TEXT step (new draft text)
   if (media && fsm && fsm.exp >= Date.now()) {
-    await tgSend(chatId, 'Сначала заверши текущее действие — жду текст (номер/код/пароль или новый текст черновика). Файлы пришли после. /start — отмена.')
+    await tgSend(chatId, 'Сначала заверши текущее действие — жду текст (новый текст черновика). Файлы пришли после. /start — отмена.')
     return NextResponse.json({ ok: true })
   }
   // T39: the owner is retyping a draft (✏️) — the message IS the new text
@@ -1225,8 +1065,10 @@ export async function POST(req: NextRequest) {
     await handleDraftEditText(chatId, entry.userId, fsm, text)
     return NextResponse.json({ ok: true })
   }
+  // T42b: legacy/retired connect states (phone/code/password) get an honest
+  // redirect to the site page — the code can no longer be collected in-chat
   if (fsm && fsm.exp >= Date.now() && !text.startsWith('/')) {
-    await handleConnectStep(chatId, entry, fsm, text, msg.message_id || 0)
+    await handleRetiredConnectStep(chatId, fsm, text)
     return NextResponse.json({ ok: true })
   }
   if (fsm && fsm.exp >= Date.now() && text.startsWith('/')) {
@@ -1292,7 +1134,7 @@ export async function POST(req: NextRequest) {
         `Привет! Я агент Vebai — сделаю документ, график, отчёт, найду инфу в интернете и пришлю файлы сюда.\n\n` +
           '🤖 обычный текст — задача агенту (создаёт файлы, доводит до конца; ты увидишь только готовый результат)\n' +
           '❓ «?текст» — быстрый вопрос без запуска задач\n' +
-          '📱 «Подключить Telegram аккаунт» — кнопка ниже: подключи СВОЙ аккаунт (номер + код), и агент будет отвечать на входящие личные сообщения от твоего имени\n' +
+          '📱 «Подключить Telegram аккаунт» — кнопка ниже: откроет страницу подключения на сайте, где номер и код вводятся на самой странице (в чате код нельзя — Telegram отзывает коды, отправленные сообщением). Агент будет отвечать на входящие личные сообщения от твоего имени\n' +
           '• /app — аккаунт на сайте: вся история задач и файлов',
         await menuKb(chatId, entry.userId),
       )

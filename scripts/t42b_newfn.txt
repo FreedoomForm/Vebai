@@ -1,0 +1,24 @@
+/** T42b: the T27 in-chat connect FSM (phone -> code -> 2FA) is RETIRED.
+ *  Telegram's anti-phishing auto-invalidates a login code that was SENT as a
+ *  chat message and then blocks the login with «Незавершённая попытка входа…
+ *  код был введен верно, но вход заблокирован, поскольку ранее Вы сообщили
+ *  этот код» — so collecting the code in the chat can never work. Any live or
+ *  legacy phone/code/password FSM step now gets this honest redirect to the
+ *  site page where the code entry is safe (HTTPS, no chat involved) and is
+ *  cancelled. */
+async function handleRetiredConnectStep(chatId: string, fsm: ConnectFsm, text: string): Promise<void> {
+  await clearConnect(chatId)
+  const sentCode = fsm.step === 'code' || /^\d{4,8}$/.test(text.trim())
+  const sentPwd = fsm.step === 'password'
+  await tgSend(
+    chatId,
+    '🔐 Подключение аккаунта теперь происходит ТОЛЬКО на сайте.\n\n' +
+      'Причина: Telegram отзывает код входа, если он был отправлен в каком-либо чате, и блокирует вход ' +
+      '(«незавершённая попытка входа — код введён верно, но заблокирован, поскольку вы сообщили код со своего аккаунта»). ' +
+      'Поэтому собирать код в чате больше нельзя — это ломает вход даже при верном коде.\n\n' +
+      (sentCode ? '⚠️ Похоже, ты только что отправил код в чат — этот код уже отозван. Запроси новый на странице подключения и введи его ТАМ.\n\n' : '') +
+      (sentPwd ? '⚠️ Облачный пароль (2FA) тоже нельзя отправлять в чат — введи его на странице подключения.\n\n' : '') +
+      'Жми кнопку ниже: там введи свой номер и код из Telegram прямо на странице. Это безопасно — код идёт по HTTPS сразу в Telegram и не задерживается в чатах.',
+    { inline_keyboard: [[{ text: '📱 Подключить на сайте', url: `${SITE_BASE}/tgagent` }]] },
+  )
+}

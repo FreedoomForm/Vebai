@@ -126,6 +126,14 @@ export function TgConnectApp() {
       window.location.href = '/?agent=1'
     })
 
+  const resend = () =>
+    run('resend', async () => {
+      const acc = state?.account
+      if (!acc) return
+      await api('/api/tg/resend', { accountId: acc.id })
+      await refresh()
+    })
+
   const disconnect = () =>
     run('disc', async () => {
       await api('/api/tg/disconnect', {})
@@ -204,7 +212,7 @@ export function TgConnectApp() {
                     autoComplete="tel"
                   />
                   <p className="mt-1.5 text-xs text-white/40">
-                    Можно просто 9 цифр — +998 добавится сам. Код придёт в твоё Telegram-приложение.
+                    Можно просто 9 цифр — +998 добавится сам. Код придёт в твоё Telegram-приложение — вводить его будешь ЗДЕСЬ, на сайте.
                   </p>
                 </div>
                 {state?.needApiCreds && (
@@ -241,6 +249,9 @@ export function TgConnectApp() {
                     autoComplete="one-time-code"
                   />
                 </div>
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-3 text-xs leading-relaxed text-amber-200">
+                  ⚠️ Вводи код только здесь, на сайте. НЕ отправляй код в чаты Telegram (даже нашему боту) — Telegram отзывает коды, отправленные сообщением, и блокирует вход, даже если код верный.
+                </div>
                 {(needPassword || state?.account?.status === '2fa') && (
                   <div>
                     <label className={label} htmlFor="pwd">Облачный пароль (2FA)</label>
@@ -257,6 +268,13 @@ export function TgConnectApp() {
                 )}
                 <button className={btnPrimary} onClick={verify} disabled={!!busy || (code.length < 4 && !password)}>
                   {busy === 'verify' ? 'проверяю…' : 'Продолжить'}
+                </button>
+                <button
+                  className="w-full text-center text-xs text-white/40 hover:text-white/70"
+                  onClick={resend}
+                  disabled={!!busy}
+                >
+                  {busy === 'resend' ? 'отправляю…' : 'Не пришёл код? Отправить повторно (тот же запрос)'}
                 </button>
                 <button
                   className="w-full text-center text-xs text-white/40 hover:text-white/70"
