@@ -16,6 +16,7 @@ import {
   encryptSecret,
   getOwnedAccount,
   migrateRulesDraft,
+  bindChatToUser,
 } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
@@ -68,6 +69,14 @@ export async function POST(req: Request) {
     })
     // migrate the pre-connection rules draft into the agent config
     await migrateRulesDraft(user.id, account.id)
+    // T41: connecting on the SITE must make the BOT see the account too.
+    // res.me.id IS this person's telegram user id — bind the chat to the site
+    // user (same merge /start connect_<token> does) unless the user is already
+    // bound to a different chat. After this the bot menu/status/toggles read
+    // the same TgAccount row — connected in one place == connected everywhere.
+    const tgId = res.me?.id ? String(res.me.id) : ''
+    if (/^\d+$/.test(tgId) && (!user.telegramChatId || user.telegramChatId === tgId))
+      await bindChatToUser(tgId, user.id, res.me?.username || null).catch(() => {})
     return NextResponse.json({ ok: true, me: res.me })
   } catch (e) {
     if (e instanceof NeedPasswordError) {

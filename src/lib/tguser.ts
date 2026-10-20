@@ -765,3 +765,90 @@ export function accountView(a: {
     examples: parseExamples(a.config?.examples),
   }
 }
+
+/* --------------------------------- site<->bot identity bridge (T41) --------
+ * The bot maps a chat to a User row by User.telegramChatId, while a personal
+ * MTProto account is always owned by the SAME User row (TgAccount.userId).
+ * When the account is connected on the SITE the chat binding used to be left
+ * untouched, so the bot kept looking at a guest user and showed «не подключён».
+ * These helpers make one Telegram identity = one user row in both directions. */
+
+/** the telegram user id hidden in a stored meInfo JSON ({id,...}) — null when
+ *  the blob is missing/corrupt or not a plain numeric TG id */
+export function meInfoTgId(meInfo: string | null | undefined): string | null {
+  if (!meInfo) return null
+  try {
+    const me = JSON.parse(meInfo) as { id?: unknown }
+    const id = typeof me.id === 'number' ? String(me.id) : typeof me.id === 'string' ? me.id : ''
+    return /^\d+$/.test(id) ? id : null
+  } catch {
+    return null
+  }
+}
+
+/** Bind a telegram chat (the bot's per-chat user) to a site User row:
+ *  detaches the current holder (auto-registered guest), sets
+ *  User.telegramChatId and re-points the bot's tgUsers map entry at the site
+ *  user so the bot instantly sees the site-side state (connected personal
+ *  account, agent toggle, chats). The bot conversation history moves with the
+ *  binding — the same merge /start connect_<token> performs. */
+export async function bindChatToUser(
+  chatId: string,
+  siteUserId: string,
+  tgUsername?: string | null,
+): Promise<void> {
+  const holder = await db.user.findUnique({ where: { telegramChatId: chatId } })
+  if (holder && holder.id !== siteUserId)
+    await db.user.update({ where: { id: holder.id }, data: { telegramChatId: null } })
+  await db.user.update({
+    where: { id: siteUserId },
+    data: { telegramChatId: chatId, ...(tgUsername ? { telegramUsername: tgUsername } : {}) },
+  })
+  // re-point the bot's per-chat entry (keep convId/flags) and hand the bot
+  // conversation history to the site account; best-effort — ensureUserConv
+  // reconciles the map against User.telegramChatId on the next message anyway
+  try {
+    const row = await db.studioState.findUnique({ where: { key: 'tgUsers' } })
+    const map = row ? (JSON.parse(row.data) as Record<string, { convId?: string } & Record<string, unknown>>) : {}
+    const entry = map[chatId]
+    if (entry) {
+      map[chatId] = { ...entry, userId: siteUserId, ...(tgUsername ? { username: tgUsername } : {}) }
+      await db.studioState.upsert({
+        where: { key: 'tgUsers' },
+        create: { key: 'tgUsers', data: JSON.stringify(map) },
+        update: { data: JSON.stringify(map) },
+      })
+      if (entry.convId)
+        await db.conversation.updateMany({ where: { id: entry.convId }, data: { userId: siteUserId } })
+    }
+  } catch { /* the reconciliation in ensureUserConv covers this */ }
+}
+
+/** T41 auto-heal: this chat's person may have connected their OWN account on
+ *  the SITE while the bot chat still maps to a guest user row (the binding
+ *  was never made). Find the connected TgAccount whose meInfo.id == chatId
+ *  and bind its owner to this chat. Conservative by design:
+ *  - never touches an account whose owner is bound to a DIFFERENT chat;
+ *  - never rips the chat away from a real (email-registered) site user.
+ *  Returns the adopted account or null. */
+export async function adoptConnectedAccountByChatId(chatId: string): Promise<{ id: string; active: boolean } | null> {
+  if (!/^\d+$/.test(chatId)) return null
+  const rows = await db.tgAccount.findMany({
+    where: { status: 'connected' },
+    orderBy: { updatedAt: 'desc' },
+    take: 100,
+    select: { id: true, userId: true, meInfo: true, active: true },
+  })
+  const acc = rows.find((r) => meInfoTgId(r.meInfo) === chatId)
+  if (!acc) return null
+  const owner = await db.user.findUnique({ where: { id: acc.userId } })
+  if (!owner) return null
+  // the account owner is already bound to another chat — leave everything as is
+  if (owner.telegramChatId && owner.telegramChatId !== chatId) return null
+  const holder = await db.user.findUnique({ where: { telegramChatId: chatId } })
+  if (holder && holder.id !== owner.id && !holder.email.endsWith('@telegram.vebai.app'))
+    return null // a real site user owns this chat — do not steal it
+  if (!holder || holder.id !== owner.id)
+    await bindChatToUser(chatId, owner.id, owner.telegramUsername || null)
+  return { id: acc.id, active: acc.active }
+}
