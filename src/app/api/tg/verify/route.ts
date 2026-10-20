@@ -75,7 +75,8 @@ export async function POST(req: Request) {
     // bound to a different chat. After this the bot menu/status/toggles read
     // the same TgAccount row — connected in one place == connected everywhere.
     const tgId = res.me?.id ? String(res.me.id) : ''
-    if (/^\d+$/.test(tgId) && (!user.telegramChatId || user.telegramChatId === tgId))
+    const freshUser = await db.user.findUnique({ where: { id: user.id }, select: { telegramChatId: true } })
+    if (/^\d+$/.test(tgId) && freshUser && (!freshUser.telegramChatId || freshUser.telegramChatId === tgId))
       await bindChatToUser(tgId, user.id, res.me?.username || null).catch(() => {})
     return NextResponse.json({ ok: true, me: res.me })
   } catch (e) {
