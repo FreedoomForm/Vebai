@@ -755,8 +755,8 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
   // ---- T39: draft approval buttons (✅ Отправить / ✏️ Изменить / ❌ Отменить)
   // Only the chat that RECEIVED the card may decide (draft.ownerChatId check).
   if (data.startsWith('drok:') || data.startsWith('dredit:') || data.startsWith('drno:')) {
-    const kind = data.slice(0, 5)
-    const found = await findDraft(data.slice(5))
+    const kind = data.slice(0, data.indexOf(':')) // 'drok' | 'dredit' | 'drno' (lengths differ!)
+    const found = await findDraft(data.slice(data.indexOf(':') + 1))
     if (!found) {
       await answerCallback(cb.id, 'Черновик не найден — истёк (24ч) или уже обработан')
       return
