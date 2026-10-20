@@ -9,10 +9,12 @@
  * the AI" for a canned reply — it goes to the AGENT, which weighs its
  * durable memory (memory.md), the recent history of THIS chat and the
  * owner's teaching, and picks the action itself:
- *   reply  -> the worker sends <text> (same contract as before)
- *   ignore -> nothing is sent (spam / no answer needed)
- *   owner  -> the owner gets a bot notification; the person may get a
- *             polite holding line
+ *   reply   -> the worker sends <text> (same contract as before)
+ *   ignore  -> nothing is sent (spam / no answer needed)
+ *   owner   -> the owner gets a bot notification; the person may get a
+ *              polite holding line
+ *   approve (T39) -> the agent's reply becomes a DRAFT card in the owner's
+ *              bot chat with ✅/✏️/❌; the person gets it only after «✅"
  * At the END of every request the agent silently appends a brief summary of
  * the interaction to memory.md (after() — never delays the reply).
  */
@@ -21,10 +23,15 @@ import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
 import {
   agentDecide,
+  createDraft,
+  draftKeyboard,
   loadAgentContext,
   parseExamples,
   readAgentMemory,
   rememberInteraction,
+  renderDraftMessage,
+  setDraftStatus,
+  type TgDraft,
 } from '@/lib/tguser'
 
 export const runtime = 'nodejs'
@@ -71,7 +78,46 @@ async function notifyOwner(text: string): Promise<void> {
 function outcomeLine(decision: { action: string; text: string }): string {
   if (decision.action === 'reply') return `ответил от имени владельца: «${decision.text.slice(0, 200)}»`
   if (decision.action === 'ignore') return 'решил не отвечать (сообщение не требовало ответа)'
+  if (decision.action === 'approve')
+    return `предложил черновик ответа на одобрение владельцу: «${decision.text.slice(0, 200)}»`
   return `передал вопрос владельцу${decision.text ? `, человеку сказано: «${decision.text.slice(0, 150)}»` : ' (молча)'}`
+}
+
+/** bot sendMessage that returns the created message_id (0 = failed) — draft
+ *  cards need the id so the webhook can re-render the card after the owner's
+ *  decision (approve / edit / cancel) */
+async function sendBotMessage(
+  chatId: string,
+  text: string,
+  replyMarkup?: Record<string, unknown>,
+): Promise<number> {
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!chatId || !token) return 0
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text.slice(0, 3800),
+        link_preview_options: { is_disabled: true },
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      }),
+      signal: AbortSignal.timeout(20_000),
+    })
+    const json = (await res.json()) as { ok?: boolean; result?: { message_id?: number } }
+    return json.ok ? Number(json.result?.message_id) || 0 : 0
+  } catch { return 0 }
+}
+
+/** where draft approval cards go: the ACCOUNT owner's own bot chat first
+ *  (multi-user correctness), then the bot owner, then the env fallback */
+async function draftTargetChatId(userId: string): Promise<string> {
+  try {
+    const u = await db.user.findUnique({ where: { id: userId } })
+    if (u?.telegramChatId) return u.telegramChatId
+  } catch { /* fall through */ }
+  return ownerChatId()
 }
 
 export async function POST(req: Request) {
@@ -156,6 +202,31 @@ export async function POST(req: Request) {
       )
       if (decision.text) return NextResponse.json({ reply: decision.text })
       return NextResponse.json({ skip: 'agent-owner' })
+    }
+
+    // T39: the agent KNOWS what to answer but wants the owner's blessing —
+    // the reply becomes a draft card in the owner's bot chat (✅/✏️/❌).
+    // The worker sends NOTHING now; the person receives the text only after
+    // «✅» (the webhook then queues a tg_outbox job — the worker delivers).
+    if (decision.action === 'approve') {
+      const target = await draftTargetChatId(account.userId)
+      if (!target) return NextResponse.json({ skip: 'draft-no-target' })
+      const draft: TgDraft = {
+        id: crypto.randomUUID(),
+        chatId,
+        chatName: chatName || '',
+        incoming: text,
+        text: decision.text,
+        ownerChatId: target,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      }
+      await createDraft(account.id, draft)
+      // inline (not after()): the owner MUST reliably get the card — one
+      // Telegram call fits the worker's 90s HTTP timeout comfortably
+      const msgId = await sendBotMessage(target, renderDraftMessage(draft), draftKeyboard(draft.id))
+      if (msgId) await setDraftStatus(account.id, draft.id, 'pending', { botMsgId: msgId }).catch(() => {})
+      return NextResponse.json({ skip: 'draft-pending' })
     }
 
     if (!decision.text) return NextResponse.json({ skip: 'empty-reply' })

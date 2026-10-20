@@ -203,15 +203,20 @@ function entityName(e) {
   return [e.firstName, e.lastName, e.username, e.title].filter(Boolean).join(' ').slice(0, 120) || '?'
 }
 
-/** resolve a contact by @username / +phone / display name (entity cache,
- * then a bounded dialogs scan). Throws with an honest message when not found. */
+/** resolve a contact by @username / +phone / display name / numeric id
+ * (entity cache, then a bounded dialogs scan). Throws with an honest message
+ * when not found. T39: numeric ids come from APPROVED agent drafts — the
+ * site stores the exact peer the incoming message came from, so a raw id
+ * must resolve reliably (getEntity for cached entities + dialogs scan by id). */
 async function findPeer(client, q) {
   const s = String(q || '').trim()
   if (!s) throw new Error('пустой получатель')
+  const digits = s.replace(/\D/g, '')
   const cands = [s]
   const tme = s.match(/t\.me\/([A-Za-z0-9_]+)/i)
   if (tme) cands.push('@' + tme[1])
   if (!s.startsWith('@') && /^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(s)) cands.push('@' + s)
+  if (/^\d{5,}$/.test(s)) cands.push(Number(s), BigInt(s)) // entity-cache hits
   for (const c of cands) {
     try {
       const e = await client.getEntity(c)
@@ -219,11 +224,12 @@ async function findPeer(client, q) {
     } catch { /* try next / dialogs */ }
   }
   const norm = s.toLowerCase().replace(/^@/, '')
-  const phoneDigits = s.replace(/\D/g, '')
+  const phoneDigits = digits
   let fuzzy = null
   for await (const d of client.iterDialogs({ limit: 200 })) {
     const e = d.entity
     if (!e) continue
+    if (/^\d{5,}$/.test(s) && String(e.id) === digits) return e // exact peer id
     const un = String(e.username || '').toLowerCase()
     const ph = String(e.phone || '').replace(/\D/g, '')
     const nm = [e.firstName, e.lastName].filter(Boolean).join(' ').toLowerCase()

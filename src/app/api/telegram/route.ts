@@ -12,6 +12,13 @@ import {
   encryptSecret,
   migrateRulesDraft,
   readAgentMemory,
+  appendAgentMemory,
+  draftKeyboard,
+  findDraft,
+  getAgentConversation,
+  readDrafts,
+  renderDraftMessage,
+  setDraftStatus,
 } from '@/lib/tguser'
 
 export const dynamic = 'force-dynamic'
@@ -116,9 +123,10 @@ async function writeUsersMap(map: TgUsersMap): Promise<void> {
  *  phone -> code -> optional 2FA password (the same TgAccount row the site
  *  /tgagent creates, so connected state is visible in BOTH places) */
 interface ConnectFsm {
-  step: 'phone' | 'code' | 'password'
+  step: 'phone' | 'code' | 'password' | 'draftedit' // draftedit: T39 owner is retyping a draft
   accountId?: string
   phone?: string
+  draftId?: string // T39: the draft being edited
   exp: number
 }
 
@@ -408,6 +416,13 @@ async function statusText(userId: string): Promise<string> {
         lines.push(`🧠 Память агента (memory.md): ${entries} записей, ${md.length} символов`)
       }
     } catch { /* status stays honest without it */ }
+    // T39: draft approvals waiting for the owner's decision
+    try {
+      if (acc) {
+        const pend = (await readDrafts(acc.id)).filter((x) => x.status === 'pending').length
+        if (pend) lines.push(`📨 Черновиков ждёт твоего решения: ${pend} — кнопки ✅/✏️/❌ в этом чате`)
+      }
+    } catch { /* status stays honest without it */ }
     const users = Object.keys(await readUsersMap()).length
     lines.push(`Пользователей бота: ${users + 1}+`)
   } catch {
@@ -612,6 +627,36 @@ async function handleConnectStep(
   }
 }
 
+/** T39: the owner is retyping a draft (✏️ Изменить) — the next message IS
+ *  the new draft text; the card above is re-rendered with the same buttons */
+async function handleDraftEditText(
+  chatId: string,
+  userId: string,
+  fsm: ConnectFsm,
+  text: string,
+): Promise<void> {
+  const found = fsm.draftId ? await findDraft(fsm.draftId) : null
+  if (!found || found.draft.status !== 'pending' || found.draft.ownerChatId !== chatId) {
+    await clearConnect(chatId)
+    await tgSend(chatId, '⚠️ Черновик не найден или уже обработан (✅/❌).')
+    return
+  }
+  const updated = await setDraftStatus(found.accountId, found.draft.id, 'pending', { text })
+  await clearConnect(chatId)
+  if (!updated) {
+    await tgSend(chatId, '⚠️ Не удалось обновить черновик — попробуй ещё раз.')
+    return
+  }
+  if (updated.botMsgId)
+    await editPanel(chatId, updated.botMsgId, renderDraftMessage(updated), draftKeyboard(updated.id))
+  await tgSend(chatId, '✏️ Черновик обновлён — одобри на сообщении выше (✅ отправить / ❌ отменить).')
+  await appendAgentMemory(
+    userId,
+    'правка черновика',
+    `Владелец отредактировал черновик агентa для ${updated.chatName || updated.chatId} перед отправкой — итоговый текст: «${text.replace(/\s+/g, ' ').slice(0, 220)}»`,
+  ).catch(() => {})
+}
+
 /** inline button presses: open a chat from the list / create a chat */
 async function handleCallback(cb: { id?: string; data?: string; from?: { id?: number; username?: string; first_name?: string }; message?: { message_id?: number } }): Promise<void> {
   if (!cb.id || !cb.data || !cb.from?.id) return
@@ -704,6 +749,92 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     // buttons disappear; the history shows as ONE message; typing continues
     // in THIS conversation
     await editPanel(chatId, carrierMsgId, await chatDigest(conv.id, conv.title || undefined))
+    return
+  }
+
+  // ---- T39: draft approval buttons (✅ Отправить / ✏️ Изменить / ❌ Отменить)
+  // Only the chat that RECEIVED the card may decide (draft.ownerChatId check).
+  if (data.startsWith('drok:') || data.startsWith('dredit:') || data.startsWith('drno:')) {
+    const kind = data.slice(0, 5)
+    const found = await findDraft(data.slice(5))
+    if (!found) {
+      await answerCallback(cb.id, 'Черновик не найден — истёк (24ч) или уже обработан')
+      return
+    }
+    const d = found.draft
+    if (d.ownerChatId !== chatId) {
+      await answerCallback(cb.id, 'Это не твой черновик')
+      return
+    }
+    if (d.status !== 'pending') {
+      await answerCallback(cb.id, 'Черновик уже обработан')
+      return
+    }
+    const acc = await db.tgAccount.findUnique({ where: { id: found.accountId } })
+    if (!acc) {
+      await answerCallback(cb.id, 'Аккаунт не найден')
+      return
+    }
+    const person = d.chatName || `id ${d.chatId}`
+
+    if (kind === 'dredit') {
+      await setConnect(chatId, { step: 'draftedit', draftId: d.id, exp: Date.now() + 30 * 60_000 })
+      await answerCallback(cb.id, 'Пришли исправленный текст одним сообщением (/menu — отмена)')
+      return
+    }
+
+    if (kind === 'drno') {
+      await setDraftStatus(found.accountId, d.id, 'cancelled')
+      if (d.botMsgId)
+        await editPanel(chatId, d.botMsgId, `${renderDraftMessage(d)}\n\n❌ Отменено — ничего не отправлено.`)
+      await answerCallback(cb.id, 'Отменено')
+      await appendAgentMemory(
+        acc.userId,
+        'черновик отклонён',
+        `Владелец отменил черновик агентa для ${person} (не отправлен) — учитывать при похожих сообщениях в этом чате.`,
+      ).catch(() => {})
+      return
+    }
+
+    // drok — queue the delivery through the owner's own account (outbox).
+    // The resident worker resolves the peer and sends; the outcome lands in
+    // the «TG-агент» chat on the site (task_result) and the transcript stays
+    // honest via the outbox-result log entry.
+    if (acc.status !== 'connected' || !acc.active) {
+      await answerCallback(cb.id, '⚠️ Аккаунт не подключён — подключи его и нажми ✅ ещё раз')
+      if (d.botMsgId)
+        await editPanel(
+          chatId,
+          d.botMsgId,
+          `${renderDraftMessage(d)}\n\n⚠️ Аккаунт не подключён — черновик ждёт: подключи аккаунт и нажми ✅.`,
+          draftKeyboard(d.id),
+        )
+      return
+    }
+    const convId = await getAgentConversation(acc.userId).catch(() => entry.convId)
+    await db.agentTask.create({
+      data: {
+        conversationId: convId,
+        type: 'tg_outbox',
+        title: `📤 Telegram: черновик агентa → ${person}`.slice(0, 140),
+        status: 'queued',
+        progress: 'Одобрено владельцем — в очереди отправки…',
+        payload: JSON.stringify({ peer: d.chatId, message: d.text, accountId: acc.id, attempts: 0 }),
+      },
+    })
+    await setDraftStatus(found.accountId, d.id, 'sent')
+    if (d.botMsgId)
+      await editPanel(
+        chatId,
+        d.botMsgId,
+        `${renderDraftMessage(d)}\n\n✅ Одобрено — отправляю от твоего имени. Результат придёт сюда и в чат «TG-агент» на сайте.`,
+      )
+    await answerCallback(cb.id, 'Отправляю ✅')
+    await appendAgentMemory(
+      acc.userId,
+      'черновик одобрен',
+      `Владелец одобрил и отправил черновик агентa для ${person}: «${d.text.replace(/\s+/g, ' ').slice(0, 220)}» — агент угадал с ответом.`,
+    ).catch(() => {})
     return
   }
 }
@@ -911,6 +1042,11 @@ export async function POST(req: NextRequest) {
   const fsm = connectMap[chatId]
   if (fsm && fsm.exp < Date.now()) {
     await clearConnect(chatId)
+  }
+  // T39: the owner is retyping a draft (✏️) — the message IS the new text
+  if (fsm && fsm.exp >= Date.now() && fsm.step === 'draftedit' && !text.startsWith('/')) {
+    await handleDraftEditText(chatId, entry.userId, fsm, text)
+    return NextResponse.json({ ok: true })
   }
   if (fsm && fsm.exp >= Date.now() && !text.startsWith('/')) {
     await handleConnectStep(chatId, entry, fsm, text, msg.message_id || 0)

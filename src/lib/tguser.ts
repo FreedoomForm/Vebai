@@ -464,8 +464,10 @@ export async function rememberInteraction(
 /* ------------------------------------------------ agent decision (T38) */
 
 export interface AgentDecision {
-  action: 'reply' | 'ignore' | 'owner'
-  text: string // reply text, or the polite holding line for 'owner'; '' for ignore
+  action: 'reply' | 'ignore' | 'owner' | 'approve'
+  // reply -> text for the person; approve -> DRAFT for the owner to approve;
+  // owner -> polite holding line ('' = silent escalation); ignore -> ''
+  text: string
 }
 
 /** Mechanical parse of the decision protocol (<action> + <text>) — same
@@ -473,13 +475,15 @@ export interface AgentDecision {
  *  <action>owner</action> without <text> is VALID (silent escalation: the
  *  owner gets notified, the person gets no message). */
 export function parseDecision(raw: string): AgentDecision | null {
-  const am = raw.match(/<action>\s*(reply|ignore|owner)\s*<\/action>/i)
+  const am = raw.match(/<action>\s*(reply|ignore|owner|approve)\s*<\/action>/i)
   if (!am) return null
   const action = am[1].toLowerCase() as AgentDecision['action']
   const tm = raw.match(/<text>([\s\S]*?)<\/text>/i)
-  const text = (tm ? tm[1] : '').replace(/^["'`«]+|["'`»]+$/g, '').trim().slice(0, 1200)
+  // trim FIRST, then strip wrapping quotes (t39 unit: «…» surrounded by
+  // spaces survived the old order), then trim again
+  const text = (tm ? tm[1] : '').trim().replace(/^["'`«»]+|["'`«»]+$/g, '').trim().slice(0, 1200)
   if (action === 'ignore' || (action === 'owner' && !text)) return { action, text: '' }
-  if (!text) return null
+  if (!text) return null // reply and approve both NEED the text
   return { action, text }
 }
 
@@ -505,11 +509,16 @@ export function compileAgentDecidePrompt(
     'или — вопрос требует решения владельца (деньги, договорённости, документы, личные данные), либо владелец велел такие вопросы передавать ему:',
     '<action>owner</action>',
     '<text>вежливое подтверждение человеку, что запрос передан владельцу (необязательно)</text>',
-    'При сомнении между reply и owner выбирай owner — не выдумывай факты о делах владельца.',
+    'или — ты САМ знаешь, что ответить, но не уверен, что стоит отправлять без ведома владельца (обещания/договорённости от его имени, важные или деликатные сообщения, просьбы прислать файл/данные владельца):',
+    '<action>approve</action>',
+    '<text>ЧЕРНОВИК ответа человеку — сначала уйдёт владельцу на одобрение (кнопки ✅/✏️/❌), человеку попадёт только после его «✅»</text>',
+    'Не знаешь ответа — owner; знаешь ответ, но не уверен в отправке — approve; уверен в мелочи (приветствие, благодарность, простой вопрос о тебе) — reply сам.',
     'НЕ ОТВЕЧАЙ САМ на вопросы о ВСТРЕЧАХ/времени/месте, деньгах, ценах, заказах, документах и личных решениях владельца — это ВСЕГДА owner (не придумывай ни время, ни место, ни суммы!).',
     'Пример: «Во сколько завтра встречаемся?» → <action>owner</action> (время знает только владелец).',
     'Пример: «Привет, как дела? Чем занимаешься?» → <action>reply</action> — короткое дружелюбное сообщение.',
     'Пример: «🔥 СКИДКА 90%, жми ссылку» (реклама) → <action>ignore</action>.',
+    'Пример: «Отлично, тогда договорились, до завтра!» (завершение договорённости) → <action>approve</action> — черновик подтверждения покажи владельцу.',
+    'Пример: «Пришли, пожалуйста, тот документ» → <action>approve</action> — черновик вида «сейчас уточню у владельца и пришлю», файлы без одобрения не обещаем.',
     '',
     `ПРАВИЛА, заданные владельцем:\n${(systemPrompt || DEFAULT_AGENT_PROMPT).trim()}`,
   ]
@@ -558,11 +567,118 @@ export async function agentDecide(
   let decision = parseDecision(String(res.choices?.[0]?.message?.content || ''))
   if (!decision) {
     res = await call(
-      'ПРЕДЫДУЩАЯ ПОПЫТКА НАРУШИЛА ФОРМАТ. Верни ТОЛЬКО теги: <action>reply|ignore|owner</action> и при необходимости <text>…</text>. Без какого-либо другого текста.',
+      'ПРЕДЫДУЩАЯ ПОПЫТКА НАРУШИЛА ФОРМАТ. Верни ТОЛЬКО теги: <action>reply|ignore|owner|approve</action> и при необходимости <text>…</text>. Без какого-либо другого текста.',
     )
     decision = parseDecision(String(res.choices?.[0]?.message?.content || ''))
   }
   return decision || { action: 'owner', text: 'Передал ваш вопрос владельцу — он ответит чуть позже.' }
+}
+
+/* ------------------------------------------ owner-approval drafts (T39) */
+
+/** T39 (owner request): the agent may decide a reply needs the owner's
+ *  blessing — it then ships a DRAFT to the owner's bot chat with
+ *  ✅ Отправить / ✏️ Изменить / ❌ Отменить buttons; the person receives
+ *  the text only after «✅». Drafts live in StudioState per account
+ *  (survives reconnects, like memory.md), TTL 24h, newest kept. */
+export interface TgDraft {
+  id: string
+  chatId: string // the person's numeric peer id the draft is destined for
+  chatName: string
+  incoming: string // the message the draft answers (context for the owner)
+  text: string // the draft itself — what the person would receive
+  ownerChatId: string // bot chat that carries the approval buttons
+  botMsgId?: number // message carrying the buttons (edited after the decision)
+  status: 'pending' | 'sent' | 'cancelled'
+  createdAt: string
+}
+
+const draftsKey = (accountId: string) => `tg-drafts:${accountId}`
+const DRAFTS_MAX = 30
+const DRAFT_TTL_MS = 24 * 60 * 60 * 1000
+
+function pruneDrafts(list: TgDraft[]): TgDraft[] {
+  const now = Date.now()
+  const fresh = list.filter((d) => now - new Date(d.createdAt).getTime() < DRAFT_TTL_MS)
+  return fresh.slice(-DRAFTS_MAX)
+}
+
+export async function readDrafts(accountId: string): Promise<TgDraft[]> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: draftsKey(accountId) } })
+    const list = row ? ((JSON.parse(row.data) as { drafts?: TgDraft[] }).drafts || []) : []
+    return Array.isArray(list) ? list : []
+  } catch { return [] }
+}
+
+async function writeDrafts(accountId: string, drafts: TgDraft[]): Promise<void> {
+  const data = JSON.stringify({ drafts })
+  await db.studioState.upsert({
+    where: { key: draftsKey(accountId) },
+    update: { data, updatedAt: new Date() },
+    create: { key: draftsKey(accountId), data },
+  })
+}
+
+export async function createDraft(accountId: string, draft: TgDraft): Promise<void> {
+  const list = pruneDrafts(await readDrafts(accountId))
+  list.push(draft)
+  await writeDrafts(accountId, list)
+}
+
+/** find a draft across all accounts' stores — the approval callback carries
+ *  only the draft id (Telegram caps callback_data at 64 bytes) */
+export async function findDraft(id: string): Promise<{ accountId: string; draft: TgDraft } | null> {
+  try {
+    const rows = await db.studioState.findMany({ where: { key: { startsWith: 'tg-drafts:' } }, take: 50 })
+    for (const row of rows) {
+      const accountId = row.key.slice('tg-drafts:'.length)
+      const list = ((JSON.parse(row.data) as { drafts?: TgDraft[] }).drafts || []) as TgDraft[]
+      const draft = list.find((d) => d.id === id)
+      if (draft) return { accountId, draft }
+    }
+  } catch { /* fall through */ }
+  return null
+}
+
+/** status transition + optional text/botMsgId patch (edit flow) */
+export async function setDraftStatus(
+  accountId: string,
+  id: string,
+  status: TgDraft['status'],
+  patch: Partial<Pick<TgDraft, 'text' | 'botMsgId'>> = {},
+): Promise<TgDraft | null> {
+  const list = await readDrafts(accountId)
+  const draft = list.find((d) => d.id === id)
+  if (!draft) return null
+  draft.status = status
+  if (patch.text !== undefined) draft.text = patch.text
+  if (patch.botMsgId !== undefined) draft.botMsgId = patch.botMsgId
+  await writeDrafts(accountId, list)
+  return draft
+}
+
+/** one canonical rendering of the draft card shown to the owner — used by
+ *  the incoming route when creating AND by the webhook when editing */
+export function renderDraftMessage(draft: TgDraft): string {
+  return (
+    `📨 Черновик ответа для ${draft.chatName || `id ${draft.chatId}`}\n\n` +
+    `Входящее: «${draft.incoming.replace(/\s+/g, ' ').slice(0, 600)}»\n\n` +
+    `Черновик:\n${draft.text.slice(0, 1500)}\n\n` +
+    `✅ — отправить от твоего имени; ✏️ — пришлёшь свой текст вместо черновика; ❌ — ничего не уйдёт.`
+  )
+}
+
+export function draftKeyboard(id: string): Record<string, unknown> {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Отправить', callback_data: `drok:${id}` },
+        { text: '✏️ Изменить', callback_data: `dredit:${id}` },
+      ],
+      [{ text: '❌ Отменить', callback_data: `drno:${id}` }],
+    ],
+  }
 }
 
 /** T28: the persona used in the SITE CHAT when the owner talks to his agent
