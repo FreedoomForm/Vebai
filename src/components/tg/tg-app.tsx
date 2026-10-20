@@ -7,9 +7,10 @@
  * «Продолжить» -> redirected back to the chat with the agent connector
  * preselected (/?agent=1).
  * The agent's rules/context live in the site CHAT now: the user talks to the
- * agent through the composer's «TG-агент» connector and the transcript
- * becomes the context the agent uses when answering people who DM the
- * account. No rules editor / test variants here anymore.
+ * agent through the site chat's agent mode (sidebar «Telegram-агент» button or
+ * the bot's «💬 Научить агента» deep link — the composer toggle was removed
+ * in T40) and the transcript becomes the context the agent uses when answering
+ * people who DM the account. No rules editor / test variants here anymore.
  */
 
 import { useCallback, useEffect, useState } from 'react'
