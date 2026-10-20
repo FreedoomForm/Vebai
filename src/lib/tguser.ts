@@ -384,23 +384,185 @@ export function parseExamples(raw: string | null | undefined): TgExample[] {
   }
 }
 
-/** Compile the worker-side system prompt: identity + rules + few-shot examples. */
-export function compileAgentPrompt(me: { firstName?: string; username?: string }, systemPrompt: string, examples: TgExample[]): string {
-  const who = [me.firstName, me.username ? `(@${me.username})` : ''].filter(Boolean).join(' ')
-  let s = `Ты — личный Telegram-агент пользователя ${who || '(владелец аккаунта)'}. Тебе приходит входящее личное сообщение; верни ТОЛЬКО текст ответа от имени владельца, без пояснений, без кавычек, без подписи.\n\nПРАВИЛА, заданные владельцем:\n${(systemPrompt || DEFAULT_AGENT_PROMPT).trim()}\n`
-  if (examples.length) {
-    s += `\nПРИМЕРЫ одобренных ответов (стиль подстраивай под правила, не копируй дословно):\n`
-    for (const e of examples.slice(-8)) {
-      s += `- ${e.from ? `От ${e.from}: ` : ''}${e.incoming.replace(/\s+/g, ' ').slice(0, 300)}\n  Ответ: ${e.reply.replace(/\s+/g, ' ').slice(0, 500)}\n`
-    }
+/* ---------------------------------------------------- agent memory (T38) */
+
+/** T38 (owner request): the agent's DURABLE memory — the memory.md document.
+ *  Every agent request ends with a SILENT under-the-hood write of a brief
+ *  summary, and every decision starts from this memory. Stored per USER in
+ *  StudioState (survives account reconnects), capped to the newest tail. */
+const memoryKey = (userId: string) => `tg-agent-memory:${userId}`
+const MEMORY_MAX_CHARS = 6000
+
+export async function readAgentMemory(userId: string): Promise<string> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: memoryKey(userId) } })
+    return row ? String((JSON.parse(row.data) as { md?: string }).md || '') : ''
+  } catch { return '' }
+}
+
+function memStamp(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`
+}
+
+/** Append one entry; when over budget drop the OLDEST whole entries first
+ *  (the newest tail is what steers current behaviour). Best-effort. */
+export async function appendAgentMemory(userId: string, title: string, body: string): Promise<void> {
+  const entry = `\n## ${memStamp()} — ${(title || 'заметка').replace(/\s+/g, ' ').trim().slice(0, 120)}\n${(body || '').replace(/\s+/g, ' ').trim()}\n`
+  let md = (await readAgentMemory(userId)) + entry
+  while (md.length > MEMORY_MAX_CHARS) {
+    const cut = md.indexOf('\n## ', 1)
+    if (cut < 0) { md = md.slice(-MEMORY_MAX_CHARS); break }
+    md = md.slice(cut)
   }
-  s += `\nЖёсткие ограничения: никаких паролей/кодов/личных данных; никаких обещаний реальных действий (платежи, документы) — только «передам владельцу»; ответ всегда на языке входящего.`
-  return s
+  const data = JSON.stringify({ md })
+  await db.studioState.upsert({
+    where: { key: memoryKey(userId) },
+    update: { data, updatedAt: new Date() },
+    create: { key: memoryKey(userId), data },
+  })
+}
+
+/** T38: the silent step at the END of every agent request — condense the
+ *  interaction into 1-2 sentences and append to memory.md. Strictly
+ *  best-effort: never throws, never delays or breaks the reply itself. */
+export async function rememberInteraction(
+  userId: string,
+  chatName: string,
+  incoming: string,
+  outcome: string,
+): Promise<void> {
+  try {
+    const memory = await readAgentMemory(userId)
+    const res = await zai.chat.completions({
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Ты ведёшь память личного Telegram-агента (memory.md). После каждого обращения к агенту в память дописывается краткая выжимка. Верни ТОЛЬКО 1-2 коротких предложения САМОГО важного на будущее: кто писал, что просил/сообщил, факты, договорённости, обещания, тон общения. Телеграфный стиль, в третьем лице, по-русски. Без вступлений, без кавычек, без markdown-заголовков.',
+        },
+        {
+          role: 'user',
+          content: [
+            `ПАМЯТЬ (уже записано):\n${memory.trim() || '(пусто)'}`,
+            `Человек: ${chatName || '(имя неизвестно)'}`,
+            `Входящее сообщение: ${incoming.replace(/\s+/g, ' ').slice(0, 800)}`,
+            `Итог обращения: ${outcome.replace(/\s+/g, ' ').slice(0, 800)}`,
+          ].join('\n\n'),
+        },
+      ],
+      temperature: 0.2,
+      max_tokens: 160,
+    })
+    const text = String(res.choices?.[0]?.message?.content || '').replace(/^["'«]+|["'»]+$/g, '').trim()
+    if (!text) return
+    await appendAgentMemory(userId, chatName || 'входящее', text)
+  } catch { /* memory is strictly best-effort */ }
+}
+
+/* ------------------------------------------------ agent decision (T38) */
+
+export interface AgentDecision {
+  action: 'reply' | 'ignore' | 'owner'
+  text: string // reply text, or the polite holding line for 'owner'; '' for ignore
+}
+
+/** Mechanical parse of the decision protocol (<action> + <text>) — same
+ *  enforce-the-format philosophy as the t35 <answer>/<file> protocol. */
+export function parseDecision(raw: string): AgentDecision | null {
+  const am = raw.match(/<action>\s*(reply|ignore|owner)\s*<\/action>/i)
+  if (!am) return null
+  const action = am[1].toLowerCase() as AgentDecision['action']
+  const tm = raw.match(/<text>([\s\S]*?)<\/text>/i)
+  const text = (tm ? tm[1] : '').replace(/^["'`«]+|["'`»]+$/g, '').trim().slice(0, 1200)
+  if (action === 'ignore') return { action, text: '' }
+  if (!text) return null
+  return { action, text }
+}
+
+/** System prompt for the DECIDING agent (not a reply generator): memory.md +
+ *  per-chat history + owner's rules + examples -> one mechanical decision. */
+export function compileAgentDecidePrompt(
+  me: { firstName?: string; username?: string },
+  systemPrompt: string,
+  examples: TgExample[],
+  memory: string,
+  history: string[],
+  context: string,
+): string {
+  const who = [me.firstName, me.username ? `(@${me.username})` : ''].filter(Boolean).join(' ')
+  const lines: string[] = [
+    `Ты — личный Telegram-АГЕНТ пользователя ${who || '(владелец аккаунта)'}. Каждое входящее личное сообщение разбираешь ТЫ САМ и решаешь, что с ним делать: ответить, промолчать или передать вопрос владельцу. Ты не генератор ответов — ты агент с памятью (memory.md), накопленной за прошлые общения.`,
+    '',
+    'ФОРМАТ РЕШЕНИЯ — СТРОГО, проверяется механически; весь твой ответ состоит ТОЛЬКО из этих тегов:',
+    '<action>reply</action>',
+    '<text>текст ответа человеку ОТ ИМЕНИ владельца</text>',
+    'или — сообщение не требует ответа (реклама, спам, рассылки, «ок»/эмодзи, уведомления):',
+    '<action>ignore</action>',
+    'или — вопрос требует решения владельца (деньги, договорённости, документы, личные данные), либо владелец велел такие вопросы передавать ему:',
+    '<action>owner</action>',
+    '<text>вежливое подтверждение человеку, что запрос передан владельцу (необязательно)</text>',
+    'При сомнении между reply и owner выбирай owner — не выдумывай факты о делах владельца.',
+    '',
+    `ПРАВИЛА, заданные владельцем:\n${(systemPrompt || DEFAULT_AGENT_PROMPT).trim()}`,
+  ]
+  if (examples.length) {
+    lines.push('', 'ПРИМЕРЫ одобренных ответов (стиль подстраивай, не копируй дословно):')
+    for (const e of examples.slice(-8))
+      lines.push(`- ${e.from ? `От ${e.from}: ` : ''}${e.incoming.replace(/\s+/g, ' ').slice(0, 300)}\n  Ответ: ${e.reply.replace(/\s+/g, ' ').slice(0, 500)}`)
+  }
+  lines.push('', `ТВОЯ ПАМЯТЬ (memory.md — итоги прошлых обращения, опирайся на неё):\n${memory.trim() || '(пока пуста — это первые обращения)'}`)
+  if (history.length) lines.push('', `НЕДАВНЯЯ ИСТОРИЯ ЭТОГО ЧАТА (от старых к свежим):\n${history.join('\n')}`)
+  if (context.trim()) lines.push('', `ПЕРЕПИСКА ВЛАДЕЛЬЦА С ТОБОЙ на сайте (твой КОНТЕКСТ — строго следуй инструкциям владельца из неё):\n${context.trim()}`)
+  lines.push(
+    '',
+    'Жёсткие ограничения: никаких паролей/кодов/личных данных; никаких обещаний реальных действий (платежи, документы) — только «передам владельцу»; ответ всегда на языке входящего.',
+    `Текущая дата и время (UTC): ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
+  )
+  return lines.join('\n')
+}
+
+/** T38: the real decision for an incoming private message — the agent weighs
+ *  its memory, the chat history and the owner's rules and picks the action.
+ *  Broken format gets ONE mechanical retry (t35 lesson), then a safe
+ *  escalation fallback — never silence (the T37 lesson). */
+export async function agentDecide(
+  me: { firstName?: string; username?: string },
+  systemPrompt: string,
+  examples: TgExample[],
+  fromName: string,
+  incoming: string,
+  context = '',
+  memory = '',
+  history: string[] = [],
+): Promise<AgentDecision> {
+  const sys = compileAgentDecidePrompt(me, systemPrompt, examples, memory, history, context)
+  const userMsg = `${fromName ? `Новое входящее сообщение от ${fromName}: ` : 'Новое входящее сообщение: '}${incoming.replace(/\s+/g, ' ').slice(0, 1500)}`
+  const call = (extra: string) =>
+    zai.chat.completions({
+      messages: [
+        { role: 'system', content: extra ? `${sys}\n\n${extra}` : sys },
+        { role: 'user', content: userMsg },
+      ],
+      temperature: 0.4,
+      max_tokens: 700,
+    })
+  let res = await call('')
+  let decision = parseDecision(String(res.choices?.[0]?.message?.content || ''))
+  if (!decision) {
+    res = await call(
+      'ПРЕДЫДУЩАЯ ПОПЫТКА НАРУШИЛА ФОРМАТ. Верни ТОЛЬКО теги: <action>reply|ignore|owner</action> и при необходимости <text>…</text>. Без какого-либо другого текста.',
+    )
+    decision = parseDecision(String(res.choices?.[0]?.message?.content || ''))
+  }
+  return decision || { action: 'owner', text: 'Передал ваш вопрос владельцу — он ответит чуть позже.' }
 }
 
 /** T28: the persona used in the SITE CHAT when the owner talks to his agent
- *  (the «TG-агент» connector). This conversation is the agent's memory — the
- *  owner teaches it here; the transcript later feeds agentReply. */
+ *  (the «TG-агент» connector). The owner teaches the agent here; the
+ *  transcript feeds every incoming-message decision (T38), alongside the
+ *  durable memory.md. */
 export function compileAgentChatPrompt(me: { firstName?: string; username?: string }, systemPrompt: string): string {
   const who = [me.firstName, me.username ? `(@${me.username})` : ''].filter(Boolean).join(' ')
   return [
@@ -414,61 +576,6 @@ export function compileAgentChatPrompt(me: { firstName?: string; username?: stri
     `Базовые правила твоего поведения в чужом Telegram: ${(systemPrompt || DEFAULT_AGENT_PROMPT).trim()}`,
     '- Текущая дата и время (UTC): ' + new Date().toISOString().slice(0, 19).replace('T', ' '),
   ].join('\n')
-}
-
-/* --------------------------------------------------------------- zai calls */
-
-async function zaiText(messages: { role: 'system' | 'user' | 'assistant'; content: string }[], temperature = 0.4, maxTokens = 700): Promise<string> {
-  const res = await zai.chat.completions({ messages, temperature, max_tokens: maxTokens })
-  const text = res.choices?.[0]?.message?.content || ''
-  if (!text.trim()) throw new Error('модель вернула пустой ответ')
-  return text.trim()
-}
-
-function extractJson<T>(raw: string): T | null {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
-  const candidate = fenced ? fenced[1] : raw
-  const start = candidate.search(/[[{]/)
-  if (start < 0) return null
-  const open = candidate[start]
-  const close = open === '[' ? ']' : '}'
-  const end = candidate.lastIndexOf(close)
-  if (end <= start) return null
-  try {
-    return JSON.parse(candidate.slice(start, end + 1)) as T
-  } catch {
-    return null
-  }
-}
-
-/** /api/tg/incoming: the real reply for an incoming private message.
- *  T28: `context` — the owner ↔ agent site-chat transcript; the agent must
- *  follow whatever the owner taught it there (this is what makes it THE
- *  owner's agent rather than a generic AI). */
-export async function agentReply(
-  me: { firstName?: string; username?: string },
-  systemPrompt: string,
-  examples: TgExample[],
-  fromName: string,
-  incoming: string,
-  context = '',
-): Promise<string> {
-  let sys = compileAgentPrompt(me, systemPrompt, examples)
-  if (context.trim()) {
-    sys +=
-      '\n\nПЕРЕПИСКА ВЛАДЕЛЬЦА С ТОБОЙ на сайте (твой КОНТЕКСТ — строго следуй инструкциям владельца из неё):\n' +
-      context.trim()
-  }
-  const raw = await zaiText(
-    [
-      { role: 'system', content: sys },
-      { role: 'user', content: `${fromName ? `Сообщение от ${fromName}: ` : ''}${incoming.slice(0, 1500)}` },
-    ],
-    0.5,
-    600,
-  )
-  // the model must return the bare message text; strip wrapping quotes/backticks
-  return raw.replace(/^["'`«]+|["'`»]+$/g, '').trim().slice(0, 1200)
 }
 
 /* ---------------------------------------------------------------- helpers */

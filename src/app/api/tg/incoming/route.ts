@@ -1,19 +1,37 @@
 /**
  * T26: POST /api/tg/incoming — the worker reports a fresh incoming private
- * message on a user's account; the site dedupes, logs it and returns the AI
- * reply text (or an honest skip reason). The actual sending happens in the
- * worker, and only then /api/tg/sent logs the outgoing message (T21 rule:
- * the log reflects reality, not intentions).
+ * message on a user's account; the site dedupes, logs it and DECIDES what to
+ * do about it. The actual sending happens in the worker, and only then
+ * /api/tg/sent logs the outgoing message (T21 rule: the log reflects
+ * reality, not intentions).
+ *
+ * T38 (owner request 2026-10-20): the message no longer goes "straight to
+ * the AI" for a canned reply — it goes to the AGENT, which weighs its
+ * durable memory (memory.md), the recent history of THIS chat and the
+ * owner's teaching, and picks the action itself:
+ *   reply  -> the worker sends <text> (same contract as before)
+ *   ignore -> nothing is sent (spam / no answer needed)
+ *   owner  -> the owner gets a bot notification; the person may get a
+ *             polite holding line
+ * At the END of every request the agent silently appends a brief summary of
+ * the interaction to memory.md (after() — never delays the reply).
  */
 import crypto from 'node:crypto'
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
-import { agentReply, loadAgentContext, parseExamples } from '@/lib/tguser'
+import {
+  agentDecide,
+  loadAgentContext,
+  parseExamples,
+  readAgentMemory,
+  rememberInteraction,
+} from '@/lib/tguser'
 
 export const runtime = 'nodejs'
-export const maxDuration = 45
+export const maxDuration = 60
 
 const RATE_PER_HOUR = 30
+const HISTORY_TURNS = 12
 
 function secretOk(s: unknown): boolean {
   const expected = process.env.GH_TERM_SECRET || ''
@@ -22,6 +40,38 @@ function secretOk(s: unknown): boolean {
   const a = Buffer.from(given)
   const b = Buffer.from(expected)
   return a.length === b.length && crypto.timingSafeEqual(a, b)
+}
+
+/** bot-cache owner chat (fallback: TELEGRAM_CHAT_ID env) — the escalation
+ *  target when the agent hands a conversation back to the owner */
+async function ownerChatId(): Promise<string> {
+  try {
+    const row = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
+    const id = row ? String((JSON.parse(row.data) as { ownerChatId?: string }).ownerChatId || '') : ''
+    if (id) return id
+  } catch { /* fall through */ }
+  return String(process.env.TELEGRAM_CHAT_ID || '')
+}
+
+async function notifyOwner(text: string): Promise<void> {
+  const chatId = await ownerChatId()
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!chatId || !token) return
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3800) }),
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch { /* best-effort */ }
+}
+
+/** one-line digest of the decision for the worker logs and for memory.md */
+function outcomeLine(decision: { action: string; text: string }): string {
+  if (decision.action === 'reply') return `ответил от имени владельца: «${decision.text.slice(0, 200)}»`
+  if (decision.action === 'ignore') return 'решил не отвечать (сообщение не требовало ответа)'
+  return `передал вопрос владельцу${decision.text ? `, человеку сказано: «${decision.text.slice(0, 150)}»` : ' (молча)'}`
 }
 
 export async function POST(req: Request) {
@@ -58,20 +108,58 @@ export async function POST(req: Request) {
 
   let me: { firstName?: string; username?: string } = {}
   try { me = JSON.parse(account.meInfo || '{}') } catch { /* ignore */ }
+
+  // the agent's three memory sources, gathered in parallel:
+  // memory.md (durable), the per-chat transcript (DB), the owner's teaching
+  // (site «TG-агент» conversation)
+  const [context, memory, chatRows] = await Promise.all([
+    loadAgentContext(account.userId).catch(() => ''),
+    readAgentMemory(account.userId).catch(() => ''),
+    db.tgAgentMessage.findMany({
+      where: { accountId, chatId },
+      orderBy: { createdAt: 'desc' },
+      take: HISTORY_TURNS,
+    }).catch(() => []),
+  ])
+  chatRows.reverse() // oldest -> newest
+  const history = chatRows.map((m) => {
+    const who = m.direction === 'in' ? (m.chatName || chatName || 'Собеседник') : 'Ты (агент)'
+    return `${who}: ${(m.text || '').replace(/\s+/g, ' ').slice(0, 300)}`
+  })
+
   try {
-    // T28: the owner teaches the agent in the site chat («TG-агент» connector);
-    // that transcript IS the agent's memory — feed it into every reply
-    const context = await loadAgentContext(account.userId).catch(() => '')
-    const reply = await agentReply(
+    const decision = await agentDecide(
       me,
       account.config?.systemPrompt || '',
       parseExamples(account.config?.examples),
       chatName || '',
       text,
       context,
+      memory,
+      history,
     )
-    if (!reply) return NextResponse.json({ skip: 'empty-reply' })
-    return NextResponse.json({ reply })
+
+    // T38: the silent under-the-hood memory write at the END of the request
+    // — runs after the HTTP response, never delays or breaks the decision
+    after(() =>
+      rememberInteraction(account.userId, chatName || '', text, outcomeLine(decision)).catch(() => {}),
+    )
+
+    if (decision.action === 'ignore') return NextResponse.json({ skip: 'agent-ignore' })
+
+    if (decision.action === 'owner') {
+      after(() =>
+        notifyOwner(
+          `📩 Входящее от ${chatName || chatId}:\n${text.slice(0, 1200)}\n\n` +
+            `🤖 Агент передал вопрос тебе (сам не стал отвечать).`,
+        ).catch(() => {}),
+      )
+      if (decision.text) return NextResponse.json({ reply: decision.text })
+      return NextResponse.json({ skip: 'agent-owner' })
+    }
+
+    if (!decision.text) return NextResponse.json({ skip: 'empty-reply' })
+    return NextResponse.json({ reply: decision.text })
   } catch (e) {
     return NextResponse.json({ skip: 'ai-error', error: e instanceof Error ? e.message.slice(0, 200) : 'ошибка ИИ' })
   }

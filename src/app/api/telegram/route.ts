@@ -11,6 +11,7 @@ import {
   normalizePhone,
   encryptSecret,
   migrateRulesDraft,
+  readAgentMemory,
 } from '@/lib/tguser'
 
 export const dynamic = 'force-dynamic'
@@ -398,6 +399,15 @@ async function statusText(userId: string): Promise<string> {
         ? `Личный Telegram-аккаунт: подключён (${acc.active ? 'агент ВКЛ' : 'агент ВЫКЛ — включи кнопкой «🤖 Агент»'})`
         : 'Личный Telegram-аккаунт: НЕ подключён — жми «📱 Подключить Telegram аккаунт» (без него агент не читает и не отправляет от твоего имени)',
     )
+    // T38: the agent's durable memory (memory.md) — grows silently after
+    // every incoming message the agent decided about
+    try {
+      const md = await readAgentMemory(userId)
+      if (md.trim()) {
+        const entries = (md.match(/\n## /g) || []).length
+        lines.push(`🧠 Память агента (memory.md): ${entries} записей, ${md.length} символов`)
+      }
+    } catch { /* status stays honest without it */ }
     const users = Object.keys(await readUsersMap()).length
     lines.push(`Пользователей бота: ${users + 1}+`)
   } catch {
