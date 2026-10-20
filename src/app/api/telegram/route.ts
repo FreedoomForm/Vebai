@@ -180,6 +180,36 @@ const appButtonRow = (): { text: string; web_app: { url: string } }[] => [
   { text: '🌐 Открыть Vebai (аккаунт)', web_app: { url: MINI_APP_URL } },
 ]
 
+// ---- "/" command menu (setMyCommands) ---------------------------------------
+// Telegram renders these in the blue menu button (and in the commands list);
+// tapping one sends its text, which lands in the normal /^\/cmd/ handlers
+// below. Synced once per lambda instance (idempotent), retried on the next
+// update if the API call fails.
+const BOT_COMMANDS = [
+  { command: 'menu', description: '⌨️ Кнопки: создать чат / чаты' },
+  { command: 'status', description: '📡 Состояние конвейера' },
+  { command: 'app', description: '🌐 Аккаунт на сайте: задачи и файлы' },
+  { command: 'start', description: '🚀 Приветствие и привязка' },
+]
+
+let commandsSynced = false
+
+async function registerCommands(): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN || ''
+  if (!token) return
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const json = (await res.json()) as { ok?: boolean; description?: string }
+    if (json.ok) commandsSynced = true
+    else console.error('[telegram-bot] setMyCommands:', json.description)
+  } catch { /* retried on the next update */ }
+}
+
 /** menu keyboard (T27): the «📱 Подключить Telegram аккаунт» button exists
  *  ONLY while the user's account is not connected — once connected it
  *  disappears here AND on the site (one shared TgAccount row), and the agent
@@ -770,6 +800,7 @@ async function chatAnswer(convId: string, q: string): Promise<string> {
 }
 
 export async function GET() {
+  if (!commandsSynced) await registerCommands()
   return NextResponse.json({ ok: true, bot: 'vebai', mode: 'webhook-multiuser' })
 }
 
@@ -805,6 +836,9 @@ export async function POST(req: NextRequest) {
   if (cache.lastUpdateId && update.update_id <= cache.lastUpdateId)
     return NextResponse.json({ ok: true, dup: true })
   await writeCache({ lastUpdateId: update.update_id })
+
+  // keep the "/" command menu in sync (once per lambda instance)
+  if (!commandsSynced) await registerCommands()
 
   const fromCb = update.callback_query
   if (fromCb?.id && fromCb.data && fromCb.from?.id) {
