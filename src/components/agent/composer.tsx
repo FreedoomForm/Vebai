@@ -6,7 +6,7 @@ import { cn, formatBytes } from '@/lib/utils'
 
 export interface SendOptions {
   resume?: boolean
-  /** 🎬 toggle: also queue the LTX-2.5 video pipeline for this prompt */
+  /** 🎬 toggle: also queue the Wan 2.1 video pipeline for this prompt */
   videoRequest?: boolean
   /** T40: files attached in the composer — the app uploads them to the
    *  Telegram channel before the turn starts */
@@ -209,7 +209,7 @@ export function Composer({
             {webSearch && <span className="hidden sm:inline">Поиск</span>}
           </button>
 
-          {/* 🎬 video toggle — queues the LTX-2.5 pipeline (Kaggle, 2x T4) */}
+          {/* 🎬 video toggle — queues the Wan 2.1 pipeline (Kaggle, 2x T4) */}
           <button
             type="button"
             aria-label="Сделать видео"

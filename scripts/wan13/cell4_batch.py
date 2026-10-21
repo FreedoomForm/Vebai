@@ -1,13 +1,15 @@
-# Stages 3-6 (dual-worker batch) -- TWO ComfyUI servers, one per T4.
+# Stages 3-5 (dual-worker batch) -- TWO ComfyUI servers, one per T4.
 #
-# The parallelism this kernel exists for, unchanged from the H3 era: one
-# worker thread per T4, each owning a ComfyUI process on its own port,
-# pulling from a shared shot queue. What changed with LTX-2.5:
-#   * the sampling graph loads the conditioning pair from blobs (no encoder)
-#     and samples the PACKED audio-video latent in 8 distilled steps;
-#   * the decode graph splits the AV latent, decodes video (tiled) and audio,
-#     and muxes them into one MP4 through CreateVideo + SaveVideo;
-#   * the retry ladder's third rung swaps Q4_K_M for the smaller Q3_K_M.
+# The parallelism this kernel exists for, unchanged from the H3/LTX eras: one
+# worker thread per T4, each owning a ComfyUI process on its own port, pulling
+# from a shared shot queue. What changed with Wan 2.1 1.3B:
+#   * the sampling graph loads the conditioning pair from blobs (no encoder),
+#     samples 30 uni_pc steps through ModelSamplingSD3 shift 8, and then -
+#     in the SAME graph - decodes with the wan VAE (tiled) and muxes a silent
+#     MP4 through CreateVideo + SaveVideo. No separate decode stage, no audio
+#     VAE: Wan 2.1 is video-only.
+#   * the retry ladder shrinks the geometry instead of swapping quants: both
+#     DiTs fit a T4, so a smaller checkpoint would buy nothing.
 import queue as queue_mod
 import threading
 
@@ -67,7 +69,7 @@ def stop_comfy_port(port, term_timeout_s=15):
         pass
 
 def spawn_comfy(port, gpu, dtype_flag=None, timeout_s=900):
-    """One ComfyUI process pinned to one GPU. dtype_flag is unused for LTX
+    """One ComfyUI process pinned to one GPU. dtype_flag is unused for Wan
     (comfy picks fp16 on sm75 by itself); kept for signature compatibility."""
     stop_comfy_port(port)
     log_path = WORK / f"comfy_p{port}.log"
@@ -123,39 +125,48 @@ def dropdown_from(info, node_type, input_name):
     spec = (inputs.get("required", {}) | inputs.get("optional", {})).get(input_name)
     return spec[0] if spec and isinstance(spec[0], list) else []
 
-# --- the sampling graph (per-shot; no text encoder, no VAE) --------------------
+# --- the sample+decode graph (per-shot; no text encoder) ------------------------
 GUARD_HEARTBEAT_S = 30
 
-def build_sample_graph(shot, gear, seed, latent_key, dit):
+def build_sample_graph(shot, gear, seed, latent_key, negative_blob_key):
+    """One roundtrip: load blobs -> 30-step uni_pc sample -> tiled VAE decode ->
+    silent mp4. The negative blob's latent is ignored on purpose - the sampler
+    seeds from the positive blob's zeros/Fun-InP latent (node 2 output 1)."""
+    dit_name = shot["dit"]["hf_filename"]
+    video_prefix = f"wan13_video/job_{shot['job_id']}/{latent_key}"
     return {
-        "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": dit["hf_filename"]}},
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": dit_name,
+                                                     "weight_dtype": "default"}},
         "2": {"class_type": "H3LoadConditioning", "inputs": {
             "store_dir": str(CONDITIONING_STORE), "key": shot["keys"][gear]}},
         "3": {"class_type": "H3LoadConditioning", "inputs": {
-            "store_dir": str(CONDITIONING_STORE), "key": negative_key()}},
-        "4": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
-        "5": {"class_type": "ManualSigmas", "inputs": {"sigmas": SIGMAS_8STEP}},
-        "6": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": SAMPLER_NAME}},
-        "7": {"class_type": "LTXVDualCFGGuider", "inputs": {
-            "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
-            "video_cfg": VIDEO_CFG, "audio_cfg": AUDIO_CFG}},
-        "8": {"class_type": "SamplerCustomAdvanced", "inputs": {
-            "noise": ["4", 0], "guider": ["7", 0], "sampler": ["6", 0],
-            "sigmas": ["5", 0], "latent_image": ["2", 1]}},
-        "9": {"class_type": "H3SaveLatent", "inputs": {
-            "samples": ["8", 0], "store_dir": str(LATENT_STORE), "key": latent_key}},
-        "10": {"class_type": "H3LatentProbe", "inputs": {
-            "samples": ["9", 0],
-            "filename_prefix": f"ltx25/job_{shot['job_id']}"}},
+            "store_dir": str(CONDITIONING_STORE), "key": negative_blob_key}},
+        "4": {"class_type": "ModelSamplingSD3", "inputs": {
+            "model": ["1", 0], "shift": SHIFT}},
+        "5": {"class_type": "KSampler", "inputs": {
+            "model": ["4", 0], "positive": ["2", 0], "negative": ["3", 0],
+            "latent_image": ["2", 1], "seed": seed, "steps": STEPS, "cfg": CFG,
+            "sampler_name": SAMPLER_NAME, "scheduler": SCHEDULER, "denoise": 1.0}},
+        "6": {"class_type": "H3SaveLatent", "inputs": {
+            "samples": ["5", 0], "store_dir": str(LATENT_STORE), "key": latent_key}},
+        "7": {"class_type": "H3LatentProbe", "inputs": {
+            "samples": ["6", 0], "filename_prefix": f"wan13/job_{shot['job_id']}"}},
+        "8": {"class_type": "VAELoader", "inputs": {
+            "vae_name": Path(VIDEO_VAE["hf_filename"]).name}},
+        "9": {"class_type": "VAEDecodeTiled", "inputs": {
+            "samples": ["5", 0], "vae": ["8", 0], "tile_size": 512, "overlap": 64,
+            "temporal_size": 64, "temporal_overlap": 16}},
+        "10": {"class_type": "CreateVideo", "inputs": {
+            "images": ["9", 0], "fps": float(FPS)}},
+        "11": {"class_type": "SaveVideo", "inputs": {
+            "video": ["10", 0], "filename_prefix": video_prefix, "format": "auto"}},
     }
 
 def validate(graph, object_info, port):
     errors = []
     serialized = json.dumps(graph)
-    for forbidden, why in (("CLIPLoader", "the 24.5 GiB text encoder must not load here"),
-                           ("VAELoader", "decoding is a separate stage")):
-        if forbidden in serialized:
-            errors.append(f"{forbidden} present: {why}")
+    if "CLIPLoader" in serialized:
+        errors.append("CLIPLoader present: the 6.27 GiB text encoder must not load here")
     for node_id, spec in graph.items():
         info = object_info.get(spec["class_type"])
         if info is None:
@@ -185,7 +196,6 @@ CLIFF_PROBE_WINDOW_S = 120
 CLIFF_PROBE_MAX_WINDOWS = 2
 CLIFF_PROJECTED_BUDGET_S = 3600
 SAMPLER_START_TIMEOUT_S = 1500
-DECODE_TIMEOUT_S = 1800
 VIDEO_INSPECT_EVERY = 8
 
 def parse_clock(value):
@@ -213,8 +223,7 @@ def new_guard_runtime(started):
 
 def guard_decide(progress, now, runtime, guard_state, steps, budget_s):
     """Times two probe windows of the sampler, projects the total denoise time
-    from the observed s/step, and cancels projections that overrun the budget.
-    Distilled LTX is 8 steps, so a healthy clip settles within minutes."""
+    from the observed s/step, and cancels projections that overrun the budget."""
     runtime = dict(runtime)
     messages = []
     waited = now - runtime["started"]
@@ -307,23 +316,28 @@ def cancel_prompt(port, prompt_id):
         time.sleep(2)
     return outcome
 
-# --- sampling one attempt -------------------------------------------------------
-def sample_one(port, shot, gear, seed, latent_key, budget_s, record, dit):
+# --- sampling + decoding one attempt --------------------------------------------
+def generate_one(port, shot, gear, seed, latent_key, budget_s, record):
+    """Runs the whole sample+decode graph in one fresh ComfyUI process and
+    returns the produced mp4 path, or None (record explains)."""
     gpu = 0 if port == WORKER_PORTS[0] else 1
     server = spawn_comfy(port, gpu)
     base = server["base_url"]
     log_offset = server["log"].stat().st_size if server["log"].exists() else 0
     try:
         info = requests.get(f"{base}/object_info", timeout=300).json()
-        required = {"UnetLoaderGGUF", "H3LoadConditioning", "RandomNoise",
-                    "ManualSigmas", "KSamplerSelect", "LTXVDualCFGGuider",
-                    "SamplerCustomAdvanced", "H3SaveLatent", "H3LatentProbe"}
+        required = {"UNETLoader", "H3LoadConditioning", "ModelSamplingSD3", "KSampler",
+                    "H3SaveLatent", "H3LatentProbe", "VAELoader", "VAEDecodeTiled",
+                    "CreateVideo", "SaveVideo"}
         missing = sorted(required - set(info))
         if missing:
             raise RuntimeError(f"Missing required nodes: {missing}")
-        if dit["hf_filename"] not in dropdown_from(info, "UnetLoaderGGUF", "unet_name"):
-            raise RuntimeError(f"DiT {dit['hf_filename']} not visible to UnetLoaderGGUF")
-        graph = build_sample_graph(shot, gear, seed, latent_key, dit)
+        if shot["dit"]["hf_filename"] not in dropdown_from(info, "UNETLoader", "unet_name"):
+            raise RuntimeError(f"DiT {shot['dit']['hf_filename']} not visible to UNETLoader")
+        if Path(VIDEO_VAE["hf_filename"]).name not in dropdown_from(info, "VAELoader", "vae_name"):
+            raise RuntimeError("wan VAE not visible to VAELoader")
+        graph = build_sample_graph(shot, gear, seed, latent_key,
+                                   NEG_KEYS[shot["variant"]])
         validate(graph, info, port)
         prompt_id = str(uuid.uuid4())
         response = requests.post(f"{base}/prompt", timeout=120, json={
@@ -334,22 +348,22 @@ def sample_one(port, shot, gear, seed, latent_key, budget_s, record, dit):
             raise RuntimeError(f"Node errors: {queued['node_errors']}")
         started = time.perf_counter()
         print(f"shot_{shot['num']:02d}: sampling {shot['geometries'][gear]['length']}f "
-              f"gear {gear} seed {seed} ({dit['hf_filename']}) on port {port}")
+              f"gear {gear} seed {seed} ({shot['dit']['hf_filename']}) on port {port}")
         shown = log_offset
         guard_runtime = new_guard_runtime(started)
         guard_state = {"outcome": None, "sampler_started": False}
         record_out = None
         deadline = min(SESSION_DEADLINE,
-                       time.time() + SAMPLER_START_TIMEOUT_S + budget_s + 900)
+                       time.time() + SAMPLER_START_TIMEOUT_S + budget_s + 1800)
         while time.time() < deadline:
             if server["process"].poll() is not None:
-                raise RuntimeError("ComfyUI exited during sampling (check for an OOM kill)")
+                raise RuntimeError("ComfyUI exited during generation (check for an OOM kill)")
             chunk = server_log_slice(port, shown)
             shown += len(chunk.encode("utf-8"))
             for line in chunk.splitlines():
                 if line.strip() and any(t in line for t in (
                         "error", "Error", "out of memory", "Requested to load",
-                        "architecture", "Patched", "lora key")):
+                        "Patched", "lora key")):
                     print("    " + line[:160])
             try:
                 history = requests.get(f"{base}/history/{prompt_id}", timeout=60).json()
@@ -373,29 +387,29 @@ def sample_one(port, shot, gear, seed, latent_key, budget_s, record, dit):
             time.sleep(5)
         elapsed = round(time.perf_counter() - started, 1)
         outcome = guard_state.get("outcome")
-        record.update({"sample_elapsed_s": elapsed, "guard_state": guard_state})
+        record.update({"generate_elapsed_s": elapsed, "guard_state": guard_state})
         if outcome in ("CLIFF_NO_STEP_COMPLETED", "CLIFF_PROJECTED_OVER_BUDGET",
                        "SAMPLER_NEVER_STARTED"):
             record["sample_status"] = "CLIFF"
             record["failure_class"] = outcome
-            return "CLIFF"
+            return None
         if record_out is None:
             record["sample_status"] = "NO_HISTORY"
-            return "FAILED"
+            return None
         status = record_out.get("status", {})
         log_text = server_log_slice(port, log_offset)
         record["oom_seen"] = bool(re.search(
             r"CUDA out of memory|torch\.OutOfMemoryError", log_text, re.I))
-        record["arch_error_seen"] = "Unexpected architecture type" in log_text
         if status.get("status_str") != "success":
             record["sample_status"] = "FAILED"
             record["history_status_str"] = status.get("status_str")
-            return "FAILED"
+            record["history_messages"] = [str(m)[:300] for m in (status.get("messages") or [])][:8]
+            return None
         latent_path = LATENT_STORE / f"{latent_key}.pt"
         if not latent_path.is_file():
             record["sample_status"] = "NO_LATENT"
-            return "FAILED"
-        summaries = sorted((OUTPUT_DIR / "ltx25").glob(
+            return None
+        summaries = sorted((OUTPUT_DIR / "wan13").glob(
             f"job_{shot['job_id']}*.latent_summary.json"), key=lambda p: p.stat().st_mtime)
         if summaries:
             summary = json.loads(summaries[-1].read_text(encoding="utf-8"))
@@ -404,124 +418,24 @@ def sample_one(port, shot, gear, seed, latent_key, budget_s, record, dit):
             finite = (summary.get("finite") or [])
             if finite and not all(finite):
                 record["sample_status"] = "NON_FINITE_LATENT"
-                return "FAILED"
-        record["sample_status"] = "SUCCESS"
-        print(f"shot_{shot['num']:02d}: sampled ok in {elapsed}s "
-              f"({guard_state.get('observed_s_per_step')} s/step)")
-        return "SUCCESS"
-    finally:
-        stop_comfy_port(port)
-
-# --- decode (fresh process: only the two VAEs are resident) ---------------------
-def decode_fill(node_type, known, schema):
-    """Fill required inputs from schema, wire known optionals."""
-    spec_in = schema[node_type].get("input", {})
-    required = spec_in.get("required") or {}
-    optional = spec_in.get("optional") or {}
-    inputs, unresolved = {}, []
-    for name, value in known.items():
-        if name in required or name in optional:
-            inputs[name] = value
-    unknown = sorted(set(known) - set(required) - set(optional))
-    if unknown:
-        raise RuntimeError(f"{node_type} does not accept {unknown}; its inputs are "
-                           f"{sorted(set(required) | set(optional))}.")
-    for name, spec in required.items():
-        if name in known:
-            continue
-        options = spec[0] if isinstance(spec, list) else None
-        if isinstance(options, list) and options:
-            inputs[name] = options[0]
-        elif isinstance(spec, tuple) and len(spec) > 1 and isinstance(spec[1], dict) \
-                and "default" in spec[1]:
-            inputs[name] = spec[1]["default"]
-        else:
-            unresolved.append(f"{name}: {spec}")
-    if unresolved:
-        raise RuntimeError(f"{node_type} requires inputs this stage has no value "
-                           "for: " + "; ".join(unresolved))
-    return inputs
-
-def decode_one(port, shot, latent_key, video_prefix, record):
-    gpu = 0 if port == WORKER_PORTS[0] else 1
-    server = spawn_comfy(port, gpu)
-    base = server["base_url"]
-    try:
-        info = requests.get(f"{base}/object_info", timeout=300).json()
-        required = {"H3LoadLatent", "LTXVSeparateAVLatent", "VAELoader",
-                    "VAEDecodeTiled", "LTXVAudioVAEDecode", "CreateVideo", "SaveVideo"}
-        missing = sorted(required - set(info))
-        if missing:
-            raise RuntimeError(f"Missing required decode nodes: {missing}")
-        decode_graph = {
-            "1": {"class_type": "H3LoadLatent", "inputs": decode_fill("H3LoadLatent", {
-                "store_dir": str(LATENT_STORE), "key": latent_key}, info)},
-            "2": {"class_type": "LTXVSeparateAVLatent", "inputs": decode_fill(
-                "LTXVSeparateAVLatent", {"av_latent": ["1", 0]}, info)},
-            "3": {"class_type": "VAELoader", "inputs": decode_fill("VAELoader", {
-                "vae_name": Path(VIDEO_VAE["hf_filename"]).name}, info)},
-            "4": {"class_type": "VAELoader", "inputs": decode_fill("VAELoader", {
-                "vae_name": Path(AUDIO_VAE["hf_filename"]).name}, info)},
-            "5": {"class_type": "VAEDecodeTiled", "inputs": decode_fill("VAEDecodeTiled", {
-                "samples": ["2", 0], "vae": ["3", 0],
-                "tile_size": 512, "overlap": 64, "temporal_size": 64,
-                "temporal_overlap": 16}, info)},
-            "6": {"class_type": "LTXVAudioVAEDecode", "inputs": decode_fill(
-                "LTXVAudioVAEDecode", {"samples": ["2", 1], "audio_vae": ["4", 0]}, info)},
-            "7": {"class_type": "CreateVideo", "inputs": decode_fill("CreateVideo", {
-                "images": ["5", 0], "audio": ["6", 0], "fps": float(FPS)}, info)},
-            "8": {"class_type": "SaveVideo", "inputs": decode_fill("SaveVideo", {
-                "video": ["7", 0], "filename_prefix": video_prefix,
-                "format": "auto"}, info)},
-        }
-        prompt_id = str(uuid.uuid4())
-        response = requests.post(f"{base}/prompt", timeout=120, json={
-            "prompt": decode_graph, "client_id": str(uuid.uuid4()),
-            "prompt_id": prompt_id})
-        response.raise_for_status()
-        if response.json().get("node_errors"):
-            raise RuntimeError(f"Node errors: {response.json()['node_errors']}")
-        print(f"shot_{shot['num']:02d}: decoding {latent_key}")
-        started = time.perf_counter()
-        decode_record = None
-        deadline = min(SESSION_DEADLINE, time.time() + DECODE_TIMEOUT_S)
-        while time.time() < deadline:
-            if server["process"].poll() is not None:
-                raise RuntimeError("ComfyUI exited during decoding")
-            try:
-                history = requests.get(f"{base}/history/{prompt_id}", timeout=60).json()
-                if prompt_id in history:
-                    status = history[prompt_id].get("status", {})
-                    if status.get("completed") is True or status.get("status_str") == "error":
-                        decode_record = history[prompt_id]
-                        break
-            except Exception:
-                pass
-            time.sleep(3)
-        else:
-            raise TimeoutError("Decoding did not finish in time")
-        record["decode_elapsed_s"] = round(time.perf_counter() - started, 1)
-        status = decode_record.get("status", {})
-        if status.get("status_str") != "success":
-            record["decode_status"] = "FAILED"
-            record["decode_history"] = {
-                "messages": [str(m)[:300] for m in (status.get("messages") or [])]}
-            return None
+                return None
         produced = []
-        for node_output in (decode_record.get("outputs") or {}).values():
+        for node_output in (record_out.get("outputs") or {}).values():
             for entry in node_output.get("images", []) + node_output.get("videos", []) \
                     + node_output.get("gifs", []):
                 if isinstance(entry, dict) and entry.get("filename"):
                     produced.append(OUTPUT_DIR / entry.get("subfolder", "") / entry["filename"])
         if not produced:
-            directory = OUTPUT_DIR / "ltx25_video" / shot_num_dir(video_prefix)
-            produced = sorted(directory.glob("*"), key=lambda p: p.stat().st_mtime) \
+            directory = OUTPUT_DIR / "wan13_video" / shot_num_dir(video_prefix)
+            produced = sorted(directory.glob("**/*"), key=lambda p: p.stat().st_mtime) \
                 if directory.is_dir() else []
-        produced = [p for p in produced if p.is_file()]
+        produced = [p for p in produced if p.is_file() and p.suffix in (".mp4", ".webm", ".mkv")]
         if not produced:
-            record["decode_status"] = "NO_FILE"
+            record["sample_status"] = "NO_FILE"
             return None
-        record["decode_status"] = "SUCCESS"
+        record["sample_status"] = "SUCCESS"
+        print(f"shot_{shot['num']:02d}: generated ok in {elapsed}s "
+              f"({guard_state.get('observed_s_per_step')} s/step)")
         return produced[-1]
     finally:
         stop_comfy_port(port)
@@ -529,7 +443,7 @@ def decode_one(port, shot, latent_key, video_prefix, record):
 def shot_num_dir(video_prefix):
     return str(Path(video_prefix).parent.name)
 
-# --- is there actually a picture AND sound in it? (PyAV QA) ---------------------
+# --- is there actually a picture in it? (PyAV QA, silent mp4 expected) ----------
 def inspect_video(mp4, record):
     inspection = {}
     try:
@@ -546,12 +460,8 @@ def inspect_video(mp4, record):
                     "frames": vstream.frames,
                     "avg_rate": float(vstream.average_rate)
                     if vstream.average_rate else None}
-            astream = streams.get("audio")
-            if astream is not None:
-                inspection["audio"] = {
-                    "codec": astream.codec_context.name,
-                    "sample_rate": astream.codec_context.sample_rate,
-                    "channels": astream.codec_context.channels}
+            if "audio" in streams:
+                inspection["unexpected_audio"] = True
         with av.open(str(mp4)) as container:
             brightness, index = [], 0
             for frame in container.decode(video=0):
@@ -608,36 +518,29 @@ def _push_insurance_impl(tag):
 
 # --- one shot through the ladder -------------------------------------------------
 def run_shot(port, shot, record):
-    """(primary gear, seed, Q4) -> (fallback gear, seed, Q4) ->
-    (fallback gear, seed+1000, Q3). The smaller quant downloads lazily."""
+    """(primary gear, seed) -> (primary gear, seed+1000) -> (fallback gear,
+    seed+1000). Same DiT on every rung: both Wan 1.3B variants fit a T4, so
+    there is no quant to fall back to - only geometry and noise change."""
     attempts = [
-        (shot["gear_primary"], shot["seed"], DIT_PRIMARY),
-        (shot["gear_fallback"], shot["seed"], DIT_PRIMARY),
-        (shot["gear_fallback"], shot["seed"] + 1000, DIT_FALLBACK),
+        (shot["gear_primary"], shot["seed"]),
+        (shot["gear_primary"], shot["seed"] + 1000),
+        (shot["gear_fallback"], shot["seed"] + 1000),
     ]
-    for attempt_index, (gear, seed, dit) in enumerate(attempts):
+    for attempt_index, (gear, seed) in enumerate(attempts):
         key = shot["keys"].get(gear)
         if key is None or not (CONDITIONING_STORE / f"{key}.pt").is_file():
             print(f"shot_{shot['num']:02d}: no blob for gear {gear}, skipping attempt")
             continue
-        if dit is DIT_FALLBACK and \
-                not (MODEL_STORE / "diffusion_models" / dit["hf_filename"]).is_file():
-            print(f"shot_{shot['num']:02d}: last rung -> downloading the Q3_K_M fallback")
-            fetch_verified(DIT_FALLBACK, "diffusion_models")
         frames = shot["geometries"][gear]["length"]
-        budget_s = int(CLIFF_PROJECTED_BUDGET_S * max(1.0, frames / 129.0) ** 1.6)
+        budget_s = int(CLIFF_PROJECTED_BUDGET_S * max(1.0, frames / 81.0) ** 1.6)
         latent_key = f"job_{shot['job_id']}_g{gear.replace('.', '')}_s{seed}"
-        video_prefix = f"ltx25_video/job_{shot['job_id']}/{latent_key}"
         record.update({"attempt": attempt_index, "gear": gear, "seed": seed,
-                       "dit": dit["hf_filename"], "frames": frames, "budget_s": budget_s})
-        outcome = sample_one(port, shot, gear, seed, latent_key, budget_s, record, dit)
-        if outcome != "SUCCESS":
-            print(f"shot_{shot['num']:02d}: attempt {attempt_index + 1} -> {outcome}, "
-                  "trying next ladder rung")
-            continue
-        mp4 = decode_one(port, shot, latent_key, video_prefix, record)
+                       "dit": shot["dit"]["hf_filename"], "frames": frames,
+                       "budget_s": budget_s})
+        mp4 = generate_one(port, shot, gear, seed, latent_key, budget_s, record)
         if mp4 is None:
-            print(f"shot_{shot['num']:02d}: decode failed on attempt {attempt_index + 1}")
+            print(f"shot_{shot['num']:02d}: attempt {attempt_index + 1} -> "
+                  f"{record.get('sample_status')}, trying next ladder rung")
             continue
         inspection = inspect_video(mp4, record)
         record["mp4"] = str(mp4)
@@ -656,9 +559,9 @@ SHUTDOWN = threading.Event()
 SEEN_JOBS = set()
 
 def estimated_shot_seconds(shot):
-    """encode 240 + sample ~8 steps x ~40 s/step scaled by frames + decode 240."""
-    frames = float(shot.get("frames", 129))
-    return 240 + 480 * (frames / 129.0) ** 1.6 + 240
+    """encode ~150 + sample ~30 steps x ~8 s/step scaled by frames + decode/io."""
+    frames = float(shot.get("frames", 81))
+    return 150 + 360 * (frames / 81.0) ** 1.6 + 120
 
 def worker(gpu):
     port = WORKER_PORTS[gpu]
@@ -688,7 +591,7 @@ def worker(gpu):
                     save_state()
                 continue
             ACTIVE["n"] += 1
-            record = {"gpu": gpu, "started_at": utc_now()}
+            record = {"gpu": gpu, "started_at": utc_now(), "variant": shot["variant"]}
             started = time.perf_counter()
             mp4 = run_shot(port, shot, record)
             prog(f"shot {shot['num']} run_shot returned gpu{gpu} "
@@ -782,18 +685,21 @@ def prepare_and_encode(entry, base_dir):
     frame_path = base_dir / entry["frame"]
     if not frame_path.is_file():
         raise RuntimeError(f"keyframe missing: {frame_path}")
+    variant = variant_for(entry)
     gears = sorted({entry.get("gear_primary", GEAR), entry.get("gear_fallback", "0.2")})
     geometries = {g: geometry_for(g, int(entry["frames"])) for g in gears}
     jid = str(entry["job_id"])
-    frame_sha = hashlib.sha256(frame_path.read_bytes()).hexdigest()
+    frame_sha = hashlib.sha256(frame_path.read_bytes()).hexdigest() \
+        if variant == "fun_inp" else None
     shot = {
         "num": int(entry["num"]), "job_id": jid, "seconds": entry["seconds"],
         "frames": int(entry["frames"]), "prompt": entry["prompt"],
-        "frame_path": frame_path,
+        "frame_path": frame_path, "has_frame": variant == "fun_inp",
+        "variant": variant, "dit": dit_for(variant),
         "gear_primary": entry.get("gear_primary", GEAR),
         "gear_fallback": entry.get("gear_fallback", "0.2"),
         "geometries": geometries,
-        "keys": {g: conditioning_key_for(entry["prompt"], frame_sha, gm)
+        "keys": {g: conditioning_key_for(entry["prompt"], frame_sha, gm, variant)
                  for g, gm in geometries.items()},
         "seed": 42 + _zlib.crc32(jid.encode("utf-8")) % 100000,
         "blobs": {},
@@ -801,34 +707,39 @@ def prepare_and_encode(entry, base_dir):
     for g, key in shot["keys"].items():
         shot["blobs"][g] = resolve_blob(key)
     todo = [(g, k) for g, k in shot["keys"].items() if shot["blobs"].get(g) is None]
-    neg_missing = not (CONDITIONING_STORE / f"{negative_key()}.pt").is_file()
+    neg_missing = resolve_blob(NEG_KEYS[variant]) is None
     if todo or neg_missing:
         if not (MODEL_STORE / "text_encoders" / TEXT_ENCODER["hf_filename"]).is_file():
-            print("[worker] downloading text encoder (one-time 24.5 GiB) ...")
+            print("[worker] downloading text encoder (one-time 6.27 GiB) ...")
             fetch_verified(TEXT_ENCODER, "text_encoders")
         server = spawn_comfy(ENCODE_PORT, 0)   # encode holds no DiT
         prog("encode server boot")
         try:
+            if neg_missing:
+                stub = {"prompt": NEGATIVE_PROMPT, "has_frame": False,
+                        "geometries": {GEAR: GEOMETRY}}
+                encode_one(server["base_url"], stub, GEAR,
+                           NEG_KEYS[variant], NEG_KEYS[variant])
             for g, key in todo:
-                shot["blobs"][g] = encode_one(server["base_url"], shot, g,
-                                              key, negative_key())
+                shot["blobs"][g] = CONDITIONING_STORE / f"{key}.pt"
+                encode_one(server["base_url"], shot, g, key, NEG_KEYS[variant])
+                prog(f"shot {shot['num']} gear {g} encoded")
         finally:
             stop_comfy_port(ENCODE_PORT)
     return shot
 
 def render_test_stub(entry, base_dir):
-    """cheap placeholder clip for test batches (no GPU work at all)."""
+    """cheap placeholder clip for test batches (no GPU work at all; silent
+    832x480@16 like the real Wan output)."""
     jid = str(entry["job_id"])
     sec = int(entry["seconds"])
     dest = OUT_STORE / f"job_{jid}.mp4"
     cmd = ["ffmpeg", "-y", "-v", "error",
-           "-f", "lavfi", "-i", f"color=c=0x1f2937:s=864x480:r=25:d={sec}",
-           "-f", "lavfi", "-i",
-           f"sine=frequency={330 + int(entry['num']) * 40}:duration={sec}",
+           "-f", "lavfi", "-i", f"color=c=0x1f2937:s=832x480:r=16:d={sec}",
            "-vf", ("drawtext=text='TEST {jid}':fontcolor=white@0.85:"
                    "x=(w-tw)/2:y=(h-th)/2:fontsize=28"),
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
-           "-c:a", "aac", "-b:a", "96k", "-shortest", "-movflags", "+faststart",
+           "-movflags", "+faststart",
            str(dest)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     assert r.returncode == 0, f"ffmpeg failed for job {jid}: {r.stderr[-500:]}"
@@ -866,8 +777,8 @@ def feeder():
             time.sleep(WORKER_POLL_S)
             continue
         stale = 0
-        # encodes need BOTH GPUs idle (the 24.5 GiB text encoder shares VRAM
-        # with a resident sampling DiT, so never overlap the two)
+        # encodes want the GPUs idle (the text encoder shares GPU 0 with a
+        # resident sampling DiT, so never overlap the two)
         while (ACTIVE["n"] > 0 or not QUEUE.empty()) and not SHUTDOWN.is_set():
             time.sleep(10)
         if SHUTDOWN.is_set():
@@ -929,7 +840,8 @@ def feeder():
             LAST_WORK["t"] = time.time()
             accepted = True
             print(f"[feeder] queued job {jid} ({e['seconds']}s, "
-                  f"{int(e['frames'])}f) -- queue depth {QUEUE.qsize()}", flush=True)
+                  f"{int(e['frames'])}f, {shot['variant']}) -- "
+                  f"queue depth {QUEUE.qsize()}", flush=True)
         if accepted or all(str(e.get("job_id")) in SEEN_JOBS for e in fresh):
             last_mark = mark
     print("[feeder] exit", flush=True)

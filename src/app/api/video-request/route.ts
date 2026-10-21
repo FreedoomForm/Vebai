@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 300
 
 /**
- * POST /api/video-request — queue the LTX-2.5 video pipeline (Kaggle GPU,
+ * POST /api/video-request — queue the Wan 2.1 1.3B video pipeline (Kaggle GPU,
  * 2x T4) for a prompt (the composer's 🎬 toggle).
  *
  * The shot list is structured SERVER-SIDE with the official Z.ai API
@@ -51,10 +51,10 @@ export async function POST(req: NextRequest) {
         {
           role: 'user',
           content:
-            `Разбей идею на короткие видеокадры для генеративной модели (LTX 2.5 — видео со синхронным звуком). Идея: «${prompt.slice(0, 900)}».\n` +
+            `Разбей идею на короткие видеокадры для генеративной модели (Wan 2.1 1.3B — тихое видео без звука, 480p). Идея: «${prompt.slice(0, 900)}».\n` +
             `Если в идее есть длительность (например «1 минута»), подбери кадры так, чтобы СУММА длин была близка к ней: один кадр 5 или 10 секунд, максимум 6 кадров (1 минута = 6 кадров по 10 секунд). Если длительность не указана — 2-3 кадра по 5 секунд.\n` +
-            `Ответь ТОЛЬКО JSON без пояснений: {"title": "короткое название видео", "shots": [{"title": "название кадра", "video_prompt": "eng prompt: subject, motion, camera, lighting, ambient sound", "seconds": 10}]}.\n` +
-            `Максимум 6 кадров, каждый 5 или 10 секунд. video_prompt — на английском, кинематографично (LTX любит детальные описания движения и звука сцены), без текста на экране; кадры должны продолжать друг друга (единый сюжет).`,
+            `Ответь ТОЛЬКО JSON без пояснений: {"title": "короткое название видео", "shots": [{"title": "название кадра", "video_prompt": "eng prompt: subject, motion, camera, lighting", "seconds": 10}]}.\n` +
+            `Максимум 6 кадров, каждый 5 или 10 секунд. video_prompt — на английском, кинематографично (Wan любит детальные описания SUBJECT и ДВИЖЕНИЯ: действия, физика движения, движение камеры; звук НЕ описывать — модель генерирует видео без звуковой дорожки), без текста на экране; кадры должны продолжать друг друга (единый сюжет).`,
         },
       ],
       max_tokens: 1536,

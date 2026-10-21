@@ -23,13 +23,14 @@ import {
   KERNEL_RMC_STUDIO_WORKER_TEST,
 } from '@/lib/kernels'
 
-// Lightricks LTX-2.5 frame counts (25 fps, the model's 8k+1 grid — replaces
-// the MiniMax H3 n%17==5 counts): 129 frames ≈ 5.2 s, 249 frames ≈ 10.0 s.
-const FRAMES_BY_SECONDS: Record<number, number> = { 5: 129, 10: 249 }
-/** frames for a duration on the LTX 8k+1 grid at 25 fps (worker does the same) */
-function ltxFrameCount(seconds: number): number {
-  const n = Math.max(9, Math.round(seconds * 25))
-  return n + ((1 - (n % 8)) % 8)
+// Wan 2.1 1.3B frame counts (16 fps, the n % 4 == 1 grid the Wan VAE was
+// trained on — replaces the LTX 8k+1 grid): 81 frames ≈ 5.06 s (native
+// window), 161 frames ≈ 10.06 s (rope extrapolation, softer quality).
+const FRAMES_BY_SECONDS: Record<number, number> = { 5: 81, 10: 161 }
+/** frames for a duration on the Wan n%4==1 grid at 16 fps (worker does the same) */
+function wanFrameCount(seconds: number): number {
+  const n = Math.max(9, Math.round(seconds * 16))
+  return n + ((1 - (n % 4)) % 4)
 }
 const BATCH_CAP = 6
 const TERMINAL_KERNEL = new Set([
@@ -93,20 +94,20 @@ async function writeState(patch: Partial<StudioState>): Promise<StudioState> {
 
 /* --------------------------------------------------------------- frame prep */
 
-/** first frame -> 864x480 canvas (the LTX gear-0.4 geometry anchor; plain
- *  stretch otherwise — LTXVImgToVideoInplace rescales to the latent geometry) */
+/** first frame -> 832x480 canvas (the Wan 1.3B native 480P geometry; plain
+ *  stretch otherwise — WanFunInpaintToVideo rescales to the latent geometry) */
 export async function prepFrameData(orig: Buffer | null): Promise<Buffer> {
   const sharp = (await import('sharp')).default
   const bg = { r: 0x15, g: 0x1a, b: 0x20 }
   if (orig) {
     try {
       return await sharp(orig)
-        .resize(864, 480, { fit: 'contain', background: bg })
+        .resize(832, 480, { fit: 'contain', background: bg })
         .jpeg({ quality: 88 })
         .toBuffer()
     } catch { /* unparsable input -> neutral canvas */ }
   }
-  return sharp({ create: { width: 864, height: 480, channels: 3, background: bg } })
+  return sharp({ create: { width: 832, height: 480, channels: 3, background: bg } })
     .jpeg()
     .toBuffer()
 }
@@ -143,9 +144,9 @@ function kernelDefs(): Record<'real' | 'test' | 'workerReal' | 'workerTest', Ker
 }
 
 /* ------------------------------- accelerator configuration ----------------
- * GPU only (owner request, 2026-10-16: TPU path removed). The LTX-2.5 pipeline
- * is CUDA-only (ComfyUI + GGUF kernels) — the proven 2x T4 (NvidiaTeslaT4,
- * ~47 TFLOPS fp16 aggregate, one ComfyUI server per GPU) is the only target.
+ * GPU only (owner request, 2026-10-16: TPU path removed). The Wan 2.1 1.3B pipeline
+ * is CUDA-only (vanilla ComfyUI) — the proven 2x T4 (NvidiaTeslaT4,
+ * one ComfyUI server per GPU) is the only target.
  */
 const MACHINE_SHAPE = process.env.KAGGLE_MACHINE_SHAPE || 'NvidiaTeslaT4'
 
@@ -169,7 +170,7 @@ async function ensureOutputsDataset() {
   const lu = await datasetLatestFileTime(OUTPUTS_DATASET)
   if (lu) return
   const r = await datasetPush(
-    [{ name: 'README.txt', data: Buffer.from('LTX-2.5 studio insurance outputs are pushed here by the kernel.\n') }],
+    [{ name: 'README.txt', data: Buffer.from('Wan 2.1 studio insurance outputs are pushed here by the kernel.\n') }],
     OUTPUTS_DATASET,
     'studio outputs seed',
   )
@@ -178,7 +179,8 @@ async function ensureOutputsDataset() {
 
 /** build the jobs dataset files (manifest + frames + done ids) fully in memory */
 async function buildJobsFiles(jobs: {
-  id: string; prompt: string; seconds: number; framePrepped: Buffer | null; testMode: boolean
+  id: string; prompt: string; seconds: number; framePrepped: Buffer | null
+  frameReal: boolean; testMode: boolean
 }[]): Promise<DatasetFileInput[]> {
   const files: DatasetFileInput[] = []
   const manifest = [] as Record<string, unknown>[]
@@ -239,11 +241,14 @@ async function buildJobsFiles(jobs: {
       num,
       title: j.prompt.slice(0, 60),
       seconds: j.seconds,
-      frames: FRAMES_BY_SECONDS[j.seconds] || ltxFrameCount(j.seconds),
+      frames: FRAMES_BY_SECONDS[j.seconds] || wanFrameCount(j.seconds),
       gear_primary: '0.4',
       gear_fallback: '0.2',
       prompt: j.prompt,
       frame: frameName,
+      // real user keyframe -> the worker runs the Fun-InP i2v variant and the
+      // clip starts on this frame; neutral canvas -> pure text-to-video
+      frame_real: j.frameReal,
       job_id: j.id,
     })
   }
@@ -293,7 +298,8 @@ async function buildJobsFiles(jobs: {
  * persistent worker is alive; the worker picks the batch up via the API.
  * Returns 'ondemand' when the caller should fall back to the batch kernel. */
 async function submitWorkerBatch(jobs: {
-  id: string; prompt: string; seconds: number; framePrepped: Buffer | null; testMode: boolean
+  id: string; prompt: string; seconds: number; framePrepped: Buffer | null
+  frameReal: boolean; testMode: boolean
 }[]): Promise<'worker' | 'ondemand'> {
   const batchId = `b${Date.now().toString(36)}`
   const isTest = jobs[0].testMode
@@ -576,7 +582,8 @@ async function pollWorker() {
 /* ------------------------------------------------------- on-demand batches */
 
 async function startBatch(jobs: {
-  id: string; prompt: string; seconds: number; framePrepped: Buffer | null; testMode: boolean
+  id: string; prompt: string; seconds: number; framePrepped: Buffer | null
+  frameReal: boolean; testMode: boolean
 }[]) {
   const batchId = `b${Date.now().toString(36)}`
   await ensureOutputsDataset()
@@ -718,6 +725,7 @@ export async function syncStudio(): Promise<StudioState> {
         prompt: j.prompt,
         seconds: j.seconds,
         framePrepped: j.framePrepped ? Buffer.from(j.framePrepped) : null,
+        frameReal: !!j.frameOrigData && (j.frameOrigData as Buffer).length > 0,
         testMode: j.testMode,
       }))
     try {

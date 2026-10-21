@@ -1,15 +1,21 @@
 # Stage 0 - configuration, environment, and the conditioning key scheme.
-# T43: MiniMax H3 -> Lightricks LTX-2.5 (22B distilled, video + synchronized
-# audio). Same studio pipeline, new model stack:
-#   * DiT: GGUF Q4_K_M (13.0 GiB, config-fix baked into the file header) from
-#     the PUBLIC unsloth mirror - no gated repos, no HF token needed.
-#   * Text encoder: gemma4-12b-with-proj bf16 (24.5 GiB), encoded ONCE per
-#     (prompt, keyframe, geometry) into a conditioning blob on a dedicated
-#     server (the H3 three-stage split, kept: 31 GiB host RAM cannot hold the
-#     encoder and two resident samplers at once).
-#   * Two VAEs (video-conv + audio). LTX-2.5 generates BOTH streams in one
-#     pass; the AV latent is packed/split with the stock ComfyUI nodes.
-# Sampling: distilled 8-step schedule, euler_ancestral, DualCFG 1/1.
+# T44: owner request (2026-10-21) - LTX-2.5 is out, the studio runs
+# **Wan 2.1 1.3B** (Alibaba's Apache-2.0 text-to-video DiT). Same pipeline
+# contract (jobs dataset in, job_<id>.mp4 out, insurance, Telegram mirror,
+# cmd/merge terminal modes), new stack - every file PUBLIC in
+# Comfy-Org/Wan_2.1_ComfyUI_repackaged, no gates, no GGUF, no custom loaders:
+#   * DiT: wan2.1_t2v_1.3B_fp16 (2.64 GiB) - the official ComfyUI example uses
+#     exactly this file and says fp16 > bf16 > fp8 on quality.
+#   * Keyframe shots: wan2.1_fun_inp_1.3B_bf16 (2.91 GiB) - the Fun-InP variant
+#     of the SAME 1.3B that consumes a start image through the vanilla
+#     WanFunInpaintToVideo node, so the studio keeps its keyframe UX.
+#   * Text encoder: umt5_xxl_fp8_e4m3fn_scaled (6.27 GiB) - 4x lighter than the
+#     LTX gemma4 encoder, fits a T4 next to the samplers.
+#   * VAE: wan_2.1_vae (0.24 GiB). WAN 2.1 IS SILENT - there is no audio VAE,
+#     the mp4 has no audio track (honest regression vs LTX-2.5, owner-decided).
+# Sampling (official ComfyUI text_to_video_wan.json): KSampler 30 steps,
+# cfg 6.0, uni_pc / simple, ModelSamplingSD3 shift 8.0, EmptyHunyuanLatentVideo
+# geometry 832x480, frame counts on the n % 4 == 1 grid at 16 fps.
 import hashlib
 import json
 import os
@@ -25,73 +31,55 @@ from pathlib import Path
 
 import psutil
 
-# --- LTX-2.x Community License ----------------------------------------------
-#   https://huggingface.co/Lightricks/LTX-2.5/blob/main/LICENSE
-# The weights are gated "auto" upstream; this pipeline consumes the public
-# unsloth GGUF mirror, whose NOTICE carries the same license terms.
-LTX_COMMUNITY_LICENSE_ACKNOWLEDGED = True
-
-# Compute dtype: the T4 (sm75) has no bf16. GGUF tensors are dequantized to
-# fp16 by ComfyUI-GGUF on Turing; the VAEs/encoder are cast to fp16 by comfy.
-UNET_DTYPE_FLAGS = {}  # no dtype flag: comfy picks fp16 on sm75 by itself
+# Compute dtype: the T4 (sm75) has no bf16 tensor cores; comfy stores fp16
+# weights natively and casts the one bf16 file (fun_inp) to fp16 on load.
+UNET_DTYPE_FLAGS = {}
 
 COMFY_REPO = "https://github.com/Comfy-Org/ComfyUI.git"
-COMFY_COMMIT = "b1a247c9cf9dbfda4b2c0a0c1d50950667eeaa0c"
-# ltxv is already in ComfyUI-GGUF's IMG_ARCH_LIST at this commit (verified);
-# the H3-era loader patch is therefore gone.
-GGUF_REPO = "https://github.com/city96/ComfyUI-GGUF.git"
-GGUF_COMMIT = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+COMFY_COMMIT = "b1a247c9cf9dbfda4b2c0a0c1d50950667eeaa0c"  # proven on Kaggle in T42/T43
 
 # --- model sources (all PUBLIC, no HF token) ---------------------------------
-MODEL_REPO = "unsloth/LTX-2.5-GGUF"
+MODEL_REPO = "Comfy-Org/Wan_2.1_ComfyUI_repackaged"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
-def _f(repo, file, size, sha):
-    return {"repo": repo, "file": file, "hf_filename": file.split("/", 1)[1],
-            "bytes": size, "sha256": sha}
+def _f(subdir, file, size, sha):
+    return {"repo": MODEL_REPO, "file": f"split_files/{subdir}/{file}",
+            "hf_filename": file, "bytes": size, "sha256": sha}
 
-# sizes + sha256 are the HF LFS oids read from the unsloth repo (2026-10-20).
-DIT_PRIMARY = _f(MODEL_REPO, "distilled/ltx-2.5-22b-distilled-Q4_K_M.gguf",
-                 13584703872, "ba40d53770314e69e88361661e55c6cc3b12a363646ba2ea53c8bcd459b66747")
-DIT_FALLBACK = _f(MODEL_REPO, "distilled/ltx-2.5-22b-distilled-Q3_K_M.gguf",
-                  11298283904, "09f62757fbf959ff767ac25e7fbe354067e1fe6bbeec8d5d022fe817268efcab")
-TEXT_ENCODER_FILE = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
-TEXT_ENCODER = _f(MODEL_REPO, TEXT_ENCODER_FILE,
-                  26263858182, "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1")
-VIDEO_VAE_FILE = "vae/ltx-2.5-video-vae-conv-bf16.safetensors"
-VIDEO_VAE = _f(MODEL_REPO, VIDEO_VAE_FILE,
-               1452269922, "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d")
-AUDIO_VAE_FILE = "vae/ltx-2.5-audio-vae-bf16.safetensors"
-AUDIO_VAE = _f(MODEL_REPO, AUDIO_VAE_FILE,
-               364866540, "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5")
-# The fallback DiT and the 24.5 GiB text encoder are downloaded LAZILY:
-# the encoder only when a conditioning blob is missing, the smaller quant
-# only when the last retry rung needs it (Kaggle scratch disk is finite).
+# sizes + sha256 are the HF LFS oids read from Comfy-Org/Wan_2.1_ComfyUI_repackaged (2026-10-21).
+DIT_T2V = _f("diffusion_models", "wan2.1_t2v_1.3B_fp16.safetensors",
+             2838303560, "be531024cd9018cb5b48c40cfbb6a6191645b1c792eb8bf4f8c1c6e10f924dc5")
+DIT_FUN_INP = _f("diffusion_models", "wan2.1_fun_inp_1.3B_bf16.safetensors",
+                 3128957992, "8495d2b1673ffb18abb548a64ff3b0e4bd367734f653096f7a8a3ad46954d511")
+TEXT_ENCODER = _f("text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                  6735906897, "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68")
+VIDEO_VAE = _f("vae", "wan_2.1_vae.safetensors",
+               253815318, "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b")
+# All four files download upfront: the whole stack is 9.4 GiB (LTX was 40+),
+# so the retry ladder needs no lazy quant - both DiTs fit one T4 side by side.
 
-VAE_FILES = {"video": VIDEO_VAE, "audio": AUDIO_VAE}
+# --- sampling configuration (official ComfyUI Wan T2V example) ----------------
+FPS = 16
+NEGATIVE_PROMPT = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
+                   "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
+                   "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
+                   "杂乱的背景，三条腿，背景人很多，倒着走")
+STEPS = 30
+CFG = 6.0
+SAMPLER_NAME = "uni_pc"
+SCHEDULER = "simple"
+SHIFT = 8.0          # official 1.3B guidance: sample_shift 8 (range 8-12)
 
-# --- sampling configuration ---------------------------------------------------
-FPS = 25
-NEGATIVE_PROMPT = "pc game, console game, video game, cartoon, childish, ugly"
-SIGMAS_8STEP = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
-STEPS = len(SIGMAS_8STEP.replace(",", " ").split()) - 1  # 8
-SAMPLER_NAME = "euler_ancestral"
-VIDEO_CFG = 1.0   # distilled: guidance is baked into the weights
-AUDIO_CFG = 1.0
-KEYFRAME_STRENGTH = 0.7  # LTXVImgToVideoInplace adherence (official template)
-IMG_COMPRESSION = 18     # LTXVPreprocess (official template)
-
-# The resolution gears (both dimensions divisible by 32, both 16:9 to match
-# the 864x480 keyframe canvas the server ships). Attention is quadratic in
-# tokens and LTX packs 32x32x8 pixels per token, so these are LIGHT compared
-# to H3: gear 0.4 at 249 frames is ~13k tokens (H3 was ~117k).
+# The resolution gears (both dimensions divisible by 16, both ~16:9 to match
+# the 832x480 keyframe canvas the server ships). Wan 1.3B is trained at
+# 832x480 480P; other sizes work but are off-distribution, so the fallback
+# gear SHRINKS rather than scales up.
 GEAR_TABLE = {
-    "0.2": (608, 352),
-    "0.3": (736, 416),
-    "0.4": (864, 480),
-    "0.5": (960, 544),
+    "0.2": (480, 272),
+    "0.3": (704, 400),
+    "0.4": (832, 480),
 }
-GEAR = "0.4"  # @param ["0.2", "0.3", "0.4", "0.5", "1.0"]
+GEAR = "0.4"  # @param ["0.2", "0.3", "0.4"]
 if "GEAR_OVERRIDE" in globals():
     GEAR = str(globals()["GEAR_OVERRIDE"])
     print(f"GEAR_OVERRIDE active: GEAR = {GEAR} (campaign run)")
@@ -99,13 +87,14 @@ CLIP_SECONDS = 5.0  # @param {type:"number"}
 
 
 def frame_count(seconds):
-    """Frames for a duration on the LTX 8k+1 grid at FPS.
+    """Frames for a duration on the Wan grid at FPS.
 
-    The model silently rounds an off-grid count, so the geometry that comes
-    back would not be the one that was asked for.
+    The latent node takes length with step 4 and the sampler wants the
+    n % 4 == 1 shape the VAE was trained on (81 f = 5.06 s native window;
+    10 s shots ride the 161-frame extrapolation, quality is softer there).
     """
     n = max(9, round(seconds * FPS))
-    return n + (1 - (n % 8)) % 8
+    return n + ((1 - (n % 4)) % 4)
 
 
 if GEAR not in GEAR_TABLE:
@@ -114,9 +103,9 @@ GEOMETRY = {"width": GEAR_TABLE[GEAR][0], "height": GEAR_TABLE[GEAR][1],
             "length": frame_count(CLIP_SECONDS)}
 
 CONTENT = Path("/kaggle/tmp") if Path("/kaggle").is_dir() else Path("/content")
-WORK = CONTENT / "ltx25_sample_probe"
+WORK = CONTENT / "wan13_sample_probe"
 COMFY_DIR = CONTENT / "ComfyUI"
-GGUF_NODE_DIR = COMFY_DIR / "custom_nodes" / "ComfyUI-GGUF"
+GGUF_NODE_DIR = COMFY_DIR / "custom_nodes" / "ComfyUI-GGUF"  # NOT installed for Wan
 CONTROL_NODE_DIR = COMFY_DIR / "custom_nodes" / "H3BenchmarkControl"  # kept name: shared with the test worker
 MODEL_STORE = WORK / "models"
 CONDITIONING_STORE = WORK / "conditioning"
@@ -199,25 +188,27 @@ def sha256_file(path, chunk_bytes=16 * 1024 * 1024):
 import torch  # noqa: E402
 
 frames = GEOMETRY["length"]
-if (frames - 1) % 8 != 0:
-    raise RuntimeError(f"LTX frame count must satisfy n % 8 == 1; got {frames}")
-if GEOMETRY["width"] % 32 or GEOMETRY["height"] % 32:
-    raise RuntimeError(f"LTX dimensions must be divisible by 32: {GEOMETRY}")
-LATENT_T = ((frames - 1) // 8) + 1
+if (frames - 1) % 4 != 0:
+    raise RuntimeError(f"Wan frame count must satisfy n % 4 == 1; got {frames}")
+if GEOMETRY["width"] % 16 or GEOMETRY["height"] % 16:
+    raise RuntimeError(f"Wan dimensions must be divisible by 16: {GEOMETRY}")
+LATENT_T = ((frames - 1) // 4) + 1
 EXPECTED_LATENT_SHAPES = [
-    [1, 128, LATENT_T, GEOMETRY["height"] // 32, GEOMETRY["width"] // 32],
+    [1, 16, LATENT_T, GEOMETRY["height"] // 8, GEOMETRY["width"] // 8],
 ]
 
 
 # The blob's identity is its inputs. Recomputing the key here means a name
-# match is itself proof that repo, encoder, prompts, geometry and fps agree.
-def conditioning_key_for(prompt, frame_sha, geometry):
+# match is itself proof that repo, variant, encoder, prompts, geometry and
+# fps agree. variant = "t2v" | "fun_inp" - the Fun-InP conditioning carries
+# the encoded keyframe, so its blob must never satisfy a t2v request.
+def conditioning_key_for(prompt, frame_sha, geometry, variant):
     payload = {
-        "model": MODEL_REPO,
+        "model": f"Wan2.1-1.3B-{variant}",
         "te_sha256": TEXT_ENCODER["sha256"][:32],
         "pos_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "neg_sha256": hashlib.sha256(NEGATIVE_PROMPT.encode("utf-8")).hexdigest(),
-        "fps": FPS, "strength": KEYFRAME_STRENGTH, "compression": IMG_COMPRESSION,
+        "fps": FPS, "shift": SHIFT,
         **geometry,
     }
     if frame_sha is not None:
@@ -226,9 +217,9 @@ def conditioning_key_for(prompt, frame_sha, geometry):
         payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
 
 
-def negative_key():
+def negative_key(variant):
     return "neg-" + hashlib.sha256(json.dumps({
-        "model": MODEL_REPO,
+        "model": f"Wan2.1-1.3B-{variant}",
         "te_sha256": TEXT_ENCODER["sha256"][:32],
         "neg_sha256": hashlib.sha256(NEGATIVE_PROMPT.encode("utf-8")).hexdigest(),
         "fps": FPS,
@@ -251,14 +242,14 @@ PROBE["stages"]["environment"] = {
     if torch.cuda.is_available() else None,
     "vram_total_mib": round(torch.cuda.get_device_properties(0).total_memory / 1024 ** 2, 1)
     if torch.cuda.is_available() else None,
-    "model": "LTX-2.5 22B distilled (video+audio)",
-    "dit_primary_gib": round(DIT_PRIMARY["bytes"] / GIB, 3),
-    "dit_fallback_gib": round(DIT_FALLBACK["bytes"] / GIB, 3),
+    "model": "Wan 2.1 1.3B (silent, no audio track)",
+    "dit_t2v_gib": round(DIT_T2V["bytes"] / GIB, 3),
+    "dit_fun_inp_gib": round(DIT_FUN_INP["bytes"] / GIB, 3),
     "text_encoder_gib": round(TEXT_ENCODER["bytes"] / GIB, 3),
-    "steps": STEPS, "sampler": SAMPLER_NAME,
-    "sigmas": SIGMAS_8STEP,
-    "fps": FPS, "negative": NEGATIVE_PROMPT,
-    "keyframe_strength": KEYFRAME_STRENGTH,
+    "vae_gib": round(VIDEO_VAE["bytes"] / GIB, 3),
+    "steps": STEPS, "cfg": CFG, "sampler": SAMPLER_NAME, "scheduler": SCHEDULER,
+    "shift": SHIFT,
+    "fps": FPS, "negative": NEGATIVE_PROMPT[:40] + "...",
     "gear": GEAR, "geometry": GEOMETRY, "clip_seconds": CLIP_SECONDS,
     "expected_latent_shapes": EXPECTED_LATENT_SHAPES,
 }
@@ -268,12 +259,12 @@ print(json.dumps(PROBE["stages"]["environment"], indent=2, ensure_ascii=False))
 print()
 print("=" * 72)
 print(f"available RAM      : {virtual_memory.available / GIB:.2f} GiB")
-print(f"DiT                : Q4_K_M {DIT_PRIMARY['bytes'] / GIB:.2f} GiB "
-      f"(fallback Q3_K_M {DIT_FALLBACK['bytes'] / GIB:.2f} GiB, lazy)")
-print(f"text encoder       : {TEXT_ENCODER['bytes'] / GIB:.2f} GiB bf16 (lazy, blob stage)")
-print(f"VAEs               : video {VIDEO_VAE['bytes'] / GIB:.2f} + "
-      f"audio {AUDIO_VAE['bytes'] / GIB:.3f} GiB")
-print(f"schedule           : distilled {STEPS} steps, {SAMPLER_NAME}, DualCFG {VIDEO_CFG}/{AUDIO_CFG}")
+print(f"DiT t2v            : {DIT_T2V['bytes'] / GIB:.2f} GiB fp16 "
+      f"(fun_inp keyframe variant {DIT_FUN_INP['bytes'] / GIB:.2f} GiB)")
+print(f"text encoder       : {TEXT_ENCODER['bytes'] / GIB:.2f} GiB fp8-scaled")
+print(f"VAE                : {VIDEO_VAE['bytes'] / GIB:.2f} GiB")
+print(f"schedule           : {STEPS} steps, {SAMPLER_NAME}/{SCHEDULER}, "
+      f"cfg {CFG}, shift {SHIFT}")
 print(f"geometry / fps     : {GEOMETRY['width']}x{GEOMETRY['height']} / "
       f"{frames} frames @ {FPS} ({CLIP_SECONDS} s)")
 print(f"disk free          : {disk.free / GIB:.1f} GiB")
@@ -328,4 +319,4 @@ def prog(tag):
     _tth.Thread(target=_go, daemon=True).start()
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"],
                capture_output=True, timeout=600)
-prog("cell1 config done (LTX-2.5)")
+prog("cell1 config done (Wan 2.1 1.3B)")

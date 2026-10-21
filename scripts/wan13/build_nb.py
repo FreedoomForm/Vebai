@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Assemble the LTX-2.5 worker notebook from scripts/ltx25/* sources.
+"""Assemble the Wan 2.1 1.3B worker notebook from scripts/wan13/* sources.
 
 Cells:
   0 markdown  - header
-  1 code      - scripts/ltx25/cell1_config.py
-  2 code      - scripts/ltx25/cell2_setup.py
-  3 code      - scripts/ltx25/cell3_models.py
-  4 code      - scripts/ltx25/cell4_batch.py  (then patch_kernels.py injects
+  1 code      - scripts/wan13/cell1_config.py
+  2 code      - scripts/wan13/cell2_setup.py
+  3 code      - scripts/wan13/cell3_models.py
+  4 code      - scripts/wan13/cell4_batch.py  (then patch_kernels.py injects
                 kernel_terminal.py before `def feeder():`)
 Writes kernels/rmc_studio_worker_real.ipynb (metadata preserved from the
 existing notebook if present).
@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent  # vebai/
-SRC = ROOT / "scripts" / "ltx25"
+SRC = ROOT / "scripts" / "wan13"
 OUT = ROOT / "kernels" / "rmc_studio_worker_real.ipynb"
 
 # keep the original notebook metadata (kaggle whisper hints etc.)

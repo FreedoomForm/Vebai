@@ -1,20 +1,21 @@
-# Stage 2 (batch) -- model downloads (lazy) + conditioning blobs for every shot.
+# Stage 2 (batch) -- model downloads + conditioning blobs for every shot.
 prog("cell3 models begin")
 #
-# Downloads: DiT Q4_K_M + both VAEs always (the samplers and the decode stage
-# need them). The 24.5 GiB text encoder downloads ONLY when at least one
-# conditioning blob is missing; the Q3_K_M fallback quant downloads only when
-# the retry ladder reaches its last rung (cell 4). Kaggle scratch is finite.
+# Downloads: both DiTs + the VAE always (9.4 GiB total - the whole stack fits
+# where the LTX encoder alone did not). The 6.27 GiB text encoder downloads
+# ONLY when at least one conditioning blob is missing.
 #
 # Blobs: for every shot the encode server (port 8190, alone on GPU 0) runs the
-# LTX-2.5 conditioning graph ONCE per geometry - positive + negative
-# conditioning AND the packed AV latent with the keyframe guides - and saves
-# both through H3SaveConditioning. The negative prompt is static, so its blob
-# is shared across all shots (one key per session).
+# Wan conditioning graph ONCE per geometry - positive + negative conditioning,
+# and for keyframe shots the Fun-InP latent (zeros + encoded start image baked
+# into the conditioning) - and saves both through H3SaveConditioning. The
+# negative prompt is static, so its blob is shared across all shots of a
+# variant (one key per session and variant).
 import requests
 
 def load_shot_manifest():
-    candidates = [Path("/kaggle/input/rmc-ltx-t4x2-inputs") / "shots.json",
+    candidates = [Path("/kaggle/input/rmc-studio-jobs") / "shots.json",
+                  Path("/kaggle/input/rmc-ltx-t4x2-inputs") / "shots.json",
                   Path("/kaggle/input/rmc-h3-t4x2-inputs") / "shots.json",
                   WORK / "inputs" / "shots.json"]
     try:
@@ -37,6 +38,17 @@ def geometry_for(gear, frames):
     return {"width": width, "height": height, "length": frames}
 
 
+def variant_for(entry):
+    """fun_inp when the server shipped a REAL user keyframe (frame_real) - the
+    video then starts exactly on it. Neutral canvases and manifests from
+    servers older than T44 fall back to pure text-to-video."""
+    return "fun_inp" if entry.get("frame_real") else "t2v"
+
+
+def dit_for(variant):
+    return DIT_FUN_INP if variant == "fun_inp" else DIT_T2V
+
+
 # [studio-worker] the feeder owns ALL job intake (single dedup point via
 # done_ids.json + SEEN_JOBS); this cell only prepares the FIRST batch.
 MANIFEST, SHOT_BASE = [], (WORK / "inputs")
@@ -47,25 +59,28 @@ for entry in MANIFEST:
     frame_path = SHOT_BASE / entry["frame"]
     if not frame_path.is_file():
         raise RuntimeError(f"keyframe missing: {frame_path}")
+    variant = variant_for(entry)
     gears = sorted({entry.get("gear_primary", GEAR), entry.get("gear_fallback", "0.2")})
     geometries = {gear: geometry_for(gear, int(entry["frames"])) for gear in gears}
-    frame_sha = hashlib.sha256(frame_path.read_bytes()).hexdigest()
+    frame_sha = hashlib.sha256(frame_path.read_bytes()).hexdigest() if variant == "fun_inp" else None
     SHOTS.append({
         "num": int(entry["num"]), "seconds": entry["seconds"],
         "frames": int(entry["frames"]), "prompt": entry["prompt"],
-        "frame_path": frame_path,
+        "frame_path": frame_path, "has_frame": variant == "fun_inp",
+        "variant": variant, "dit": dit_for(variant),
         "gear_primary": entry.get("gear_primary", GEAR),
         "gear_fallback": entry.get("gear_fallback", "0.2"),
         "geometries": geometries,
-        "keys": {gear: conditioning_key_for(entry["prompt"], frame_sha, geometry)
+        "keys": {gear: conditioning_key_for(entry["prompt"], frame_sha, geometry, variant)
                  for gear, geometry in geometries.items()},
         "seed": 42 + int(entry["num"]) * 7919,
         "blobs": {},
     })
 print("prepared shots: " + ", ".join(
-    f"{s['num']:02d}/{s['frames']}f" for s in SHOTS))
+    f"{s['num']:02d}/{s['frames']}f/{s['variant']}" for s in SHOTS))
 
-NEED_KEY = negative_key()
+NEG_KEYS = {variant: negative_key(variant) for variant in
+            sorted({shot["variant"] for shot in SHOTS} | {"t2v", "fun_inp"})}
 
 
 def find_blob_anywhere(key):
@@ -94,12 +109,12 @@ def resolve_blob(key):
 for shot in SHOTS:
     for gear, key in shot["keys"].items():
         shot["blobs"][gear] = resolve_blob(key)
-NEG_BLOB = resolve_blob(NEED_KEY)
 pending = [(shot, gear) for shot in SHOTS for gear in shot["keys"]
            if shot["blobs"].get(gear) is None]
+neg_pending = [v for v, k in NEG_KEYS.items() if resolve_blob(k) is None]
 total_blobs = sum(len(s["keys"]) for s in SHOTS)
 print(f"conditioning blobs: {total_blobs - len(pending)}/{total_blobs} present, "
-      f"{len(pending)} to encode; negative blob {'present' if NEG_BLOB else 'missing'}")
+      f"{len(pending)} to encode; negative blobs missing: {neg_pending or 'none'}")
 
 
 # --- shared fetch helper (verbatim semantics from the H3 stage) ---------------
@@ -122,7 +137,7 @@ def fetch_verified(expected, subdir):
                                f"{expected['bytes'] / GIB + 3:.1f} GiB for {relative_name}.")
         print(f"  downloading {relative_name} ({expected['bytes'] / GIB:.2f} GiB) ...")
         started = time.perf_counter()
-        fetched = hf_hub_download(repo_id=expected["repo"], filename=expected["hf_filename"],
+        fetched = hf_hub_download(repo_id=expected["repo"], filename=expected["file"],
                                   local_dir=str(MODEL_STORE / "_hf"), token=False)
         shutil.move(fetched, destination)
         record["source"] = "huggingface"
@@ -157,109 +172,67 @@ def fetch_verified(expected, subdir):
     return record
 
 
-def gguf_header_check(path):
-    """Read the GGUF header: arch must be ltxv and the config KV must exist
-    (without it ComfyUI builds an LTX-2.3-shaped model and shape-mismatches)."""
-    import struct
-    data = Path(path).open("rb").read(24 * 1024 * 1024)
-    magic, ver = struct.unpack("<4sI", data[:8])
-    if magic != b"GGUF":
-        return {"status": "not_gguf"}
-    tc, kc = struct.unpack("<QQ", data[8:24])
-    off = 24
-    found = {}
-    sizes = {0: 1, 1: 2, 2: 2, 3: 4, 4: 4, 5: 4, 6: 1, 7: 1, 9: 8, 10: 8}
-
-    def rs(o):
-        n = struct.unpack("<Q", data[o:o + 8])[0]
-        return data[o + 8:o + 8 + n].decode("utf-8", "replace"), o + 8 + n
-
-    def rv(o, t, depth=0):
-        if t == 8:
-            return rs(o)
-        if t == 11:
-            et = struct.unpack("<I", data[o:o + 4])[0]
-            cnt = struct.unpack("<Q", data[o + 4:o + 12])[0]
-            o2 = o + 12
-            vals = []
-            for _ in range(min(cnt, 2)):
-                v, o2 = rv(o2, et, depth + 1)
-                vals.append(v)
-            return f"arr{cnt}", o2
-        if t in sizes:
-            f = {0: "<b", 1: "<h", 2: "<H", 3: "<i", 4: "<I", 5: "<f",
-                 6: "<B", 7: "<?", 9: "<q", 10: "<Q"}[t]
-            return struct.unpack(f, data[o:o + sizes[t]])[0], o + sizes[t]
-        return None, None
-
-    for _ in range(min(kc, 80)):
-        key, off = rs(off)
-        t = struct.unpack("<I", data[off:off + 4])[0]
-        off += 4
-        v, off = rv(off, t)
-        found[key] = v
-        if off is None or off > len(data) - 64:
-            break
-    return {"status": "OK", "kvs": len(found),
-            "architecture": found.get("general.architecture"),
-            "config_present": "config" in found,
-            "model_version": str(found.get("model_version", ""))[:16]}
-
-
 models = {}
-print("\nDiT Q4_K_M + both VAEs ...")
-models["dit"] = fetch_verified(DIT_PRIMARY, "diffusion_models")
-models["dit"]["gguf_header"] = gguf_header_check(MODEL_STORE / "diffusion_models" / DIT_PRIMARY["hf_filename"])
-header = models["dit"]["gguf_header"]
-if header.get("architecture") != "ltxv" or not header.get("config_present"):
-    raise RuntimeError(f"DiT GGUF header check failed: {header}. Without arch=ltxv and "
-                       "the config KV, ComfyUI-GGUF builds a wrong-shaped model.")
-print(f"  gguf header OK: arch={header.get('architecture')!r} "
-      f"config={'yes' if header.get('config_present') else 'NO'}")
-models["video_vae"] = fetch_verified(VIDEO_VAE, "vae")
-models["audio_vae"] = fetch_verified(AUDIO_VAE, "vae")
+print("\nDiT t2v + DiT fun_inp + VAE ...")
+models["dit_t2v"] = fetch_verified(DIT_T2V, "diffusion_models")
+models["dit_fun_inp"] = fetch_verified(DIT_FUN_INP, "diffusion_models")
+models["vae"] = fetch_verified(VIDEO_VAE, "vae")
 
 PROBE["stages"]["models"] = {k: {kk: vv for kk, vv in v.items() if kk != "files"}
                              for k, v in models.items()}
 save()
-prog("dit+vaes ready")
+prog("dits+vae ready")
 
 
 # --- encode every missing blob in one session, then record models -------------
 
 def encode_graph(shot, gear, key_pos, key_neg, image_name):
+    """Two branches, both saving (conditioning, latent) blob pairs.
+
+    t2v:     CLIPTextEncode pos/neg + EmptyHunyuanLatentVideo zeros.
+    fun_inp: the same text conditioning runs through WanFunInpaintToVideo with
+             the start image - it returns (positive, negative, latent) where
+             the conditioning now carries the encoded keyframe and the mask
+             that pins frame 0 to it.
+    """
     geometry = shot["geometries"][gear]
-    return {
+    graph = {
         "2": {"class_type": "CLIPLoader", "inputs": {
-            "clip_name": Path(TEXT_ENCODER["hf_filename"]).name, "type": "ltxv",
+            "clip_name": Path(TEXT_ENCODER["hf_filename"]).name, "type": "wan",
             "device": "default"}},
-        "3": {"class_type": "VAELoader", "inputs": {"vae_name": Path(VIDEO_VAE["hf_filename"]).name}},
-        "4": {"class_type": "VAELoader", "inputs": {"vae_name": Path(AUDIO_VAE["hf_filename"]).name}},
-        "5": {"class_type": "LoadImage", "inputs": {"image": image_name}},
-        "6": {"class_type": "LTXVPreprocess", "inputs": {
-            "image": ["5", 0], "img_compression": IMG_COMPRESSION}},
-        "7": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
-            "width": geometry["width"], "height": geometry["height"],
-            "length": geometry["length"], "batch_size": 1}},
-        "8": {"class_type": "LTXVImgToVideoInplace", "inputs": {
-            "vae": ["3", 0], "image": ["6", 0], "latent": ["7", 0],
-            "strength": KEYFRAME_STRENGTH, "bypass": False}},
-        "9": {"class_type": "LTXVEmptyLatentAudio", "inputs": {
-            "frames_number": geometry["length"], "frame_rate": FPS,
-            "batch_size": 1, "audio_vae": ["4", 0]}},
-        "10": {"class_type": "LTXVConcatAVLatent", "inputs": {
-            "video_latent": ["8", 0], "audio_latent": ["9", 0]}},
         "11": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": shot["prompt"]}},
         "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": NEGATIVE_PROMPT}},
-        "13": {"class_type": "LTXVConditioning", "inputs": {
-            "positive": ["11", 0], "negative": ["12", 0], "frame_rate": float(FPS)}},
-        "40": {"class_type": "H3SaveConditioning", "inputs": {
-            "conditioning": ["13", 0], "samples": ["10", 0],
-            "store_dir": str(CONDITIONING_STORE), "key": key_pos}},
-        "41": {"class_type": "H3SaveConditioning", "inputs": {
-            "conditioning": ["13", 1], "samples": ["10", 0],
-            "store_dir": str(CONDITIONING_STORE), "key": key_neg}},
     }
+    if shot.get("has_frame"):
+        graph.update({
+            "3": {"class_type": "VAELoader", "inputs": {
+                "vae_name": Path(VIDEO_VAE["hf_filename"]).name}},
+            "5": {"class_type": "LoadImage", "inputs": {"image": image_name}},
+            "6": {"class_type": "WanFunInpaintToVideo", "inputs": {
+                "positive": ["11", 0], "negative": ["12", 0], "vae": ["3", 0],
+                "width": geometry["width"], "height": geometry["height"],
+                "length": geometry["length"], "batch_size": 1,
+                "start_image": ["5", 0]}},
+            "40": {"class_type": "H3SaveConditioning", "inputs": {
+                "conditioning": ["6", 0], "samples": ["6", 2],
+                "store_dir": str(CONDITIONING_STORE), "key": key_pos}},
+            "41": {"class_type": "H3SaveConditioning", "inputs": {
+                "conditioning": ["6", 1], "samples": ["6", 2],
+                "store_dir": str(CONDITIONING_STORE), "key": key_neg}},
+        })
+    else:
+        graph.update({
+            "7": {"class_type": "EmptyHunyuanLatentVideo", "inputs": {
+                "width": geometry["width"], "height": geometry["height"],
+                "length": geometry["length"], "batch_size": 1}},
+            "40": {"class_type": "H3SaveConditioning", "inputs": {
+                "conditioning": ["11", 0], "samples": ["7", 0],
+                "store_dir": str(CONDITIONING_STORE), "key": key_pos}},
+            "41": {"class_type": "H3SaveConditioning", "inputs": {
+                "conditioning": ["12", 0], "samples": ["7", 0],
+                "store_dir": str(CONDITIONING_STORE), "key": key_neg}},
+        })
+    return graph
 
 
 def wait_prompt(base_url, prompt_id, what, timeout_s):
@@ -286,7 +259,8 @@ def wait_prompt(base_url, prompt_id, what, timeout_s):
 def encode_one(base_url, shot, gear, key_pos, key_neg):
     image_name = f"cond_{key_pos}.jpg"
     (COMFY_DIR / "input").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(shot["frame_path"], COMFY_DIR / "input" / image_name)
+    if shot.get("has_frame"):
+        shutil.copy2(shot["frame_path"], COMFY_DIR / "input" / image_name)
     graph = encode_graph(shot, gear, key_pos, key_neg, image_name)
     prompt_id = str(uuid.uuid4())
     response = requests.post(f"{base_url}/prompt", timeout=120, json={
@@ -297,36 +271,58 @@ def encode_one(base_url, shot, gear, key_pos, key_neg):
     return wait_prompt(base_url, prompt_id, f"encode {key_pos[:18]} gear {gear}", 3600)
 
 
-if pending or NEG_BLOB is None:
+if pending or neg_pending:
     print(f"\nDownloading text encoder ({TEXT_ENCODER['bytes'] / GIB:.2f} GiB, one-time) ...")
     models["text_encoder"] = fetch_verified(TEXT_ENCODER, "text_encoders")
     server = start_comfy(port=8190, timeout_s=1200)
     prog("encode server boot")
     try:
         encode_info = requests.get(f"{server}/object_info", timeout=300).json()
-        for node in ("CLIPLoader", "VAELoader", "LoadImage", "LTXVPreprocess",
-                     "LTXVImgToVideoInplace", "EmptyLTXVLatentVideo",
-                     "LTXVEmptyLatentAudio", "LTXVConcatAVLatent",
-                     "LTXVConditioning", "H3SaveConditioning"):
+        for node in ("CLIPLoader", "CLIPTextEncode", "VAELoader", "LoadImage",
+                     "WanFunInpaintToVideo", "EmptyHunyuanLatentVideo",
+                     "H3SaveConditioning"):
             if node not in encode_info:
                 raise RuntimeError(f"{node} is missing; cannot encode")
-        done = 0
+        # negative blobs first (shared across shots of the variant), then shots
+        plan = []
+        for variant in neg_pending:
+            plan.append(("negative", variant, NEG_KEYS[variant]))
         for shot, gear in pending:
-            key_pos = shot["keys"][gear]
-            seconds = encode_one(server, shot, gear, key_pos, NEED_KEY)
-            shot["blobs"][gear] = CONDITIONING_STORE / f"{key_pos}.pt"
+            plan.append(("shot", shot, gear))
+        done = 0
+        for kind, obj, arg in plan:
+            if kind == "negative":
+                variant, key = obj, arg
+                stub = {"prompt": NEGATIVE_PROMPT, "has_frame": False,
+                        "geometries": {GEAR: GEOMETRY}}
+                seconds = encode_one(server, stub, GEAR, key, key)
+                CONDITIONING_STORE.mkdir(parents=True, exist_ok=True)
+                if not (CONDITIONING_STORE / f"{key}.pt").is_file():
+                    raise RuntimeError(f"negative blob {key} was not saved")
+                neg_pending = [v for v in neg_pending if v != variant]
+                print(f"  negative blob for {variant} saved in {seconds}s")
+            else:
+                shot, gear = obj, arg
+                key_pos = shot["keys"][gear]
+                neg = NEG_KEYS[shot["variant"]]
+                seconds = encode_one(server, shot, gear, key_pos, neg)
+                shot["blobs"][gear] = CONDITIONING_STORE / f"{key_pos}.pt"
+                print(f"  [{sum(1 for k, o, a in plan[:done] if k == 'shot') + 1}"
+                      f"/{len(pending)}] shot_{shot['num']:02d} gear {gear} "
+                      f"({shot['variant']}) encoded in {seconds}s")
             done += 1
-            print(f"  [{done}/{len(pending)}] shot_{shot['num']:02d} gear {gear} "
-                  f"encoded (+negative blob) in {seconds}s")
             try:
                 DRIVE_CONDITIONING_STORE.mkdir(parents=True, exist_ok=True)
-                for key in (key_pos, NEED_KEY):
+                saved_keys = [NEG_KEYS[v] for v in NEG_KEYS
+                              if (CONDITIONING_STORE / f"{NEG_KEYS[v]}.pt").is_file()] \
+                    + [s["keys"][g] for s in SHOTS for g in s["keys"]
+                       if (CONDITIONING_STORE / f"{s['keys'][g]}.pt").is_file()]
+                for key in set(saved_keys):
                     source = CONDITIONING_STORE / f"{key}.pt"
                     if source.is_file():
                         shutil.copy2(source, DRIVE_CONDITIONING_STORE / source.name)
             except Exception as exc:
                 print(f"  persist failed (non-fatal): {type(exc).__name__}: {exc}")
-        NEG_BLOB = CONDITIONING_STORE / f"{NEED_KEY}.pt"
     finally:
         stop_comfy()
         print("encode session stopped; sampling starts from a clean process")
@@ -337,4 +333,4 @@ else:
 PROBE["stages"]["models"] = {k: {kk: vv for kk, vv in v.items() if kk != "files"}
                              for k, v in models.items()}
 save()
-prog("cell3 done (dit+vae ready, blobs encoded)")
+prog("cell3 done (dits+vae ready, blobs encoded)")

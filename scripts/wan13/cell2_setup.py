@@ -1,7 +1,9 @@
-# Stage 1 - ComfyUI + ComfyUI-GGUF at pinned commits, the studio control nodes,
+# Stage 1 - ComfyUI at the pinned commit, the studio control nodes,
 prog("cell2 comfyui setup begin")
 # and an EARLY node-availability check (CPU server, no models): every node the
-# LTX-2.5 graphs use must exist in the pinned ComfyUI before anything downloads.
+# Wan graphs use must exist in the pinned ComfyUI before anything downloads.
+# No ComfyUI-GGUF here: Wan 2.1 1.3B runs on the stock fp16 safetensors
+# loader; the only custom nodes are the slim studio control nodes.
 import importlib.metadata as importlib_metadata
 import tempfile
 
@@ -50,7 +52,7 @@ def ensure_checkout(repo, destination, commit, allow_dirty=False):
 def pip_install_without_touching_torch(requirements_path, label):
     """Resolve first, refuse the plan if it would move torch, then install exactly."""
     before = protected_snapshot()
-    handle, name = tempfile.mkstemp(prefix=f"ltx-{label}-", suffix=".json")
+    handle, name = tempfile.mkstemp(prefix=f"wan-{label}-", suffix=".json")
     os.close(handle)
     report_path = Path(name)
     try:
@@ -83,28 +85,23 @@ def pip_install_without_touching_torch(requirements_path, label):
 
 ensure_checkout(COMFY_REPO, COMFY_DIR, COMFY_COMMIT)
 comfy_install = pip_install_without_touching_torch(COMFY_DIR / "requirements.txt", "comfyui")
+print(f"installed comfyui:{len(comfy_install['installed'])} packages, torch untouched")
 
-ensure_checkout(GGUF_REPO, GGUF_NODE_DIR, GGUF_COMMIT)
-gguf_install = pip_install_without_touching_torch(GGUF_NODE_DIR / "requirements.txt", "gguf")
-print(f"installed comfyui:{len(comfy_install['installed'])} gguf:{len(gguf_install['installed'])} "
-      "packages, torch untouched")
-
-# --- architecture allowlist check (replaces the H3-era loader patch) ---------
-# ComfyUI-GGUF validates a UNET GGUF's general.architecture against a hardcoded
-# set. The LTX-2.5 GGUFs declare "ltxv" and carry the 61-key config blob in a
-# KV named "config" (verified in the unsloth files' headers on 2026-10-20), so
-# the stock loader works: assert both facts instead of patching anything.
-loader_path = GGUF_NODE_DIR / "loader.py"
-loader_text = loader_path.read_text(encoding="utf-8")
-m = re.search(r"IMG_ARCH_LIST\s*=\s*\{([^}]*)\}", loader_text)
-if not m or "ltxv" not in m.group(1):
-    raise RuntimeError("ComfyUI-GGUF IMG_ARCH_LIST does not contain 'ltxv' at the pinned "
-                       "commit - the LTX-2.5 GGUF would be rejected. Inspect loader.py.")
-PROBE["stages"]["gguf_arch"] = {"img_arch_list": m.group(1).strip()[:200], "ltxv_ok": True}
-print("gguf arch check: ltxv present, no patch needed")
+# --- Wan node sanity check at the pinned commit -------------------------------
+# The graphs rely on WanTextEncoder loading through CLIPLoader(type=wan),
+# WanFunInpaintToVideo for keyframe shots, and ModelSamplingSD3 for the flow
+# shift - all vanilla. Assert the three names exist in the source tree so a
+# ComfyUI refactor cannot silently break the session.
+for node_file, marker in (("comfy_extras/nodes_wan.py", "WanFunInpaintToVideo"),
+                          ("comfy_extras/nodes_model_advanced.py", "ModelSamplingSD3"),
+                          ("comfy_extras/nodes_hunyuan.py", "EmptyHunyuanLatentVideo")):
+    text = (COMFY_DIR / node_file).read_text(encoding="utf-8")
+    if marker not in text:
+        raise RuntimeError(f"{node_file} at the pinned commit has no {marker}; "
+                           "the Wan graphs would not build. Inspect the checkout.")
 
 custom_nodes = COMFY_DIR / "custom_nodes"
-allowed = {"ComfyUI-GGUF", "H3BenchmarkControl", "__pycache__",
+allowed = {"H3BenchmarkControl", "__pycache__",
            "example_node.py.example", "websocket_image_save.py"}
 unexpected = [p.name for p in custom_nodes.iterdir() if p.name not in allowed]
 if unexpected:
@@ -112,8 +109,8 @@ if unexpected:
 
 CONTROL_NODE_DIR.mkdir(parents=True, exist_ok=True)
 # Slim studio control nodes: blob + latent save/load (plain torch.save of the
-# LTX AV latent dict - plain tensors, no nested-tensor restore dance) and a
-# finite-check latent probe.
+# Wan conditioning/latent dicts - plain tensors, no nested-tensor restore
+# dance) and a finite-check latent probe.
 (CONTROL_NODE_DIR / "__init__.py").write_text(r'''
 import json
 import logging
@@ -135,9 +132,9 @@ def _detach_to_cpu(obj):
 class H3SaveConditioning:
     """Persist {conditioning, samples} so later runs never load the encoder.
 
-    For LTX-2.5 the CONDITIONING is the LTXVConditioning output (a list of
-    [embeddings, options] pairs) and samples is the packed AV latent with the
-    keyframe guides - both plain python/torch containers.
+    For Wan the CONDITIONING is the CLIPTextEncode output (a list of
+    [embeddings, options] pairs; Fun-InP options carry the encoded keyframe)
+    and samples is the zeros video latent - both plain python/torch containers.
     """
 
     @classmethod
@@ -161,7 +158,7 @@ class H3SaveConditioning:
         staged = destination.with_suffix(".pt.tmp")
         torch.save(payload, staged)
         staged.replace(destination)
-        logging.info("LTX_SAVE_CONDITIONING %s", json.dumps(
+        logging.info("WAN_SAVE_CONDITIONING %s", json.dumps(
             {"key": key, "bytes": destination.stat().st_size}, separators=(",", ":")))
         return {}
 
@@ -187,13 +184,13 @@ class H3LoadConditioning:
         payload = torch.load(source, map_location="cpu", weights_only=False)
         if payload.get("schema_version") != 2:
             raise RuntimeError(f"Unsupported schema: {payload.get('schema_version')}")
-        logging.info("LTX_LOAD_CONDITIONING %s", json.dumps(
+        logging.info("WAN_LOAD_CONDITIONING %s", json.dumps(
             {"key": key, "bytes": source.stat().st_size}, separators=(",", ":")))
         return (payload["conditioning"], payload["samples"])
 
 
 class H3SaveLatent:
-    """Persist a LATENT dict (the packed AV latent) between stages."""
+    """Persist a LATENT dict (the sampled video latent) between stages."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -215,7 +212,7 @@ class H3SaveLatent:
         staged = destination.with_suffix(".pt.tmp")
         torch.save(payload, staged)
         staged.replace(destination)
-        logging.info("LTX_SAVE_LATENT %s", json.dumps(
+        logging.info("WAN_SAVE_LATENT %s", json.dumps(
             {"key": key, "bytes": destination.stat().st_size}, separators=(",", ":")))
         return (samples,)
 
@@ -244,7 +241,7 @@ class H3LoadLatent:
 
 
 class H3LatentProbe:
-    """Record the sampled AV latent and refuse non-finite values.
+    """Record the sampled latent and refuse non-finite values.
 
     A finite latent can still decode to black - the decode QA covers that -
     but a NaN here means the whole session is misconfigured, so fail fast.
@@ -254,7 +251,7 @@ class H3LatentProbe:
     def INPUT_TYPES(cls):
         return {"required": {
             "samples": ("LATENT",),
-            "filename_prefix": ("STRING", {"default": "ltx25/probe"}),
+            "filename_prefix": ("STRING", {"default": "wan13/probe"}),
         }}
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("samples",)
@@ -278,7 +275,7 @@ class H3LatentProbe:
                    "finite": finite,
                    "keys": sorted(samples.keys())}
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logging.info("LTX_LATENT_PROBE %s", json.dumps(payload["shapes"], separators=(",", ":")))
+        logging.info("WAN_LATENT_PROBE %s", json.dumps(payload["shapes"], separators=(",", ":")))
         if finite and not all(finite):
             raise RuntimeError(f"Sampled latent contains non-finite values: {payload}")
         return (samples,)
@@ -292,7 +289,7 @@ NODE_CLASS_MAPPINGS = {
     "H3LatentProbe": H3LatentProbe,
 }
 ''')
-print("studio control nodes written (slim LTX variant)")
+print("studio control nodes written (slim Wan variant)")
 
 FORBIDDEN_FLAGS = ("--use-sage-attention", "--highvram")
 
@@ -367,15 +364,11 @@ def start_comfy(timeout_s=900, quiet=False, port=8188, cpu=False, extra_flags=()
 
 # --- EARLY node verification (CPU, no models) ---------------------------------
 REQUIRED_NODES = {
-    # loaders + samplers
-    "UnetLoaderGGUF", "CLIPLoader", "CLIPTextEncode", "VAELoader", "LoadImage",
-    "RandomNoise", "ManualSigmas", "KSamplerSelect", "SamplerCustomAdvanced",
-    # LTX-2.5 graph
-    "LTXVPreprocess", "LTXVImgToVideoInplace", "EmptyLTXVLatentVideo",
-    "LTXVEmptyLatentAudio", "LTXVConcatAVLatent", "LTXVSeparateAVLatent",
-    "LTXVConditioning", "LTXVDualCFGGuider",
-    # decode
-    "VAEDecodeTiled", "LTXVAudioVAEDecode", "CreateVideo", "SaveVideo",
+    # loaders + text
+    "CLIPLoader", "CLIPTextEncode", "VAELoader", "LoadImage", "UNETLoader",
+    # Wan graph
+    "EmptyHunyuanLatentVideo", "WanFunInpaintToVideo", "ModelSamplingSD3",
+    "KSampler", "VAEDecode", "CreateVideo", "SaveVideo",
     # studio control
     "H3SaveConditioning", "H3LoadConditioning", "H3SaveLatent", "H3LoadLatent",
     "H3LatentProbe",
@@ -388,10 +381,19 @@ try:
     missing = sorted(REQUIRED_NODES - set(info))
     if missing:
         raise RuntimeError(f"Pinned ComfyUI is missing required nodes: {missing}")
+    # the exact contract of the two graph-shaping inputs we depend on
+    clip_types = info["CLIPLoader"]["input"]["required"]["type"][0]
+    if "wan" not in clip_types:
+        raise RuntimeError(f"CLIPLoader types lack 'wan': {clip_types}")
+    inp_types = info["WanFunInpaintToVideo"]["input"]["required"]
+    for name in ("positive", "negative", "vae", "width", "height", "length", "batch_size"):
+        if name not in inp_types and name not in info["WanFunInpaintToVideo"]["input"].get("optional", {}):
+            raise RuntimeError(f"WanFunInpaintToVideo lost its '{name}' input")
     PROBE["stages"]["node_check"] = {"verified": len(REQUIRED_NODES), "missing": []}
-    print(f"node check: all {len(REQUIRED_NODES)} required nodes present")
+    print(f"node check: all {len(REQUIRED_NODES)} required nodes present "
+          "(CLIPLoader type=wan, WanFunInpaintToVideo contract OK)")
 finally:
     stop_comfy()
     print("verification server stopped")
 save()
-prog("cell2 done (comfy+gguf+nodes verified)")
+prog("cell2 done (comfy+nodes verified)")
