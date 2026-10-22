@@ -42,6 +42,7 @@ export async function POST(req: NextRequest) {
     text?: string
     caption?: string
     files?: SendFile[]
+    mirror?: boolean
   }
   const secret = String(body.secret || '')
   const sessionId = String(body.session || '')
@@ -133,6 +134,37 @@ export async function POST(req: NextRequest) {
     for (const c of chunks.slice(0, 8)) {
       if (await sendTelegramText(c, chatId)) textSent++
       else errors.push('текст не доставлен')
+    }
+  }
+
+  // ---- T48: mirror mid-task <answer>/<file> deliveries into the site chat --
+  // The runner sets mirror=true for its internal apps (<answer> contact /
+  // <file> attachment): the user gets the Telegram message AND a matching
+  // entry in the site conversation, so the chat history stays complete.
+  if (body.mirror && cmd?.conversationId && (textSent > 0 || filesSent > 0)) {
+    try {
+      const conv = await db.conversation.findUnique({ where: { id: cmd.conversationId } })
+      if (conv) {
+        const content = files.length > 0
+          ? `📎 Агент передал файл(ы): ${files.map((f) => f.name).join(', ').slice(0, 300)} — вложением в Telegram${text ? `, подпись: «${text.slice(0, 300)}»` : ''}`
+          : text
+        if (content) {
+          await db.message.create({
+            data: {
+              conversationId: cmd.conversationId,
+              role: 'assistant',
+              kind: 'text',
+              content: content.slice(0, 8000),
+              meta: JSON.stringify({ midTask: true, terminalCommandId: cmd.id }),
+            },
+          })
+          await db.conversation
+            .update({ where: { id: cmd.conversationId }, data: { updatedAt: new Date() } })
+            .catch(() => {})
+        }
+      }
+    } catch {
+      /* mirror is best-effort */
     }
   }
 

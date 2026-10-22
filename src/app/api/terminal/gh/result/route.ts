@@ -2,9 +2,29 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { uploadToTelegram, sendTelegramText, taskChat } from '@/lib/telegram'
 import { parseAiAnswer, fileWants } from '@/lib/agent/answer'
+import { chainOfCommand, continueAfterTerminal } from '@/lib/agent/continue'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 120
+
+/** T48: the site brain SEES the command output — feed the result back to the
+ * chat model so it continues the task autonomously (bounded chain). Only for
+ * plain commands issued by the site model: source='agent', not '#!agent'
+ * (those carry their own full agent loop on GitHub). */
+function fireContinuation(
+  cmd: { id: string; conversationId: string | null; command: string; source: string },
+  output: string,
+  exit: number,
+): void {
+  if (cmd.source !== 'agent' || cmd.command.startsWith('#!agent') || !cmd.conversationId) return
+  const chain = chainOfCommand(cmd.command)
+  if (chain >= 3) return
+  const run = () =>
+    continueAfterTerminal(cmd.conversationId as string, cmd.id, cmd.command, output, exit, chain)
+  void import('@vercel/functions')
+    .then(({ waitUntil }) => waitUntil(run()))
+    .catch(() => void run())
+}
 
 interface GhFile {
   path?: string
@@ -196,6 +216,9 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // T48: let the site brain see this result and continue working on its own
+    fireContinuation(cmd, output, exit)
+
     return NextResponse.json({ ok: true, files: saved.length })
   }
 
@@ -238,6 +261,9 @@ export async function POST(req: NextRequest) {
       } catch { /* best-effort */ }
     }
   }
+
+  // T48: let the site brain see this result and continue working on its own
+  fireContinuation(cmd, output, exit)
 
   return NextResponse.json({ ok: true, files: saved.length })
 }
