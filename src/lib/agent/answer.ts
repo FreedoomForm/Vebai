@@ -17,6 +17,14 @@ const RE_FILE = /<file>([\s\S]*?)<\/file>/gi
 const RE_INTERNAL =
   /<think>[\s\S]*?<\/think>|<thought>[\s\S]*?<\/thought>|<cmd[^>]*>[\s\S]*?<\/cmd>|<search>[\s\S]*?<\/search>|<read>[\s\S]*?<\/read>|<send\b[^>]*>[\s\S]*?<\/send>|<end\s*\/>|<end\b[^>]*>[\s\S]*?<\/end>|<memory\b[^>]*>[\s\S]*?<\/memory>|<work\b[^>]*>[\s\S]*?<\/work>/gi
 
+/** T52c (owner report «писание 3-летнего малыша»): fenced SERVICE blocks
+ * (```run-agent / run-terminal / run-vterm / run-tg / run-tg-read /
+ * video-request) are dispatched by the site and must NEVER appear in the
+ * chat — a raw "to:/message:" dump did. Stripped from fallback text here,
+ * terminated or not (an unclosed block runs to the end of the text). */
+const RE_FENCED =
+  /```(?:run-agent|run-terminal|run-vterm|run-tg-read|run-tg|video-request)\b[^\n]*(?:\n[\s\S]*?(?:```|$))?/gi
+
 export interface ParsedAnswer {
   /** the text the user is allowed to see */
   text: string
@@ -26,9 +34,11 @@ export interface ParsedAnswer {
   tagged: boolean
 }
 
-/** no <answer> wrapper: unwrap the safe tags, drop the internal ones */
+/** no <answer> wrapper: unwrap the safe tags, drop the internal ones and
+ * the fenced service blocks (T52c) */
 function cleanFallback(raw: string): string {
   return raw
+    .replace(RE_FENCED, '')
     .replace(RE_INTERNAL, '')
     .replace(/<\/?(?:answer|file|final|end|memory|work)>/gi, '')
     .trim()
@@ -55,8 +65,12 @@ export function parseAiAnswer(raw: string): ParsedAnswer {
       }
     }
   }
-  if (answers.length > 0)
-    return { text: answers.join('\n\n'), files, tagged: true }
+  if (answers.length > 0) {
+    // T52c hardening: a service fenced block wrapped INSIDE <answer> (protocol
+    // violation) must still never reach the chat
+    const text = answers.join('\n\n').replace(RE_FENCED, '').trim()
+    if (text) return { text, files, tagged: true }
+  }
   return { text: cleanFallback(src), files, tagged: false }
 }
 

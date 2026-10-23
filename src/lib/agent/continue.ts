@@ -96,15 +96,21 @@ export async function continueAfterRead(
       max_tokens: 2200,
       temperature: 0.4,
     })
-    const answer = String(completion.choices?.[0]?.message?.content || '').trim()
-    if (!answer) return
+    const raw = String(completion.choices?.[0]?.message?.content || '').trim()
+    if (!raw) return
+    // T52c (owner report «писание 3-летнего малыша»): the RAW model output used
+    // to land in the chat VERBATIM — literal <answer>…</answer> tags, "to:/
+    // message:" service lines and all. Parse like continueAfterTerminal does:
+    // only the visible text is posted, tool blocks are dispatched from raw.
+    const parsed = parseAiAnswer(raw)
+    if (!parsed.text) return
 
     await db.message.create({
       data: {
         conversationId,
         role: 'assistant',
         kind: 'text',
-        content: answer,
+        content: parsed.text,
         meta: JSON.stringify({ taskId, autoContinue: true, chain }),
       },
     })
@@ -112,8 +118,9 @@ export async function continueAfterRead(
       .update({ where: { id: conversationId }, data: { updatedAt: new Date() } })
       .catch(() => {})
 
-    // dispatch the follow-up tool blocks the continuation emitted
-    const mAgent = answer.match(/```run-agent\s*\n([\s\S]*?)```/)
+    // dispatch the follow-up tool blocks the continuation emitted (from RAW —
+    // the blocks live outside/beside the visible <answer> text)
+    const mAgent = raw.match(/```run-agent\s*\n([\s\S]*?)```/)
     if (mAgent) {
       const t = mAgent[1].trim().slice(0, 8000)
       if (t) {
@@ -129,8 +136,8 @@ export async function continueAfterRead(
         }).catch(() => {})
       }
     }
-    await createOutboxTasks(answer, conversationId, conv.userId)
-    const nr = await createTgReadTasks(answer, conversationId, conv.userId, chain + 1)
+    await createOutboxTasks(raw, conversationId, conv.userId)
+    const nr = await createTgReadTasks(raw, conversationId, conv.userId, chain + 1)
     if (nr === -1) {
       await db.message
         .create({

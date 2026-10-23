@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server'
 import { requireAuth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
-import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
+import { DEFAULT_CHAT_MODEL, MIDDLE_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { createAnswerStreamFilter } from '@/lib/agent/answer'
 import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
@@ -282,7 +282,8 @@ export async function POST(req: NextRequest) {
     webSearch = body.webSearch === undefined ? true : Boolean(body.webSearch)
     // whitelist: only the free chat models are selectable from the UI
     const requested = String(body.model || '').trim()
-    if (requested === DEFAULT_CHAT_MODEL || requested === FALLBACK_CHAT_MODEL) model = requested
+    if (requested === DEFAULT_CHAT_MODEL || requested === MIDDLE_CHAT_MODEL || requested === FALLBACK_CHAT_MODEL)
+      model = requested
     effort = body.effort === 'high' ? 'high' : 'max'
     conversationId = String(body.conversationId || '').trim()
   } catch {

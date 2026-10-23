@@ -7,7 +7,15 @@
  * and is now the default; it's a thinking model, briefly overloaded at times). */
 export const DEFAULT_CHAT_MODEL = process.env.ZAI_MODEL || 'glm-4.7-flash'
 
-/** Automatic fallback when the primary model is overloaded. */
+/** T52c (owner report 2026-10-23: «писание 3-летнего малыша: GLM-4.5-Flash»):
+ * when 4.7-flash is overloaded the chain used to drop straight to the WEAKEST
+ * free model (4.5-flash) — messages it writes read like a toddler's. The free
+ * Flash line also has glm-4.6-flash (itsfree.ai, verified 2026-09): newer
+ * generation than 4.5, now the MIDDLE rung so the quality floor is higher.
+ * 4.5-flash stays only as the last resort. */
+export const MIDDLE_CHAT_MODEL = 'glm-4.6-flash'
+
+/** Last-resort free model (weakest of the Flash line). */
 export const FALLBACK_CHAT_MODEL = 'glm-4.5-flash'
 
 /** Official OpenAI-compatible endpoint (international Z.ai / mainland Zhipu). */

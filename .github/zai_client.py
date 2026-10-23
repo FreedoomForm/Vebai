@@ -2,10 +2,13 @@
 """Minimal Z.ai (GLM) client for the vebai agent runner.
 
 Mirrors the site's src/lib/zai.ts: official OpenAI-compatible endpoint,
-glm-4.7-flash primary + glm-4.5-flash fallback, retry/backoff on 429/5xx
-and the known Zhipu overload codes. Key-free web search (Bing RSS primary,
-DuckDuckGo lite fallback) and a page reader are included so the agent can
-look things up without burning LLM tokens.
+free-Flash chain glm-4.7-flash -> glm-4.6-flash -> glm-4.5-flash (T52c: the
+old two-model chain jumped straight from 4.7 to the WEAKEST 4.5 when 4.7 was
+overloaded and its messages read like a toddler wrote them; 4.6-flash is the
+new middle rung), retry/backoff on 429/5xx and the known Zhipu overload codes.
+Key-free web search (Bing RSS primary, DuckDuckGo lite fallback) and a page
+reader are included so the agent can look things up without burning LLM
+tokens.
 """
 import html as _html
 import json
@@ -20,7 +23,15 @@ BASE_URL = (os.environ.get("ZAI_BASE_URL") or
             "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
 API_KEY = os.environ.get("ZAI_API_KEY") or ""
 PRIMARY_MODEL = os.environ.get("ZAI_MODEL") or "glm-4.7-flash"
-FALLBACK_MODEL = "glm-4.5-flash"
+MIDDLE_MODEL = "glm-4.6-flash"   # T52c: newer-generation free fallback
+FALLBACK_MODEL = "glm-4.5-flash"  # last resort (weakest of the free line)
+
+# T52c: (model, timeout_s, attempts) tried in order, strongest first.
+MODEL_PLAN = [
+    (PRIMARY_MODEL, 45, 2),
+    (MIDDLE_MODEL, 90, 2),
+    (FALLBACK_MODEL, 120, 2),
+]
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
@@ -50,13 +61,18 @@ def _retryable(status: int, body: str) -> bool:
 def chat(messages, temperature: float = 0.3, max_tokens: int = 4000):
     """One chat completion with retries + model fallback -> (text, model).
 
-    Primary (glm-4.7-flash) is a thinking model that occasionally hangs:
-    give it short timeouts so the agent never stalls; the fallback
-    (glm-4.5-flash) is fast and stable."""
+    Free-Flash chain, strongest first (T52c): glm-4.7-flash (thinking, may be
+    briefly overloaded) -> glm-4.6-flash -> glm-4.5-flash (last resort)."""
     if not API_KEY:
         raise ZaiError("ZAI_API_KEY не задан (добавь secret ZAI_API_KEY в репозиторий)")
     last = ""
-    plan = [(PRIMARY_MODEL, 45, 2), (FALLBACK_MODEL, 120, 3)]
+    # dedupe while keeping order (ZAI_MODEL may equal one of the fallbacks)
+    seen = set()
+    plan = []
+    for entry in MODEL_PLAN:
+        if entry[0] not in seen:
+            seen.add(entry[0])
+            plan.append(entry)
     for model, tmo, attempts in plan:
         for attempt in range(attempts):
             try:

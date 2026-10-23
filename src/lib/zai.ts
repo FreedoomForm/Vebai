@@ -7,16 +7,18 @@
  * no captchas — the key stays server-side and every user shares the
  * owner's free-model quota.
  *
- * Models (free on this platform):
+ * Models (free on this platform, T52c chain — strongest first):
  *   - glm-4.7-flash  — default (ZAI_MODEL), a thinking model (owner request)
- *   - glm-4.5-flash  — automatic fallback when 4.7-flash is overloaded
+ *   - glm-4.6-flash  — middle rung when 4.7-flash is overloaded (T52c: 4.5
+ *                      alone wrote toddler-grade messages, owner report)
+ *   - glm-4.5-flash  — last resort
  * Image generation: cogview-3-flash (free) via ZAI_IMAGE_MODEL.
  *
  * Web tools (web_search / page_reader) remain key-free (Bing RSS + DDG +
  * direct page fetch) so search works even without an API key.
  */
 
-import { DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL, DEFAULT_IMAGE_MODEL } from './zai-config'
+import { DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL, MIDDLE_CHAT_MODEL, FALLBACK_CHAT_MODEL, DEFAULT_IMAGE_MODEL } from './zai-config'
 
 export interface ZaiConfig {
   baseUrl: string
@@ -33,10 +35,12 @@ function config(): ZaiConfig {
   return { baseUrl, apiKey }
 }
 
-/** Chat models tried in order when the upstream errors/overloads. */
+/** Chat models tried in order when the upstream errors/overloads (deduped,
+ * strongest first — T52c: the weak tail only fires after the newer model). */
 function chatModels(primaryOverride?: string): string[] {
   const primary = (primaryOverride || DEFAULT_CHAT_MODEL).trim()
   const models = [primary]
+  if (primary !== MIDDLE_CHAT_MODEL) models.push(MIDDLE_CHAT_MODEL)
   if (primary !== FALLBACK_CHAT_MODEL) models.push(FALLBACK_CHAT_MODEL)
   return models
 }
