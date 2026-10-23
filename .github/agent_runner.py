@@ -804,8 +804,9 @@ def run_agent(task, budget_min=None) -> str:
         if answered_only := (answered_now and all(k == "answer" for k, _a, _t in actions[:6]) and not final):
             outputs.append("[СИСТЕМА] ответ доставлен ✅ — пользователь его получил. Дальше решаешь ты: "
                            "продолжай работу действиями (<cmd>/<search>/<read>/<file>…), дай <final> с итоговым "
-                           "отчётом, ИЛИ заверши задачу командой <end></end> (можно с коротким комментарием "
-                           "внутри), если всё сделано и сказано.")
+                           "отчётом, ИЛИ заверши задачу командой <end>краткий пересказ сделанного</end> — "
+                           "внутри тега ОБЯЗАТЕЛЬНО напиши краткий пересказ всего, что сделал в этом запросе "
+                           "(человек увидит его сообщением в Telegram), если всё сделано и сказано.")
 
         history.append({"role": "assistant", "content": reply})
         compact(history)
@@ -841,12 +842,33 @@ def run_agent(task, budget_min=None) -> str:
     # the final batch so the user never receives the same file twice.
     # T49: an <end> without a co-present <final> still leaves the user a
     # short honest closing line (the <end> body, or a default one).
+    # T51 (owner request 2026-10-23): the <end> body MUST be a SHORT RECAP of
+    # everything the agent did in THIS request — the user sees exactly that
+    # message when opening the Telegram bot chat. An empty <end> gets ONE
+    # corrective model turn asking for the recap; if that fails too, the
+    # honest default line still closes the task.
     if ended and not (final_text or ""):
         if final and final.strip():
             final_text = final.strip()  # <final> + <end> in the same reply
         else:
-            close = end_note if end_note else "✅ Готово — работа завершена."
-            final_text = "<answer>" + close[:2000] + "</answer>"
+            close = end_note if end_note else ""
+            if not close and len(history) > 1:
+                try:
+                    r, _ = zai_client.chat(
+                        [{"role": "system", "content": system}] + history[-8:] +
+                        [{"role": "user", "content":
+                          "[СИСТЕМА] ты завершил задачу командой <end>, но не написал пересказ. "
+                          "Напиши КРАТКИЙ пересказ (2-5 предложений) всего, что ты сделал в ЭТОЙ задаче: "
+                          "что именно сделал, что получилось, какие файлы/сообщения доставил пользователю. "
+                          "Ответь ТОЛЬКО текстом пересказа — без тегов, без приветствий."}],
+                        temperature=0.2, max_tokens=700)
+                    close = RE_THINK.sub("", r or "")
+                    close = re.sub(r"<[^>\n]{1,60}>", " ", close)  # strip stray tags
+                    close = re.sub(r"\s+", " ", close).strip()
+                except Exception:
+                    close = ""
+            final_text = "<answer>" + ("✅ " + close[:2000] if close
+                                       else "✅ Готово — работа завершена.") + "</answer>"
     if delivered_files:
         final_text = dedup_final_files(final_text, delivered_files)
     final_text, send_files_ok = format_guard(final_text, system, history, started_ts, send_files_ok, delivered_files)
