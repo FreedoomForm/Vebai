@@ -77,6 +77,16 @@ const RETRY_DELAYS_MS: readonly number[] = (
   .map((s) => Number(s.trim()))
   .filter((n) => Number.isFinite(n) && n >= 0)
 
+/** T54 (owner request 2026-10-23: «повторяем запрос бесконечный раз, пока не
+ * придёт ответ от искусственного интеллекта»): the number of full retry
+ * ROUNDS (per-model attempts AND full model-chain cycles). 0 = бесконечно —
+ * the loop only stops on SUCCESS or on a PERMANENT error (bad request / bad
+ * key — retrying those can never succeed). Set ZAI_MAX_ROUNDS="N" for tests
+ * and ops to bound the loop. Backoff caps at the last schedule entry (6.5s,
+ * jittered, Retry-After honored up to 15s), so infinite mode costs ~9/min
+ * per model and never hammers the upstream. */
+const MAX_ROUNDS = Math.max(0, Math.floor(Number(process.env.ZAI_MAX_ROUNDS) || 0))
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 function jitter(base: number): number {
@@ -114,6 +124,22 @@ function isRetryableException(e: unknown): boolean {
   return /timeout|abort|network|ECONNRESET|ETIMEDOUT|socket|fetch failed/i.test(msg)
 }
 
+/** chain-worthy = overload/limit-style failure — worth trying the next model
+ * of the chain (or another full-chain round). Anything else (bad request,
+ * bad key) is PERMANENT and fails fast even in the infinite-retry mode. */
+function chainWorthyError(msg: string): boolean {
+  return (
+    isRetryableError(Number(msg.match(/^(\d{3}):/)?.[1] || 0), msg) ||
+    /rate|нагрузк|перегруж|调用过高|算力|timeout|abort|fetch failed/i.test(msg) ||
+    /bad JSON/.test(msg)
+  )
+}
+
+/** did the round budget run out after this attempt? 0 = infinite (T54) */
+function roundsExhausted(attempt: number): boolean {
+  return MAX_ROUNDS > 0 && attempt + 1 >= MAX_ROUNDS
+}
+
 export interface RetryStats {
   attempts: number
   retries: number
@@ -122,28 +148,33 @@ export interface RetryStats {
 
 /** Run `fn` for one model with the retry/backoff policy. `fn` returns either
  * `{ok:true,value}` or `{ok:false,status,payload,res}`; network exceptions are
- * retried too. Throws the last error once the schedule is exhausted. */
+ * retried too. T54: the loop is INFINITE for retryable failures (owner order:
+ * keep asking until the AI answers) — it throws only on permanent errors or
+ * when ZAI_MAX_ROUNDS bounds the rounds. */
 async function withModelRetries<T>(
   fn: (attempt: number, lastRes?: Response) => Promise<{ ok: true; value: T } | { ok: false; status: number; payload: string; res?: Response }>,
   onRetry?: (info: { attempt: number; delayMs: number; status: number | 'network'; payload: string }) => void,
 ): Promise<T> {
   let lastErr: Error | null = null
-  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     try {
       const r = await fn(attempt)
       if (r.ok) return r.value
       const retryable = isRetryableError(r.status, r.payload)
       lastErr = new Error(`${r.status}: ${r.payload.slice(0, 300)}`)
-      if (!retryable || attempt === RETRY_DELAYS_MS.length) throw lastErr
+      if (!retryable) throw lastErr
+      if (roundsExhausted(attempt)) throw lastErr
       const delay = backoffMs(attempt, r.res)
       onRetry?.({ attempt, delayMs: delay, status: r.status, payload: r.payload.slice(0, 160) })
       await sleep(delay)
     } catch (e) {
       // a thrown non-Error from fn means it already decided to give up
       if (e instanceof Error && lastErr === e) throw e
-      if (!isRetryableException(e) || attempt === RETRY_DELAYS_MS.length) throw e
+      if (!isRetryableException(e)) throw e
+      lastErr = e instanceof Error ? e : new Error(String(e))
+      if (roundsExhausted(attempt)) throw lastErr
       const delay = backoffMs(attempt)
-      onRetry?.({ attempt, delayMs: delay, status: 'network', payload: (e as Error).message.slice(0, 160) })
+      onRetry?.({ attempt, delayMs: delay, status: 'network', payload: lastErr.message.slice(0, 160) })
       await sleep(delay)
     }
   }
@@ -176,39 +207,44 @@ export interface ChatCompletion {
 
 async function officialComplete(cfg: ZaiConfig, body: ChatBody): Promise<ChatCompletion> {
   let lastError = ''
-  for (const model of chatModels(body.model)) {
-    try {
-      return await withModelRetries(async () => {
-        const res = await post(cfg, '/chat/completions', {
-          model,
-          messages: body.messages,
-          stream: false,
-          temperature: body.temperature,
-          max_tokens: body.max_tokens,
-          thinking: body.thinking || { type: 'disabled' },
-        })
-        const text = await res.text()
-        if (res.ok) {
-          try {
-            return { ok: true as const, value: JSON.parse(text) as ChatCompletion }
-          } catch {
-            // undecodable 200 answer — pointless on the same model
-            throw new Error(`bad JSON from ${model}: ${text.slice(0, 160)}`)
+  const models = chatModels(body.model)
+  // T54: full-chain rounds repeat INFINITELY (default) until a model answers;
+  // permanent errors break out immediately — retrying them can never succeed.
+  for (let round = 0; ; round++) {
+    for (const model of models) {
+      try {
+        return await withModelRetries(async () => {
+          const res = await post(cfg, '/chat/completions', {
+            model,
+            messages: body.messages,
+            stream: false,
+            temperature: body.temperature,
+            max_tokens: body.max_tokens,
+            thinking: body.thinking || { type: 'disabled' },
+          })
+          const text = await res.text()
+          if (res.ok) {
+            try {
+              return { ok: true as const, value: JSON.parse(text) as ChatCompletion }
+            } catch {
+              // undecodable 200 answer — pointless on the same model
+              throw new Error(`bad JSON from ${model}: ${text.slice(0, 160)}`)
+            }
           }
+          return { ok: false as const, status: res.status, payload: text, res }
+        })
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e)
+        // keep walking the chain only for overload/limit-style failures
+        // (status codes, known wording, or network timeouts)
+        if (!chainWorthyError(lastError)) {
+          throw new Error(`Z.ai chat/completions не удалось: ${lastError}`)
         }
-        return { ok: false as const, status: res.status, payload: text, res }
-      })
-    } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e)
-      // keep walking the chain only for overload/limit-style failures
-      // (status codes, known wording, or network timeouts)
-      const chainWorthy =
-        isRetryableError(Number(lastError.match(/^(\d{3}):/)?.[1] || 0), lastError) ||
-        /rate|нагрузк|перегруж|调用过高|算力|timeout|abort|fetch failed/i.test(lastError) ||
-        /bad JSON/.test(lastError)
-      if (!chainWorthy) break
-      // overloaded / rate-limited after all retries — try the next model
+        // overloaded / rate-limited after all retries — try the next model
+      }
     }
+    if (roundsExhausted(round)) break
+    await sleep(jitter(5000))
   }
   throw new Error(`Z.ai chat/completions не удалось: ${lastError}`)
 }
@@ -247,43 +283,51 @@ export async function officialStream(
     return { status: res.status, payload: text, res } as const
   }
 
-  // resolve the first working model (with per-model retry/backoff), then stream
-  let upstream: Response | null = null
+  // resolve the first working model (with per-model retry/backoff), then
+  // stream. T54: full-chain rounds repeat INFINITELY (default) until a model
+  // answers; permanent errors fail fast. This also fixes an old latent bug:
+  // the thrown error never carried `.retryable`, so the fallback models were
+  // silently skipped — now the chain is walked via chainWorthyError.
   let lastError: Error | null = null
-  for (const model of chatModels(body.model)) {
-    try {
-      upstream = await withModelRetries(async () => {
-        const r = await tryModelOnce(model)
-        if (r instanceof Response) return { ok: true as const, value: r }
-        return { ok: false as const, status: r.status, payload: r.payload, res: r.res }
-      })
-      // stash the model name for the first SSE payload
-      const src = upstream.body as ReadableStream<Uint8Array>
-      return new ReadableStream<Uint8Array>({
-        async start(controller) {
-          // announce which model is answering (useful for debugging/fallback)
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ model_used: model })}\n\n`))
-          const reader = src.getReader()
-          try {
-            for (;;) {
-              const { done, value } = await reader.read()
-              if (done) break
-              controller.enqueue(value)
+  const models = chatModels(body.model)
+  for (let round = 0; ; round++) {
+    for (const model of models) {
+      try {
+        const upstream = await withModelRetries(async () => {
+          const r = await tryModelOnce(model)
+          if (r instanceof Response) return { ok: true as const, value: r }
+          return { ok: false as const, status: r.status, payload: r.payload, res: r.res }
+        })
+        // stash the model name for the first SSE payload
+        const src = upstream.body as ReadableStream<Uint8Array>
+        return new ReadableStream<Uint8Array>({
+          async start(controller) {
+            // announce which model is answering (useful for debugging/fallback)
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ model_used: model })}\n\n`))
+            const reader = src.getReader()
+            try {
+              for (;;) {
+                const { done, value } = await reader.read()
+                if (done) break
+                controller.enqueue(value)
+              }
+            } finally {
+              reader.releaseLock()
+              controller.close()
             }
-          } finally {
-            reader.releaseLock()
-            controller.close()
-          }
-        },
-        cancel() {
-          void upstream?.body?.cancel().catch(() => {})
-        },
-      })
-    } catch (e) {
-      lastError = e as Error
-      const retryable = (e as { retryable?: boolean }).retryable
-      if (!retryable) break
+          },
+          cancel() {
+            void upstream.body?.cancel().catch(() => {})
+          },
+        })
+      } catch (e) {
+        lastError = e as Error
+        if (!chainWorthyError(lastError?.message || '')) throw lastError
+        // overloaded / rate-limited after all retries — try the next model
+      }
     }
+    if (roundsExhausted(round)) break
+    await sleep(jitter(5000))
   }
   throw new Error(
     `Z.ai chat/completions (stream) не удалось: ${lastError?.message?.slice(0, 300) || 'нет доступных моделей'}`,

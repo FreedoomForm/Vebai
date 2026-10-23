@@ -196,6 +196,44 @@ RE_SEND_CLAIM = re.compile(
 # one JSON line; ok:true = delivered).
 RE_TG_SEND_OK = re.compile(r'"ok"\s*:\s*true')
 
+# ------------------------------------------------------ T54: report guard
+# Owner request 2026-10-23: what the OWNER sees must be a REPORT of what was
+# done — «Отвечал Mirsaid (chat id: …) на сообщение «…». Ответ: «…»» — NOT a
+# copy of the text sent to the correspondent. The runner tracks every text
+# actually delivered to other people ($TG send via <cmd>, <send> to a person);
+# when the final <answer> duplicates one of them, report_guard gets ONE
+# corrective round to rewrite it as a proper report.
+SENT_TEXTS: list = []  # normalized texts delivered to correspondents (this task)
+
+
+def norm_txt(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _loose(s: str) -> str:
+    """strip the leading ✅/punctuation the runner or model may prepend"""
+    return s.lstrip("✅☑✔→-—:;,.;!? ").strip()
+
+
+def track_tg_send(cmd: str, outp: str) -> None:
+    """record the text a successful `$TG send/sendfile` actually delivered
+    (the last quoted argument of the command, >=16 chars)."""
+    if not re.search(r'(\$TG|tg\.js)', cmd) or not re.search(r'\bsend(file)?\b', cmd):
+        return
+    if not RE_TG_SEND_OK.search(outp or ""):
+        return
+    # proper left-to-right quoted pairs (the greedy [^"\n]{16,} cross-pairs
+    # the "$TG" quotes with the message quotes and misses the real text)
+    quotes = [q for q in re.findall(r'"([^"]*)"', cmd) if len(norm_txt(q)) >= 16]
+    if quotes:
+        SENT_TEXTS.append(norm_txt(quotes[-1]))
+
+
+def track_send(to: str, body: str, ok: bool) -> None:
+    """record a successful <send> text delivered to a person (not the owner)."""
+    if ok and (to or "").strip().lower() != "owner" and len(norm_txt(body)) >= 16:
+        SENT_TEXTS.append(norm_txt(body))
+
 MAX_SEND_BYTES = 3_400_000   # per request: Vercel body limit ~4.5MB base64-encoded
 
 
@@ -530,6 +568,53 @@ def truth_guard(final_text: str, system: str, history: list, send_files_ok: int,
 # The truth guard below still guarantees file-claims honesty.
 
 
+def report_problem(final_text: str) -> str:
+    """the copy-defect description when the final <answer> duplicates a text
+    already delivered to a correspondent; '' when clean."""
+    answers = [m.group(1).strip() for m in RE_ANSWER.finditer(final_text or "") if m.group(1).strip()]
+    for a in answers:
+        na = norm_txt(a)
+        if len(na) >= 16 and any(_loose(na) == _loose(s) for s in SENT_TEXTS):
+            return "<answer> — это КОПИЯ текста, отправленного собеседнику, а не отчёт владельцу"
+    return ""
+
+
+def report_guard(final_text: str, system: str, history: list) -> str:
+    """T54 (owner request 2026-10-23: «чтобы он именно говорил мне то что хотел,
+    типа отчёт давал, а не просто слова которые он сам сказал»): when the final
+    <answer> is an exact copy of a text already delivered to a correspondent,
+    ONE corrective round rewrites it as a proper owner-facing report
+    («Отвечал Mirsaid (chat id: …) на сообщение «…». Ответ: «…»»).
+    Same shape as truth_guard/refusal_guard — NOT the removed T35 format retry:
+    it fires only on the mechanical copy-defect, never on style."""
+    final_text = (final_text or "").strip()
+    if not SENT_TEXTS or not final_text:
+        return final_text
+    if not report_problem(final_text):
+        return final_text
+    history.append({"role": "user", "content":
+        ("[СИСТЕМА] ПРОВЕРКА ОТЧЁТА: твой <answer> — это КОПИЯ текста, который ты отправил собеседнику, "
+         "а не отчёт владельцу. Текст для собеседника уже доставлен ($TG/<send>) — в <answer> он не нужен. "
+         "Напиши в <answer> ОТЧЁТ ВЛАДЕЛЬЦУ о сделанном: кому ответил, на какое сообщение, чем именно. "
+         "Одобренный владельцем формат отчёта: «Отвечал Mirsaid (chat id: 7660731569) на сообщение "
+         "«Juma ayyomlarin bilan». Ответ: «Juma ayyomlarin bilan! …»» — то есть КОМУ, НА ЧТО и ЧЕМ ответил. "
+         "Дай новый <final> с отчётом в <answer> (ничего повторно не отправляй).")})
+    try:
+        reply, _ = zai_client.chat(
+            [{"role": "system", "content": system}] + history,
+            temperature=0.2, max_tokens=2500)
+    except Exception:
+        return final_text
+    final3, actions3 = parse_actions(reply)
+    end_body = next((arg for kind, arg, _t in actions3 if kind == "end"), None)
+    final2 = (final3 or (end_body or "").strip() or strip_protocol_tags(reply) or "").strip()
+    if not final2:
+        return final_text
+    if not report_problem(final2):
+        return final2
+    return final_text
+
+
 def refusal_guard(final_text: str, tg_available: bool, task_text: str,
                   system: str, history: list) -> tuple:
     """T52b (owner field report 2026-10-23): the agent must EXPLORE its tools
@@ -786,6 +871,7 @@ def run_agent(task, budget_min=None) -> str:
                 same_cmd_runs = same_cmd_runs + 1 if sig == last_cmd_sig else 1
                 last_cmd_sig = sig
                 rc, dt, outp = run_bash(arg, tmo)
+                track_tg_send(arg, outp)  # T54: remember texts actually delivered
                 outputs.append(f"$ {arg[:400]}\n(exit {rc}, {dt} c)\n{outp or '(пустой вывод)'}")
                 # T52b: the Telegram app delivering a message/file IS an honest
                 # delivery - count it so the truth guard never nags a real DM reply
@@ -808,6 +894,7 @@ def run_agent(task, budget_min=None) -> str:
                 outp, ok, n = do_send(to, fpath, body)
                 if ok and n:
                     send_files_ok += n
+                track_send(to, body, ok)  # T54: remember texts actually delivered
                 outputs.append(outp)
                 heartbeat()
             elif kind == "answer":
@@ -912,6 +999,10 @@ def run_agent(task, budget_min=None) -> str:
     # final then goes through the file-claims truth guard as usual.
     final_text, guard_tg = refusal_guard(final_text, bool(tg_path), task, system, history)
     tg_ok += guard_tg
+    # T54: the owner must see a REPORT (кому/на что/чем ответил), not the raw
+    # text the agent sent to the correspondent — one corrective rewrite when
+    # the final <answer> duplicates a delivered text.
+    final_text = report_guard(final_text, system, history)
     final_text = truth_guard(final_text, system, history, send_files_ok, tg_ok)
     if ended and end_note and end_note.strip():
         memory_append(end_note, "end")

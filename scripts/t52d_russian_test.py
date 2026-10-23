@@ -28,8 +28,10 @@ ag = read(".github/AGENT.md")
 pm = read("src/lib/agent/prompt.ts")
 inc = read("src/app/api/tg/incoming/route.ts")
 
-# --- 1. runner AGENT.md v12: hard Russian-only rule on every writing surface
-check("AGENT.md bumped to v12", "мозг Vebai Agent (v12" in ag)
+# --- 1. runner AGENT.md v13 (v12 было в T52d; v13 = T54 «отчёт вместо копии»):
+# hard Russian-only rule stays on every writing surface
+check("AGENT.md bumped to v13 (правило T52d сохранено)",
+      "мозг Vebai Agent (v13" in ag and "ЯЗЫК — ТОЛЬКО РУССКИЙ" in ag)
 check("AGENT.md: hard rule «ЯЗЫК — ТОЛЬКО РУССКИЙ»",
       "ЯЗЫК — ТОЛЬКО РУССКИЙ" in ag and "всегда НА РУССКОМ" in ag)
 check("AGENT.md: rule covers answers + end recaps + memory + messages to people",
@@ -53,8 +55,9 @@ check("prompt.ts: handwriting keeps owner style but not language",
       "но по-русски" in pm)
 check("prompt.ts: broken-Uzbek anti-example kept", "Йакшимисан? Хаммаси яхшимисан?" in pm)
 
-# --- 3. bot DM task prompt (tg/incoming): v12 + Russian rule
-check("incoming: rules bumped to v12", "Правила обработки входящего (v12)" in inc)
+# --- 3. bot DM task prompt (tg/incoming): v13 (v12 было в T52d) + Russian rule
+check("incoming: rules bumped to v13 (русское правило сохранено)",
+      "Правила обработки входящего (v13)" in inc and "ВСЕГДА РУССКИЙ" in inc)
 check("incoming: ПОЧЕРК pins Russian",
       "ЯЗЫК ОТВЕТА — ВСЕГДА РУССКИЙ" in inc and "даже если собеседник пишет по-узбекски" in inc)
 check("incoming: examples no longer copy their language",

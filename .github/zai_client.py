@@ -35,6 +35,13 @@ MODEL_PLAN = [
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
 
+# T54 (owner request 2026-10-23: «повторяем запрос бесконечный раз, пока не
+# придёт ответ»): full model-plan ROUNDS repeat forever (0 = no cap) until a
+# model answers; only PERMANENT errors (bad key/request) raise immediately.
+# ZAI_MAX_ROUNDS bounds the loop for tests/ops; ZAI_ROUND_SLEEP spaces rounds.
+MAX_ROUNDS = max(0, int(os.environ.get("ZAI_MAX_ROUNDS") or 0))
+ROUND_SLEEP = float(os.environ.get("ZAI_ROUND_SLEEP") or 10.0)
+
 
 class ZaiError(Exception):
     pass
@@ -62,7 +69,11 @@ def chat(messages, temperature: float = 0.3, max_tokens: int = 4000):
     """One chat completion with retries + model fallback -> (text, model).
 
     Free-Flash chain, strongest first (T52c): glm-4.7-flash (thinking, may be
-    briefly overloaded) -> glm-4.6-flash -> glm-4.5-flash (last resort)."""
+    briefly overloaded) -> glm-4.6-flash -> glm-4.5-flash (last resort).
+
+    T54 (owner request): the plan cycles INFINITELY (MAX_ROUNDS=0) until a
+    model answers — a transient overload can no longer kill a task; only
+    permanent errors (bad key/request) raise right away."""
     if not API_KEY:
         raise ZaiError("ZAI_API_KEY не задан (добавь secret ZAI_API_KEY в репозиторий)")
     last = ""
@@ -73,30 +84,36 @@ def chat(messages, temperature: float = 0.3, max_tokens: int = 4000):
         if entry[0] not in seen:
             seen.add(entry[0])
             plan.append(entry)
-    for model, tmo, attempts in plan:
-        for attempt in range(attempts):
-            try:
-                d = _post_json(
-                    BASE_URL + "/chat/completions",
-                    {"model": model, "messages": messages, "stream": False,
-                     "temperature": temperature, "max_tokens": max_tokens,
-                     "thinking": {"type": "disabled"}},
-                    key=API_KEY, timeout=tmo)
-                text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                if text.strip():
-                    return text.strip(), model
-                last = "пустой ответ модели"
-            except urllib.error.HTTPError as e:
+    rounds = 0
+    while True:
+        for model, tmo, attempts in plan:
+            for attempt in range(attempts):
                 try:
-                    body = e.read().decode(errors="replace")[:400]
-                except Exception:
-                    body = ""
-                last = f"HTTP {e.code}: {body}"
-                if not _retryable(e.code, body):
-                    raise ZaiError(last)
-            except Exception as e:
-                last = f"{type(e).__name__}: {e}"
-            time.sleep(min(2 ** attempt * 1.5 + 1.0, 15))
+                    d = _post_json(
+                        BASE_URL + "/chat/completions",
+                        {"model": model, "messages": messages, "stream": False,
+                         "temperature": temperature, "max_tokens": max_tokens,
+                         "thinking": {"type": "disabled"}},
+                        key=API_KEY, timeout=tmo)
+                    text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    if text.strip():
+                        return text.strip(), model
+                    last = "пустой ответ модели"
+                except urllib.error.HTTPError as e:
+                    try:
+                        body = e.read().decode(errors="replace")[:400]
+                    except Exception:
+                        body = ""
+                    last = f"HTTP {e.code}: {body}"
+                    if not _retryable(e.code, body):
+                        raise ZaiError(last)
+                except Exception as e:
+                    last = f"{type(e).__name__}: {e}"
+                time.sleep(min(2 ** attempt * 1.5 + 1.0, 15))
+        rounds += 1
+        if MAX_ROUNDS and rounds >= MAX_ROUNDS:
+            break
+        time.sleep(ROUND_SLEEP)
     raise ZaiError("GLM недоступен: " + last[:300])
 
 
