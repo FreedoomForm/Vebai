@@ -1,44 +1,36 @@
 /**
  * T26: POST /api/tg/incoming — the worker reports a fresh incoming private
  * message on a user's account; the site dedupes, logs it and DECIDES what to
- * do about it. The actual sending happens in the worker, and only then
- * /api/tg/sent logs the outgoing message (T21 rule: the log reflects
- * reality, not intentions).
+ * do about it. The actual sending happens in the worker (or by the agent's
+ * own Telegram app), and /api/tg/sent logs the outgoing message (T21 rule:
+ * the log reflects reality, not intentions).
  *
- * T38 (owner request 2026-10-20): the message no longer goes "straight to
- * the AI" for a canned reply — it goes to the AGENT, which weighs its
- * durable memory (memory.md), the recent history of THIS chat and the
- * owner's teaching, and picks the action itself:
- *   reply   -> the worker sends <text> (same contract as before)
- *   ignore  -> nothing is sent (spam / no answer needed)
- *   owner   -> the owner gets a bot notification; the person may get a
- *              polite holding line
- *   approve (T39) -> the agent's reply becomes a DRAFT card in the owner's
- *              bot chat with ✅/✏️/❌; the person gets it only after «✅"
- * At the END of every request the agent silently appends a brief summary of
- * the interaction to memory.md (after() — never delays the reply).
+ * T38..T39 (2026-10-20): the message went to a one-shot agentDecide() model
+ * that picked reply/ignore/owner/approve in a single LLM call.
+ *
+ * T52 (owner request 2026-10-23): NO more "just an AI" answering people.
+ * Every incoming DM now goes to the FULL agent — the one with the computer
+ * (shell, python, files), the Telegram app, web search and the shared
+ * memory. The route composes a DM task (sender + message + last 50 messages
+ * of THIS chat + shared agent memory + the owner's teaching), queues it as a
+ * #!agent task and kicks the worker. The agent replies to the person from
+ * the owner's account via its own Telegram app (node "$TG" send <chat_id>),
+ * escalates delicate questions to the owner via <answer>, and closes with
+ * an <end> recap that lands in the shared memory. Nothing is sent
+ * synchronously here — the HTTP response only acknowledges the queueing.
  */
 import crypto from 'node:crypto'
 import { NextResponse, after } from 'next/server'
 import { db } from '@/lib/db'
-import {
-  agentDecide,
-  createDraft,
-  draftKeyboard,
-  loadAgentContext,
-  parseExamples,
-  readAgentMemory,
-  rememberInteraction,
-  renderDraftMessage,
-  setDraftStatus,
-  type TgDraft,
-} from '@/lib/tguser'
+import { loadAgentContext, parseExamples, rememberInteraction, type TgExample } from '@/lib/tguser'
+import { readMemText } from '@/lib/agent/memory'
+import { agentTick } from '@/lib/agent/worker'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
 const RATE_PER_HOUR = 30
-const HISTORY_TURNS = 12
+const HISTORY_TURNS = 50
 
 function secretOk(s: unknown): boolean {
   const expected = process.env.GH_TERM_SECRET || ''
@@ -49,85 +41,66 @@ function secretOk(s: unknown): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b)
 }
 
-/** bot-cache owner chat (fallback: TELEGRAM_CHAT_ID env) — the escalation
- *  target when the agent hands a conversation back to the owner */
-async function ownerChatId(): Promise<string> {
-  try {
-    const row = await db.studioState.findUnique({ where: { key: 'telegramBot' } })
-    const id = row ? String((JSON.parse(row.data) as { ownerChatId?: string }).ownerChatId || '') : ''
-    if (id) return id
-  } catch { /* fall through */ }
-  return String(process.env.TELEGRAM_CHAT_ID || '')
+/** one-line digest of the queueing for the shared memory */
+function outcomeLine(taskId: string, from: string, text: string): string {
+  return `входящее от ${from || 'неизвестного'}: «${text.slice(0, 120)}» → передано полному агенту (задача ${taskId.slice(-6)} в очереди)`
 }
 
-async function notifyOwner(text: string): Promise<void> {
-  const chatId = await ownerChatId()
-  const token = process.env.TELEGRAM_BOT_TOKEN || ''
-  if (!chatId || !token) return
-  try {
-    const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(0, 3800) }
-    // T50: escalations also carry the full menu (owner request: «верни все
-    // кнопки в телеграм боте») — best-effort, never blocks the send
-    try {
-      const { menuIfUserChat } = await import('@/lib/tgmenu')
-      const kb = await menuIfUserChat(chatId)
-      if (kb) body.reply_markup = kb
-    } catch {
-      /* send without buttons rather than not send at all */
-    }
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(20_000),
-    })
-  } catch { /* best-effort */ }
+/** the DM site conversation (owner-visible log of this chat's agent runs) */
+async function dmConversation(userId: string, chatId: string, chatName: string | null) {
+  const title = `TG-входящие · ${chatName || chatId} (${chatId})`
+  const existing = await db.conversation.findFirst({
+    where: { userId, title },
+    orderBy: { updatedAt: 'desc' },
+  })
+  if (existing) return existing
+  return db.conversation.create({ data: { userId, title } })
 }
 
-/** one-line digest of the decision for the worker logs and for memory.md */
-function outcomeLine(decision: { action: string; text: string }): string {
-  if (decision.action === 'reply') return `ответил от имени владельца: «${decision.text.slice(0, 200)}»`
-  if (decision.action === 'ignore') return 'решил не отвечать (сообщение не требовало ответа)'
-  if (decision.action === 'approve')
-    return `предложил черновик ответа на одобрение владельцу: «${decision.text.slice(0, 200)}»`
-  return `передал вопрос владельцу${decision.text ? `, человеку сказано: «${decision.text.slice(0, 150)}»` : ' (молча)'}`
-}
-
-/** bot sendMessage that returns the created message_id (0 = failed) — draft
- *  cards need the id so the webhook can re-render the card after the owner's
- *  decision (approve / edit / cancel) */
-async function sendBotMessage(
-  chatId: string,
-  text: string,
-  replyMarkup?: Record<string, unknown>,
-): Promise<number> {
-  const token = process.env.TELEGRAM_BOT_TOKEN || ''
-  if (!chatId || !token) return 0
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text.slice(0, 3800),
-        link_preview_options: { is_disabled: true },
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-      }),
-      signal: AbortSignal.timeout(20_000),
-    })
-    const json = (await res.json()) as { ok?: boolean; result?: { message_id?: number } }
-    return json.ok ? Number(json.result?.message_id) || 0 : 0
-  } catch { return 0 }
-}
-
-/** where draft approval cards go: the ACCOUNT owner's own bot chat first
- *  (multi-user correctness), then the bot owner, then the env fallback */
-async function draftTargetChatId(userId: string): Promise<string> {
-  try {
-    const u = await db.user.findUnique({ where: { id: userId } })
-    if (u?.telegramChatId) return u.telegramChatId
-  } catch { /* fall through */ }
-  return ownerChatId()
+/** the #!agent task body the GitHub runner executes with ALL tools */
+function dmTaskPrompt(opts: {
+  chatId: string
+  chatName: string
+  text: string
+  history: string[]
+  memory: string
+  teaching: string
+  configPrompt: string
+  examples: TgExample[]
+}): string {
+  const parts: string[] = []
+  parts.push(
+    `ВХОДЯЩЕЕ ЛИЧНОЕ СООБЩЕНИЕ в Telegram-аккаунт владельца. Ты отвечаешь на него ОТ ИМЕНИ владельца — со всеми своими инструментами (компьютер, Telegram, поиск, память).`,
+    ``,
+    `От: ${opts.chatName || 'Неизвестный'} (chat id: ${opts.chatId})`,
+    `Сообщение: «${opts.text}»`,
+  )
+  if (opts.history.length > 0) {
+    parts.push(
+      ``,
+      `История этого чата (последние ${opts.history.length}, старые → свежие):`,
+      ...opts.history.map((h) => `- ${h}`),
+    )
+  }
+  if (opts.memory) parts.push(``, `# Общая память агента\n${opts.memory}`)
+  if (opts.configPrompt) parts.push(``, `# Настройка владельца (стиль и правила общения)\n${opts.configPrompt}`)
+  if (opts.teaching) parts.push(``, `# Чему владельец учил агента в чате «TG-агент»\n${opts.teaching}`)
+  if (opts.examples.length > 0) {
+    parts.push(``, `ПРИМЕРЫ одобренных владельцем ответов (стиль подстраивай, не копируй дословно):`)
+    for (const e of opts.examples.slice(-8))
+      parts.push(`- ${e.from ? `От ${e.from}: ` : ''}${e.incoming.replace(/\s+/g, ' ').slice(0, 300)}\n  Ответ: ${e.reply.replace(/\s+/g, ' ').slice(0, 500)}`)
+  }
+  parts.push(
+    ``,
+    `## Правила обработки входящего (v9)`,
+    `1. Ответ человеку — ТОЛЬКО через приложение Telegram: node "$TG" send ${opts.chatId} "текст" (коротко, живым языком, от первого лица владельца). НЕ используй <answer> для ответа этому человеку — <answer> уходит только владельцу в его бот-чат.`,
+    `2. Спам или не требует ответа — ничего не отправляй, заверши сразу <end>пересказ</end>.`,
+    `3. Деликатные темы (деньги, обещания, встречи, важные решения) или сомневаешься — человеку НЕ отвечай; сообщи владельцу через <answer> (цитируй вопрос, предложи свой вариант ответа).`,
+    `4. Для ответа нужно что-то сделать (файл, расчёт, поиск, прочитать историю) — сделай инструментами компьютера, проверь результат и только потом отправляй.`,
+    `5. Важные факты (договорённости, имена, предпочтения) — <memory>…</memory>.`,
+    `6. Заверши <end>краткий пересказ: от кого, что сделал, что отправил</end>.`,
+  )
+  return parts.join('\n')
 }
 
 export async function POST(req: Request) {
@@ -162,15 +135,11 @@ export async function POST(req: Request) {
   })
   if (sentCount >= RATE_PER_HOUR) return NextResponse.json({ skip: 'rate' })
 
-  let me: { firstName?: string; username?: string } = {}
-  try { me = JSON.parse(account.meInfo || '{}') } catch { /* ignore */ }
-
-  // the agent's three memory sources, gathered in parallel:
-  // memory.md (durable), the per-chat transcript (DB), the owner's teaching
-  // (site «TG-агент» conversation)
-  const [context, memory, chatRows] = await Promise.all([
+  // the agent's context, gathered in parallel: the per-chat transcript
+  // (T52: last 50 messages), the shared agent memory and the owner's teaching
+  const [memory, teaching, chatRows] = await Promise.all([
+    readMemText().catch(() => ''),
     loadAgentContext(account.userId).catch(() => ''),
-    readAgentMemory(account.userId).catch(() => ''),
     db.tgAgentMessage.findMany({
       where: { accountId, chatId },
       orderBy: { createdAt: 'desc' },
@@ -184,64 +153,44 @@ export async function POST(req: Request) {
   })
 
   try {
-    const decision = await agentDecide(
-      me,
-      account.config?.systemPrompt || '',
-      parseExamples(account.config?.examples),
-      chatName || '',
+    const conv = await dmConversation(account.userId, chatId, chatName)
+    const prompt = dmTaskPrompt({
+      chatId,
+      chatName: chatName || '',
       text,
-      context,
-      memory,
       history,
-    )
+      memory,
+      teaching,
+      configPrompt: account.config?.systemPrompt || '',
+      examples: parseExamples(account.config?.examples),
+    })
+    const task = await db.agentTask.create({
+      data: {
+        conversationId: conv.id,
+        type: 'terminal',
+        title: `📩 ${chatName || chatId}: ${text.replace(/\s+/g, ' ').slice(0, 60)}`,
+        status: 'queued',
+        progress: 'Полный агент (GitHub Actions) возьмёт сообщение в течение минуты: сам решит, ответить человеку, действовать инструментами или позвать владельца',
+        payload: JSON.stringify({ command: `#!agent\n${prompt}`.slice(0, 20_000), terminalId: conv.id, timeoutS: 3600 }),
+      },
+    })
+    // kick the worker immediately (cron would pick it up anyway) — the DM
+    // gets answered in seconds-to-minutes, not at the next 5-min cron beat
+    after(() => agentTick().catch(() => {}))
 
-    // T38: the silent under-the-hood memory write at the END of the request
-    // — runs after the HTTP response, never delays or breaks the decision
+    // silent memory write at the END of the request (never delays the reply):
+    // the interaction digest lands in the shared memory like <memory>/<end>
     after(() =>
-      rememberInteraction(account.userId, chatName || '', text, outcomeLine(decision)).catch(() => {}),
+      rememberInteraction(
+        account.userId,
+        chatName || '',
+        text,
+        outcomeLine(task.id, chatName || '', text),
+      ).catch(() => {}),
     )
 
-    if (decision.action === 'ignore') return NextResponse.json({ skip: 'agent-ignore' })
-
-    if (decision.action === 'owner') {
-      after(() =>
-        notifyOwner(
-          `📩 Входящее от ${chatName || chatId}:\n${text.slice(0, 1200)}\n\n` +
-            `🤖 Агент передал вопрос тебе (сам не стал отвечать).`,
-        ).catch(() => {}),
-      )
-      if (decision.text) return NextResponse.json({ reply: decision.text })
-      return NextResponse.json({ skip: 'agent-owner' })
-    }
-
-    // T39: the agent KNOWS what to answer but wants the owner's blessing —
-    // the reply becomes a draft card in the owner's bot chat (✅/✏️/❌).
-    // The worker sends NOTHING now; the person receives the text only after
-    // «✅» (the webhook then queues a tg_outbox job — the worker delivers).
-    if (decision.action === 'approve') {
-      const target = await draftTargetChatId(account.userId)
-      if (!target) return NextResponse.json({ skip: 'draft-no-target' })
-      const draft: TgDraft = {
-        id: crypto.randomUUID(),
-        chatId,
-        chatName: chatName || '',
-        incoming: text,
-        text: decision.text,
-        ownerChatId: target,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-      }
-      await createDraft(account.id, draft)
-      // inline (not after()): the owner MUST reliably get the card — one
-      // Telegram call fits the worker's 90s HTTP timeout comfortably
-      const msgId = await sendBotMessage(target, renderDraftMessage(draft), draftKeyboard(draft.id))
-      if (msgId) await setDraftStatus(account.id, draft.id, 'pending', { botMsgId: msgId }).catch(() => {})
-      return NextResponse.json({ skip: 'draft-pending' })
-    }
-
-    if (!decision.text) return NextResponse.json({ skip: 'empty-reply' })
-    return NextResponse.json({ reply: decision.text })
+    return NextResponse.json({ skip: 'agent-queued', taskId: task.id })
   } catch (e) {
-    return NextResponse.json({ skip: 'ai-error', error: e instanceof Error ? e.message.slice(0, 200) : 'ошибка ИИ' })
+    return NextResponse.json({ skip: 'queue-error', error: e instanceof Error ? e.message.slice(0, 200) : 'ошибка очереди' })
   }
 }

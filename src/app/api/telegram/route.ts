@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { systemPrompt } from '@/lib/agent/prompt'
-import { parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
+import { parseAiAnswer } from '@/lib/agent/answer'
 import { downloadTgFile, uploadToTelegram } from '@/lib/telegram'
 import { botMenuKb } from '@/lib/tgmenu'
 import { formatBytes } from '@/lib/utils'
@@ -946,30 +946,15 @@ async function chatAnswer(convId: string, q: string): Promise<string> {
     if (c) messages.push({ role: m.role, content: c.slice(0, 6000) })
   }
   try {
-    // T35 (owner request 2026-10-20): the <answer>/<file> protocol is enforced
-    // MECHANICALLY — an empty reply / empty <answer> / untagged text triggers
-    // an AUTOMATIC repeat with a corrective note (up to 2 retries) instead of
-    // showing "(пустой ответ модели)" or the raw unformatted text.
-    const MAX_FORMAT_RETRIES = 2
-    let answer = ''
-    let lastRaw = ''
-    for (let tries = 0; ; tries++) {
-      const cc = await zai.chat.completions({
-        messages,
-        thinking: { type: 'disabled' }, // fast mode: Telegram waits
-      })
-      lastRaw = cc.choices?.[0]?.message?.content || ''
-      const verdict = checkAnswerProtocol(lastRaw)
-      if (verdict.ok) {
-        answer = parseAiAnswer(lastRaw).text
-        break
-      }
-      if (tries >= MAX_FORMAT_RETRIES) break // fall through to the legacy fallback below
-      if (lastRaw.trim()) messages.push({ role: 'assistant', content: lastRaw.slice(0, 1500) })
-      messages.push({ role: 'user', content: formatRetryNote(verdict.reason) })
-    }
-    if (!answer) answer = parseAiAnswer(lastRaw).text
-    if (!answer) answer = '(модель нарушила формат ответа трижды — переспроси, пожалуйста)'
+    // T52: NO format retries — tags are optional everywhere. One call; the
+    // <answer> text is delivered, untagged text is delivered cleaned as-is.
+    const cc = await zai.chat.completions({
+      messages,
+      thinking: { type: 'disabled' }, // fast mode: Telegram waits
+    })
+    const lastRaw = cc.choices?.[0]?.message?.content || ''
+    let answer = parseAiAnswer(lastRaw).text
+    if (!answer) answer = '(пустой ответ — переспроси, пожалуйста)'
     await db.message.create({
       data: { conversationId: convId, role: 'assistant', kind: 'text', content: answer },
     })

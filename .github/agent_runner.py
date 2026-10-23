@@ -16,32 +16,37 @@ commands, search, intermediate notes) never reaches the user. Produced
 files are collected by the executor's post_result (mtime diff of /tmp/ws)
 as before; /api/terminal/gh/result does the parsing/filtering.
 
-T48 (owner request 2026-10-23) - the agent gets THREE INTERNAL APPS for
-deciding ITSELF when to talk, when to work silently and when to hand over
-files (they complement the shell/terminal and the Telegram app):
+T48 (owner request 2026-10-23) - the agent gets INTERNAL APPS for deciding
+ITSELF when to talk and when to hand over files (they complement the
+shell/terminal and the Telegram app):
   1. <answer>...</answer> - CONTACT THE USER, at ANY step (not only inside
      <final>): intermediate result, a problem, an important finding. The
      text is delivered immediately (Telegram + mirrored into the site chat).
   2. <file>name</file> - ATTACH A FILE, at ANY step: the workspace file is
      delivered to the user right away; already-delivered files are deduped
      out of the final batch so nothing arrives twice.
-  3. <work>...</work> - WORK MODE: declare a silent phase
-     ("<work>silent 20m: собираю данные</work>"), a report phase or a
-     status. In silent mode the runner nudges the model to check in when
-     the declared timer expires (or after 30+ min of silence) - the agent
-     owns the decision, the runner enforces the honesty of it.
-T49 (owner request 2026-10-23): the FOURTH app - <end></end> (or
+T49 (owner request 2026-10-23): the STOP app - <end></end> (or
   <end>комментарий</end>). After every delivered <answer>/<file> the model
   gets a delivery receipt and decides ITSELF: keep working OR finish the
   task with <end>. <end> gracefully stops the loop: a <final> in the same
   reply is honoured, otherwise the (optional) <end> body becomes the short
   closing answer.
+T52 (owner request 2026-10-23): three protocol changes:
+  - <work> is REMOVED (the agent just works; contact the user when there
+    is something to say).
+  - NEW <memory>...</memory> - WRITE TO THE SHARED AGENT MEMORY: important
+    facts (user preferences, agreements, names, outcomes) the agent MUST
+    remember; the text is appended to the site's shared memory (visible and
+    editable on the site's memory page) and to the local shift memory.
+  - TAGS ARE OPTIONAL: a reply with no real actions (or only <memory>) is
+    the plain ANSWER and finishes the task. No format retries anywhere.
 
 Protocol (see AGENT.md): the model answers with <cmd to="900">...</cmd>,
 <search>...</search>, <read>...</read>, <send to="owner" file="...">...</send>
-or <final>...</final> blocks. <send> delivers texts/files to a person via the
-Telegram bot right now (the task sender's private chat by default) instead
-of waiting for the end-of-task result batch.
+or <final>...</final> blocks - OR just plain text (the answer). <send>
+delivers texts/files to a person via the Telegram bot right now (the task
+sender's private chat by default) instead of waiting for the end-of-task
+result batch.
 Stdlib only - nothing to install on the runner.
 """
 import json
@@ -86,11 +91,13 @@ RE_FINAL = re.compile(r"<final>([\s\S]*?)</final>", re.I)
 RE_THINK = re.compile(r"<think>[\s\S]*?</think>|<thought>[\s\S]*?</thought>", re.I)
 RE_ANSWER = re.compile(r"<answer>([\s\S]*?)</answer>", re.I)
 RE_FTAG = re.compile(r"<file>([\s\S]*?)</file>", re.I)
-RE_WORK = re.compile(r"<work>([\s\S]*?)</work>", re.I)
+RE_MEMORY = re.compile(r"<memory>([\s\S]*?)</memory>", re.I)
 
 # T48: one combined scanner so actions execute in the order the model wrote
-# them (cmd -> search -> read -> send -> answer -> file -> work -> end are all
-# matched by a single pass, ordered by position in the reply).
+# them (cmd -> search -> read -> send -> answer -> file -> memory -> end are
+# all matched by a single pass, ordered by position in the reply).
+# T52: the <work> slot became <memory> (same group index - the scanner
+# structure is unchanged).
 RE_ACTION = re.compile(
     r"<cmd(?:\s+to\s*=\s*[\"']?(\d+)[\"']?)?\s*>([\s\S]*?)</cmd>"
     r"|<search>([\s\S]*?)</search>"
@@ -98,39 +105,8 @@ RE_ACTION = re.compile(
     r"|<send\b([^>]*?)/?>([\s\S]*?)</send>"
     r"|<answer>([\s\S]*?)</answer>"
     r"|<file>([\s\S]*?)</file>"
-    r"|<work>([\s\S]*?)</work>"
+    r"|<memory>([\s\S]*?)</memory>"
     r"|(<end\s*/>)|<end>([\s\S]*?)</end>", re.I)
-
-SILENT_SOFT_NAG_S = 30 * 60   # durationless silent phase: check-in nudge every 30 min
-MAX_SILENT_NAGS = 2
-
-
-def parse_work(body: str):
-    """T48 <work> body -> (mode, seconds, status).
-    Grammar: '[silent|report] [Nm|Nh] - free-form status for the heartbeat'.
-    The bare tag means 'silent until the final'."""
-    text = " ".join((body or "").split())
-    mode = "silent"
-    m = re.match(r"(silent|report|тихо|молча|фокус|связь|чек-?ин)\b", text, re.I)
-    if m:
-        w = m.group(1).lower()
-        mode = "report" if (w.startswith("report") or w.startswith("чек") or w == "связь") else "silent"
-        text = text[m.end():].strip()
-    secs = 0
-    md = re.search(r"(\d+)\s*(мин|min|m|h|ч|час)", text, re.I)
-    if md:
-        n = int(md.group(1))
-        secs = n * 3600 if md.group(2).lower() in ("h", "ч", "час") else n * 60
-        secs = min(secs, 6 * 3600)
-        text = (text[:md.start()] + " " + text[md.end():]).strip()
-    status = text.lstrip("—–-:· ").strip()
-    return mode, secs, status[:200]
-
-
-def fmt_secs(secs: int) -> str:
-    if secs >= 3600 and secs % 3600 == 0:
-        return "%d ч" % (secs // 3600)
-    return "%d мин" % max(1, secs // 60)
 
 
 def dedup_final_files(final_text: str, delivered: set) -> str:
@@ -142,6 +118,53 @@ def dedup_final_files(final_text: str, delivered: set) -> str:
         kept = [n for n in names if n and n.lower() not in delivered]
         return "<file>" + "\n".join(kept) + "</file>" if kept else ""
     return re.sub(r"<file>([\s\S]*?)</file>", drop, final_text or "", flags=re.I)
+
+
+def memory_append(text: str, source: str) -> bool:
+    """T52: append a note to the SHARED agent memory on the site (visible and
+    editable on the site's memory page). Best-effort: a site outage must not
+    break the task; the note also lands in the local shift memory file."""
+    t = " ".join((text or "").split()).strip()
+    if not t:
+        return False
+    ok = False
+    if SECRET:
+        try:
+            api("/api/agent/memory",
+                {"secret": SECRET, "text": t[:1500], "source": source},
+                timeout=30)
+            ok = True
+        except Exception:
+            ok = False
+    try:
+        with open(MEMORY, "a", encoding="utf-8") as f:
+            f.write("\n[%s] %s" % (source, t[:800]))
+    except OSError:
+        pass
+    return ok
+
+
+def shared_memory() -> str:
+    """T52: fetch the shared agent memory from the site (best-effort)."""
+    if not SECRET:
+        return ""
+    try:
+        r = api("/api/agent/memory", {"secret": SECRET}, timeout=30)
+        return str(r.get("text") or "")[:12000]
+    except Exception:
+        return ""
+
+
+def strip_protocol_tags(text: str) -> str:
+    """T52: remove ALL protocol machinery from a reply, leaving only the
+    visible text (used when the model answers in plain text without tags)."""
+    t = RE_THINK.sub("", text or "")
+    t = re.sub(r"<end\s*/>|<end\b[^>]*>[\s\S]*?</end\s*>", " ", t, flags=re.I)
+    t = re.sub(r"<memory\b[^>]*>[\s\S]*?</memory\s*>", " ", t, flags=re.I)
+    t = re.sub(r"<final\b[^>]*>[\s\S]*?</final\s*>", " ", t, flags=re.I)
+    t = re.sub(r"<(cmd|search|read|send)\b[^>]*>[\s\S]*?</\1\s*>", " ", t, flags=re.I)
+    t = re.sub(r"</?(?:cmd|search|read|send|answer|file|final|end|memory|work)\b[^>]*/?>", " ", t, flags=re.I)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 # T21a truth guard: file names mentioned in the visible answer, and claims
 # that something was already sent/attached (the agent must never say it
@@ -174,8 +197,7 @@ def heartbeat(status: str = "") -> None:
     /api/terminal/gh/progress endpoint, generic payload; the route only
     touches the running command's updatedAt (30-min timeout guard) and the
     session's lastSeenAt (resident redispatch guard). Throttled to one
-    beat per 4 minutes - far below both timeouts. T48: an optional status
-    string (the <work> declaration) rides along as the silent status."""
+    beat per 4 minutes - far below both timeouts."""
     global _last_progress
     now = time.time()
     if now - _last_progress < 240:  # one beat / 4 min is enough
@@ -283,12 +305,11 @@ def run_bash(script: str, timeout: int):
 def parse_actions(reply: str):
     """extract (final_text|None, [action tuples]) from a model reply.
     T48: everything OUTSIDE <final> is scanned in reply order; <answer> and
-    <file> there are IMMEDIATE user-contact actions ('answer'/'mfile'),
-    <work> declares the work mode; inside <final> they stay the final
-    protocol (delivered by the result route as before).
+    <file> there are IMMEDIATE user-contact actions ('answer'/'mfile').
     T49: <end> (any form: <end/>, <end></end>, <end>note</end>) is the
     agent's own STOP command - the loop finishes gracefully after the
-    remaining actions of this reply are executed."""
+    remaining actions of this reply are executed.
+    T52: <memory> writes to the shared agent memory; <work> is gone."""
     reply = RE_THINK.sub("", reply)
     final = None
     rest = reply
@@ -332,8 +353,10 @@ def parse_actions(reply: str):
                 p = line.strip().replace("/tmp/ws/", "").lstrip("./")
                 if p:
                     actions.append(("mfile", p, 60))
-        elif g[8] is not None:  # T48 <work> -> mode declaration
-            actions.append(("work", parse_work(g[8]), 0))
+        elif g[8] is not None:  # T52 <memory> -> write to the shared memory
+            t = g[8].strip()
+            if t:
+                actions.append(("memory", t, 0))
         elif g[9] is not None or g[10] is not None:  # T49 <end> -> stop
             actions.append(("end", (g[10] or "").strip(), 0))
     return final, actions
@@ -477,97 +500,9 @@ def truth_guard(final_text: str, system: str, history: list, send_files_ok: int)
     return final2
 
 
-# --------------------------------------------------- T35: format guard
-# Owner request 2026-10-20: the model used to obey the <answer>/<file>
-# protocol, then started writing "whatever it wants" — untagged finals,
-# empty <answer> fields, files delivered without <file> tags. The final is
-# now verified MECHANICALLY and the answer is AUTO-REPEATED (up to 2
-# corrective round-trips) until the format is right or retries run out.
-# Runs BEFORE the truth guard so honesty checks operate on a tagged final.
-
-def protocol_problems(final_text: str, started_ts: float, delivered: set = None):
-    """mechanical format check of the final. Returns a list of violations.
-    T48: files already delivered mid-task (<file>/<send>) are excluded —
-    the final batch must not re-list them, and their absence is NOT a violation."""
-    delivered = delivered or set()
-    txt = (final_text or "").strip()
-    answers = [m.group(1).strip() for m in RE_ANSWER.finditer(txt) if m.group(1).strip()]
-    problems = []
-    if not txt:
-        problems.append("финал ПУСТ — ответ модели был пустым полем")
-    elif not answers:
-        problems.append("финал БЕЗ обёртки <answer>…</answer> — текст вне тегов пользователю не показывается")
-    else:
-        listed = {m.group(1).strip().lower() for m in RE_FTAG.finditer(txt)}
-        new_files = [(p, _s) for p, _s in list_new_files(started_ts)
-                     if os.path.basename(p).lower() not in delivered]
-        if new_files and not listed:
-            problems.append("в /tmp/ws есть НОВЫЕ файлы (" + ", ".join(p for p, _s in new_files[:5]) +
-                            "), но ни ОДНОГО тега <file> — пользователь их не получит")
-    return problems
-
-
-def format_guard(final_text: str, system: str, history: list, started_ts: float,
-                 send_files_ok: int, delivered: set = None):
-    """T35 auto-repeat: bounce a broken final back to the model with a
-    corrective system note (owner request: «сделай авто повторения задачи,
-    если модель ошиблась и ответила пустым полем»). Up to 2 rounds; each
-    round may execute the model's corrective <cmd>/<send> actions, then
-    demands a proper <final>. Returns (final_text, send_files_ok).
-    T48: files delivered mid-task are excluded from the missing-<file> check."""
-    for _ in range(2):
-        problems = protocol_problems(final_text, started_ts, delivered)
-        if not problems:
-            break
-        history.append({"role": "user", "content":
-            ("[СИСТЕМА] ПРОВЕРКА ФОРМАТА ФИНАЛА (авто-повтор): " + "; ".join(problems) +
-             ". Дай <final> ЗАНОВО по протоколу: весь текст для человека — ТОЛЬКО внутри "
-             "<answer>…</answer> (без служебного текста вне тегов); каждый ИТОГОВЫЙ файл, который "
-             "пользователь должен получить, — отдельным тегом <file>имя</file> (только реально "
-             "существующие файлы из /tmp/ws; промежуточные скрипты и черновики не перечисляй; "
-             "файлов для доставки нет — тегов <file> не ставь).")})
-        heartbeat()
-        try:
-            reply, _ = zai_client.chat(
-                [{"role": "system", "content": system}] + history,
-                temperature=0.2, max_tokens=3000)
-        except Exception:
-            break
-        final2, actions = parse_actions(reply)
-        if actions:
-            outs = []
-            for kind, arg, tmo in actions[:3]:
-                if kind == "cmd":
-                    rc, dt, outp = run_bash(arg, min(tmo, 300))
-                    outs.append(f"$ {arg[:200]}\n(exit {rc}, {dt} c)\n{outp or '(пусто)'}")
-                elif kind == "send":
-                    report, ok, n = do_send(*arg)
-                    if ok and n:
-                        send_files_ok += n
-                    outs.append(report)
-                else:
-                    continue
-            heartbeat()
-            history.append({"role": "assistant", "content": reply})
-            history.append({"role": "user", "content":
-                "=== вывод исправления формата ===\n" + "\n\n".join(outs) +
-                "\n\n[СИСТЕМА] Теперь дай <final> по протоколу: текст в <answer>…</answer>, файлы — <file>."})
-            try:
-                reply2, _ = zai_client.chat(
-                    [{"role": "system", "content": system}] + history,
-                    temperature=0.2, max_tokens=2500)
-                final3, _ = parse_actions(reply2)
-                final2 = final3 or final2
-            except Exception:
-                pass
-        if final2 and final2.strip():
-            final_text = final2
-        elif not (final_text or "").strip():
-            final_text = reply[:3000]  # at least deliver something
-    return final_text, send_files_ok
-
-
-# ---------------------------------------------------------------------- main
+# T35 format guard REMOVED (T52, owner request 2026-10-23): tags are optional
+# now - a plain-text final IS the answer, no mechanical auto-repeat anywhere.
+# The truth guard below still guarantees file-claims honesty.
 
 def list_new_files(since_ts: float) -> list:
     """files created/modified in WS since the task started (for the final note)."""
@@ -649,6 +584,13 @@ def run_agent(task, budget_min=None) -> str:
         + (f"- приложение Telegram: node \"$TG\" help (действует от имени личного аккаунта владельца; как комбинировать с компьютером — см. AGENT.md)\n" if tg_path else "")
         + f"- память смены (итоги прошлых задач):\n{load_memory()}\n"
     )
+    shm = shared_memory()
+    if shm:
+        header += (
+            "# Общая память агента (важное из прошлых задач — видна владельцу на странице «Память»;\n"
+            "# дополняй её тегом <memory>…</memory>):\n"
+            f"{shm}\n"
+        )
     if os.environ.get("AGENT_GUEST"):
         header += (
             "- заказчик — гость из Telegram (не владелец): обращайся нейтрально и вежливо;\n"
@@ -660,13 +602,8 @@ def run_agent(task, budget_min=None) -> str:
     same_cmd_runs = 0
     send_files_ok = 0   # T21a: files actually delivered by successful <send>s
 
-    # T48: three internal apps state — <answer>/<file> deliveries and <work> mode
+    # T48: internal apps state — <answer>/<file> deliveries
     delivered_files = set()     # basenames already handed to the user mid-task
-    work_mode = "auto"          # auto | silent | report
-    work_until = 0.0            # declared silent-timer expiry (0 = no timer)
-    work_started = time.time()  # when the current silent phase began
-    work_secs = 0               # last declared timer (for the nag text)
-    work_nags = 0               # durationless-silence soft nags issued
     # T49: the agent's own STOP command state
     ended = False               # <end> seen — finish after this reply's actions
     end_note = ""               # optional closing line inside <end>…</end>
@@ -685,23 +622,6 @@ def run_agent(task, budget_min=None) -> str:
             final_text = (RE_FINAL.search(reply).group(1).strip()
                           if RE_FINAL.search(reply) else reply[:3000])
             break
-
-        # ---- T48: enforce the declared work mode (contact or extend) -------
-        nag = ""
-        if work_until and time.time() > work_until:
-            nag = ("[СИСТЕМА] истёк объявленный тобой режим <work> (%s): свяжись с пользователем сейчас — "
-                   "<answer>промежуточный итог / проблема / важная находка</answer> — ИЛИ явно продли "
-                   "тихую фазу новым <work>…</work>." % fmt_secs(work_secs))
-            work_until = 0.0
-            work_started = time.time()
-        elif work_mode == "silent" and not work_until \
-                and time.time() - work_started > SILENT_SOFT_NAG_S and work_nags < MAX_SILENT_NAGS:
-            nag = ("[СИСТЕМА] тихий режим длится уже больше 30 минут без ни одного <answer>: дай пользователю "
-                   "короткий <answer> (статус / промежуточный итог) или подтверди тишину новым <work>…</work>.")
-            work_nags += 1
-            work_started = time.time()
-        if nag:
-            history.append({"role": "user", "content": nag})
 
         # ---- ask the model (resilient: one retry, then graceful exit)
         reply = None
@@ -728,6 +648,19 @@ def run_agent(task, budget_min=None) -> str:
             # no directives -> treat the whole reply as the final answer
             final_text = final or reply[:3000].strip()
             break
+
+        # T52: the ONLY non-contact action left is <memory>. A reply that
+        # carries nothing but memory notes plus plain text IS the answer —
+        # persist the memories and deliver the text (tags are optional).
+        if not final and not ended and all(k == "memory" for k, _a, _t in actions):
+            body = strip_protocol_tags(reply)
+            if body:
+                for _k, mtext, _t in actions[:6]:
+                    memory_append(mtext, "memory")
+                final_text = body
+                break
+            # memory-only reply with no visible text: fall through to normal
+            # execution (the [память] feedback goes back, the loop continues)
 
         answered_now = any(k == "answer" for k, _a, _t in actions[:6])
 
@@ -772,23 +705,11 @@ def run_agent(task, budget_min=None) -> str:
                     delivered_files.add(os.path.basename(arg.replace("\\", "/")).lower())
                 outputs.append("[файл → пользователь] " + report)
                 heartbeat()
-            elif kind == "work":
-                # T48 app #3: declare the work mode (silent | report + timer + status)
-                mode, secs, status = arg
-                work_mode = mode
-                work_secs = secs
-                work_started = time.time()
-                work_until = work_started + secs if secs else 0.0
-                work_nags = 0
-                _last_progress = 0.0  # a fresh <work> declaration always beats
-                heartbeat(f"работаю: {status}" if status else "работаю")
-                bits = ["report — связывайся <answer> каждый ход" if mode == "report"
-                        else "silent — работай молча"]
-                if secs:
-                    bits.append("таймер %s, потом обязательная связь или продление" % fmt_secs(secs))
-                if status:
-                    bits.append("статус: %s" % status)
-                outputs.append("[режим работы] " + "; ".join(bits))
+            elif kind == "memory":
+                # T52: WRITE to the shared agent memory (site page «Память» +
+                # local shift memory). Non-blocking, honest feedback.
+                outputs.append("[память] " + ("✅ записано в общую память" if memory_append(arg, "memory")
+                                              else "❌ сайт недоступен — сохранил только локально"))
             elif kind == "end":
                 # T49 app #4: FINISH the task on the agent's own decision
                 # (it already delivered its answers/files and considers the
@@ -798,9 +719,6 @@ def run_agent(task, budget_min=None) -> str:
                 outputs.append("[режим] команда <end>: завершаю работу" +
                                (" — " + end_note[:200] if end_note else ""))
 
-        if work_mode == "report" and not final and not ended and not answered_now:
-            outputs.append("[СИСТЕМА] включён режим <work>report</work>: пользователь ждёт короткий <answer> — "
-                           "следующим ходом свяжись с ним (1-2 предложения о прогрессе).")
         if answered_only := (answered_now and all(k == "answer" for k, _a, _t in actions[:6]) and not final):
             outputs.append("[СИСТЕМА] ответ доставлен ✅ — пользователь его получил. Дальше решаешь ты: "
                            "продолжай работу действиями (<cmd>/<search>/<read>/<file>…), дай <final> с итоговым "
@@ -835,9 +753,6 @@ def run_agent(task, budget_min=None) -> str:
     # T21a: before anything leaves the runner, the final is checked against
     # reality — the agent either creates the promised file or the user gets
     # an honest system note instead of a phantom "created and sent".
-    # T35: the final must follow the <answer>/<file> protocol — a broken one
-    # (empty field / no <answer> / files without <file>) is AUTO-REPEATED with
-    # a corrective note before the honesty check runs.
     # T48: files already delivered mid-task (<file>/<send>) are dropped from
     # the final batch so the user never receives the same file twice.
     # T49: an <end> without a co-present <final> still leaves the user a
@@ -847,6 +762,8 @@ def run_agent(task, budget_min=None) -> str:
     # message when opening the Telegram bot chat. An empty <end> gets ONE
     # corrective model turn asking for the recap; if that fails too, the
     # honest default line still closes the task.
+    # T52: NO format retries anymore (tags are optional). The <end> recap is
+    # also appended to the SHARED agent memory (source 'end').
     if ended and not (final_text or ""):
         if final and final.strip():
             final_text = final.strip()  # <final> + <end> in the same reply
@@ -871,8 +788,9 @@ def run_agent(task, budget_min=None) -> str:
                                        else "✅ Готово — работа завершена.") + "</answer>"
     if delivered_files:
         final_text = dedup_final_files(final_text, delivered_files)
-    final_text, send_files_ok = format_guard(final_text, system, history, started_ts, send_files_ok, delivered_files)
     final_text = truth_guard(final_text, system, history, send_files_ok)
+    if ended and end_note and end_note.strip():
+        memory_append(end_note, "end")
     save_memory(task, final_text)
     return final_text or "(агент закончил без финального ответа)"
 

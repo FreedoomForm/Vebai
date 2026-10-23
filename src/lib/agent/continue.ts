@@ -18,7 +18,8 @@ import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { createOutboxTasks, createTgReadTasks } from '@/lib/agent/outbox'
-import { parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
+import { parseAiAnswer } from '@/lib/agent/answer'
+import { readMemText } from '@/lib/agent/memory'
 
 const MAX_CHAIN = 3 // read -> continue -> read -> continue -> read -> continue
 const HISTORY_MESSAGES = 14
@@ -82,8 +83,12 @@ export async function continueAfterRead(
     }
     msgs.push(continuation)
 
+    const shm = await readMemText().catch(() => '')
     const sys =
       systemPrompt() +
+      (shm ? `
+
+# Общая память агента\n${shm}` : '') +
       '\n\nСЕЙЧАС — АВТОПРОДОЛЖЕНИЕ: ты выполняешь приказ владельца полностью БЕЗ его участия (он может ничего не писать). Результаты чтения Telegram уже у тебя в последнем сообщении — сразу действуй дальше или отчитайся, если всё сделано.'
 
     const completion = await zai.chat.completions({
@@ -224,8 +229,12 @@ export async function continueAfterTerminal(
     }
     msgs.push(continuation)
 
+    const shm2 = await readMemText().catch(() => '')
     const sys =
       systemPrompt() +
+      (shm2 ? `
+
+# Общая память агента\n${shm2}` : '') +
       '\n\nСЕЙЧАС — АВТОПРОДОЛЖЕНИЕ: ты выполняешь приказ владельца полностью БЕЗ его участия (он может ничего не писать). Реальный вывод команды уже у тебя в последнем сообщении — сразу действуй дальше: исправляй, дополняй или отчитайся, если всё сделано.'
 
     const completion = await zai.chat.completions({
@@ -235,22 +244,8 @@ export async function continueAfterTerminal(
     })
     let raw = String(completion.choices?.[0]?.message?.content || '').trim()
     if (!raw) return
-    // mechanical protocol check with one corrective retry (same as the SSE route)
-    const verdict = checkAnswerProtocol(raw)
-    if (!verdict.ok) {
-      const retry = await zai.chat.completions({
-        messages: [
-          { role: 'system', content: sys },
-          ...msgs,
-          { role: 'assistant', content: raw.slice(0, 1500) },
-          { role: 'user', content: formatRetryNote(verdict.reason) },
-        ],
-        max_tokens: 1800,
-        temperature: 0.3,
-      }).catch(() => null)
-      const raw2 = String(retry?.choices?.[0]?.message?.content || '').trim()
-      if (raw2 && checkAnswerProtocol(raw2).ok) raw = raw2
-    }
+    // T52: NO corrective retry — tags are optional; parseAiAnswer delivers
+    // the <answer> text or the cleaned plain text as-is.
 
     const parsed = parseAiAnswer(raw)
     if (!parsed.text) return

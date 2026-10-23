@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""T35 local unit probe: protocol_problems + format-guard plumbing of
-agent_runner.py (no network, no model calls)."""
+"""T35/T52 local unit probe: parse_actions regression + the T52 protocol
+changes in agent_runner.py (no network, no model calls).
+
+T52 (owner request 2026-10-23): <work> is GONE, <memory> writes to the
+shared memory, tags are optional (a plain-text reply IS the answer) and the
+format auto-repeat machinery (protocol_problems + format_guard) is REMOVED.
+"""
 import os
 import sys
-import time
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".github"))
@@ -18,97 +22,53 @@ def check(name, cond, detail=""):
         fails.append(name)
 
 
-# --- protocol_problems ------------------------------------------------------
-ar.WS = tempfile.mkdtemp(prefix="t35ws_")  # empty workspace
-started = time.time() - 5
-
-p = ar.protocol_problems("", started)
-check("empty final -> 'empty' problem", len(p) == 1 and "ПУСТ" in p[0], p)
-
-p = ar.protocol_problems("Готово, всё сделал", started)
-check("untagged final -> no <answer> problem", len(p) == 1 and "БЕЗ обёртки" in p[0], p)
-
-p = ar.protocol_problems("<final><answer></answer></final>", started)
-check("empty <answer> -> no <answer> problem", len(p) == 1 and "БЕЗ обёртки" in p[0], p)
-
-p = ar.protocol_problems("<answer>Готово: отчёт готов.</answer>", started)
-check("tagged, no files, empty ws -> OK", p == [], p)
-
-# a new file appears in WS -> tagged final without <file> must be flagged
-with open(os.path.join(ar.WS, "otchet.pdf"), "wb") as f:
-    f.write(b"%PDF-1.4 test")
-p = ar.protocol_problems("<answer>Готово: отчёт готов.</answer>", started)
-check("new file + no <file> -> flagged", len(p) == 1 and "<file>" in p[0] and "otchet.pdf" in p[0], p)
-
-p = ar.protocol_problems("<answer>Готово.</answer>\n<file>otchet.pdf</file>", started)
-check("new file + <file> tag -> OK", p == [], p)
-
-p = ar.protocol_problems("<answer>Готово.</answer>\n<file>net_takogo.pdf</file>", started)
-check("file tag only (listed) -> no format problem (honesty is truth_guard's job)", p == [], p)
-
-# --- parse_actions still fine (regression) ----------------------------------
+# --- parse_actions regression ------------------------------------------------
 final, actions = ar.parse_actions("<cmd to='60'>echo hi</cmd>")
 check("parse_actions cmd", final is None and actions and actions[0][0] == "cmd" and actions[0][2] == 60, actions)
 
 final, actions = ar.parse_actions("<final><answer>Ответ</answer><file>a.pdf</file></final>")
 check("parse_actions final", final and "Ответ" in final and actions == [], (final, actions))
 
-# --- format_guard: broken final + model that fixes it on round 1 ------------
-calls = {"n": 0}
+# --- T52: <work> is gone, <memory> is parsed ---------------------------------
+final, actions = ar.parse_actions("<work>silent 20m — собираю</work>")
+check("work tag is NO action now", final is None and actions == [], (final, actions))
 
+final, actions = ar.parse_actions("мысль <memory>Владелец любит краткость</memory>")
+check("memory action parsed", final is None and actions and actions[0][0] == "memory"
+      and actions[0][1] == "Владелец любит краткость", (final, actions))
 
-class FakeClient:
-    @staticmethod
-    def chat(messages, temperature=0.3, max_tokens=4000):
-        calls["n"] += 1
-        last = messages[-1]["content"]
-        assert "ПРОВЕРКА ФОРМАТА" in last or "Теперь дай <final>" in last, last[:120]
-        return ("<final><answer>Исправленный честный ответ.</answer>"
-                "<file>otchet.pdf</file></final>", "glm-test")
+final, actions = ar.parse_actions("<memory>первое</memory><memory>второе</memory>")
+check("two memory actions", len(actions) == 2 and actions[0][1] == "первое" and actions[1][1] == "второе", actions)
 
+final, actions = ar.parse_actions("<end/>")
+check("end self-closed still parses", bool(actions) and actions[0][0] == "end" and actions[0][1] == "", actions)
 
-orig_chat = ar.zai_client.chat
-ar.zai_client.chat = FakeClient.chat
-hist = [{"role": "user", "content": "задача"}]
-out, sfo = ar.format_guard("<final><answer></answer></final>", "sys", hist, started, 0)
-ar.zai_client.chat = orig_chat
-check("format_guard retries empty answer", "Исправленный" in out and "otchet.pdf" in out, out)
-check("format_guard corrective note in history", any("ПРОВЕРКА ФОРМАТА" in m["content"] for m in hist))
+# --- T52: strip_protocol_tags -------------------------------------------------
+body = ar.strip_protocol_tags("Ответ пользователю.\n<memory>заметка</memory><end>пересказ</end>")
+check("strip leaves visible text", body == "Ответ пользователю.", repr(body))
 
-# --- format_guard: already-correct final -> zero model calls ----------------
-calls2 = {"n": 0}
+body = ar.strip_protocol_tags(
+    "Проверка <think>скрытые мысли</think> текста.\n<cmd to='30'>ls</cmd>"
+    "<send to='owner'>прив</send><memory>m</memory>")
+check("strip removes cmd/send/think", "скрытые" not in body and "ls" not in body
+      and "прив" not in body and "Проверка" in body and "текста" in body, repr(body))
 
+# --- T52: format machinery REMOVED --------------------------------------------
+check("format_guard removed", not hasattr(ar, "format_guard"))
+check("protocol_problems removed", not hasattr(ar, "protocol_problems"))
 
-class FakeClient2:
-    @staticmethod
-    def chat(messages, temperature=0.3, max_tokens=4000):
-        calls2["n"] += 1
-        return ("<final><answer>ок</answer></final>", "glm-test")
+# --- T52: memory_append writes locally without SECRET -------------------------
+ar.SECRET = ""
+tmp = tempfile.mkdtemp(prefix="t52mem_")
+ar.MEMORY = os.path.join(tmp, "mem.md")
+ok = ar.memory_append("Тестовая заметка о владельце", "memory")
+check("memory_append local-only without secret", ok is False)
+content = open(ar.MEMORY, encoding="utf-8").read() if os.path.exists(ar.MEMORY) else ""
+check("memory_append wrote the local file", "Тестовая заметка о владельце" in content, content)
 
-
-ar.zai_client.chat = FakeClient2.chat
-ar.WS = tempfile.mkdtemp(prefix="t35ws_clean_")  # fresh empty workspace: no new files -> no <file> duty
-out2, _ = ar.format_guard("<answer>Готово.</answer>", "sys", [], started, 0)
-ar.zai_client.chat = orig_chat
-check("correct final -> no retry call", calls2["n"] == 0 and out2 == "<answer>Готово.</answer>", (calls2["n"], out2))
-
-# --- format_guard: model keeps failing -> 2 rounds then give up with best ---
-calls3 = {"n": 0}
-
-
-class FakeClient3:
-    @staticmethod
-    def chat(messages, temperature=0.3, max_tokens=4000):
-        calls3["n"] += 1
-        return ("всё ещё без тегов", "glm-test")
-
-
-ar.zai_client.chat = FakeClient3.chat
-out3, _ = ar.format_guard("", "sys", [], started, 0)
-ar.zai_client.chat = orig_chat
-check("persistent empty -> 2 rounds max, delivers best effort", calls3["n"] == 2 and out3 == "всё ещё без тегов",
-      (calls3["n"], out3))
+# --- T52: shared_memory() without secret is safe ------------------------------
+check("shared_memory no secret -> ''", ar.shared_memory() == "")
 
 print()
-print("T35 PY PROBE:", "ALL PASS" if not fails else f"{len(fails)} FAIL: {fails}")
+print("T35/T52 PY PROBE:", "ALL PASS" if not fails else f"{len(fails)} FAIL: {fails}")
 sys.exit(1 if fails else 0)

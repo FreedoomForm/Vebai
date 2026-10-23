@@ -13,9 +13,9 @@
 const RE_ANSWER = /<answer>([\s\S]*?)<\/answer>/gi
 const RE_FILE = /<file>([\s\S]*?)<\/file>/gi
 
-/** truly internal blocks — dropped even from fallback text */
+/** truly internal blocks — dropped even from fallback text (T52: end/memory/work added) */
 const RE_INTERNAL =
-  /<think>[\s\S]*?<\/think>|<thought>[\s\S]*?<\/thought>|<cmd[^>]*>[\s\S]*?<\/cmd>|<search>[\s\S]*?<\/search>|<read>[\s\S]*?<\/read>|<send\b[^>]*>[\s\S]*?<\/send>/gi
+  /<think>[\s\S]*?<\/think>|<thought>[\s\S]*?<\/thought>|<cmd[^>]*>[\s\S]*?<\/cmd>|<search>[\s\S]*?<\/search>|<read>[\s\S]*?<\/read>|<send\b[^>]*>[\s\S]*?<\/send>|<end\s*\/>|<end\b[^>]*>[\s\S]*?<\/end>|<memory\b[^>]*>[\s\S]*?<\/memory>|<work\b[^>]*>[\s\S]*?<\/work>/gi
 
 export interface ParsedAnswer {
   /** the text the user is allowed to see */
@@ -30,7 +30,7 @@ export interface ParsedAnswer {
 function cleanFallback(raw: string): string {
   return raw
     .replace(RE_INTERNAL, '')
-    .replace(/<\/?(?:answer|file|final)>/gi, '')
+    .replace(/<\/?(?:answer|file|final|end|memory|work)>/gi, '')
     .trim()
 }
 
@@ -98,7 +98,7 @@ export function checkAnswerProtocol(raw: string): AnswerVerdict {
     const tail = src
       .slice(mOpen.index + mOpen[0].length)
       .replace(RE_INTERNAL, '')
-      .replace(/<\/?(?:answer|file|final)>/gi, '')
+      .replace(/<\/?(?:answer|file|final|end|memory|work)>/gi, '')
       .trim()
     if (tail) return { ok: true }
   }

@@ -946,12 +946,21 @@ export function AgentApp() {
           )}
         </div>
         <div className="mt-2 flex items-center gap-2">
-          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-800 text-[10px] font-semibold text-white">
-            {(session.user?.name || session.user?.email || '?').slice(0, 1).toUpperCase()}
-          </div>
-          <span className="min-w-0 flex-1 truncate text-[11px] text-stone-600" title={session.user?.email}>
-            {session.user?.name || session.user?.email}
-          </span>
+          {/* T52: the profile row opens the SHARED agent memory page — read
+              and edit what the agent remembers (<memory>/<end> notes) */}
+          <button
+            type="button"
+            onClick={() => router.push('/memory')}
+            title="Память агента — посмотреть и отредактировать"
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1 py-1 text-left transition-colors hover:bg-stone-100"
+          >
+            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-800 text-[10px] font-semibold text-white">
+              {(session.user?.name || session.user?.email || '?').slice(0, 1).toUpperCase()}
+            </div>
+            <span className="min-w-0 flex-1 truncate text-[11px] text-stone-600" title={session.user?.email}>
+              {session.user?.name || session.user?.email}
+            </span>
+          </button>
           <button
             onClick={() => void logout()}
             className="rounded px-2 py-1 text-[11px] text-stone-500 hover:bg-stone-100 hover:text-stone-700"

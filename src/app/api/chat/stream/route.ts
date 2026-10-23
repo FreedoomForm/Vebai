@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 import { zai, type ChatMessage } from '@/lib/zai'
 import { DEFAULT_CHAT_MODEL, FALLBACK_CHAT_MODEL } from '@/lib/zai-config'
 import { systemPrompt } from '@/lib/agent/prompt'
-import { createAnswerStreamFilter, parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
+import { createAnswerStreamFilter } from '@/lib/agent/answer'
 import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
 import { createOutboxTasks, createTgReadTasks } from '@/lib/agent/outbox'
 import { createVideoTask } from '@/lib/agent/video'
@@ -322,6 +322,12 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // T52 (owner request 2026-10-23): every site request to the AI carries the
+  // SHARED agent memory (<memory>/<end> notes) so answers remember the owner
+  const { readMemText } = await import('@/lib/agent/memory')
+  const shm = await readMemText().catch(() => '')
+  if (shm) sys += `\n\n# Общая память агента (важное из прошлых задач и разговоров)\n${shm}`
+
   const messages: ChatMessage[] = [{ role: 'system', content: sys }]
 
   // ---- optional web search: RAG-inject fresh results into the context.
@@ -365,16 +371,11 @@ export async function POST(req: NextRequest) {
   // T16: the model decides what the user sees — only <answer>…</answer>
   // content is forwarded; run-terminal/run-vterm blocks (outside <answer>)
   // are still dispatched below from the RAW text.
-  // T35 (owner request 2026-10-20): the protocol is now enforced MECHANICALLY.
-  // A reply that is empty / has an empty <answer> / has no <answer> at all
-  // triggers an AUTOMATIC repeat (up to 2) with a corrective note — the era of
-  // "модель пишет что хочет" and silent empty answers ends here.
+  // T52: NO format retries anymore — tags are optional. The stream filter
+  // forwards <answer> content live; flush() emits the unclosed tail or,
+  // when nothing was tagged, the cleaned plain text (the answer).
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const t0 = Date.now()
-      const RETRY_BUDGET_MS = 150_000
-      const MAX_FORMAT_RETRIES = 2
-      let formatRetries = 0
       let fullAnswer = ''
       let answerFilter = createAnswerStreamFilter()
 
@@ -475,41 +476,19 @@ export async function POST(req: NextRequest) {
       }
 
       let failed = false
-      for (;;) {
+      {
+        // T52: single attempt, NO format retries — tags are optional. The
+        // filter has streamed <answer> content live; flush() emits the tail
+        // of an unclosed <answer> or, when nothing was tagged, the cleaned
+        // plain text (which IS the answer).
         const { raw: attemptRaw, failed: upFailed } = await streamOnce()
         if (upFailed) {
           failed = true
-          break
-        }
-        fullAnswer = attemptRaw
-        const verdict = checkAnswerProtocol(attemptRaw)
-        if (verdict.ok) {
-          // stream over: emit the tail of an unclosed <answer>
+        } else {
+          fullAnswer = attemptRaw
           const tail = answerFilter.flush()
           if (tail) controller.enqueue(sse({ type: 'delta', text: tail }))
-          break
         }
-        if (formatRetries >= MAX_FORMAT_RETRIES || Date.now() - t0 > RETRY_BUDGET_MS) {
-          // retries exhausted / no time left: deliver the cleaned text so the
-          // user still gets SOMETHING (legacy fallback behaviour)
-          const fb = parseAiAnswer(attemptRaw).text
-          if (fb) controller.enqueue(sse({ type: 'delta', text: fb }))
-          break
-        }
-        formatRetries++
-        const why =
-          verdict.reason === 'empty'
-            ? 'пустотой (пустое поле)'
-            : verdict.reason === 'empty_answer'
-              ? 'пустым тегом <answer></answer>'
-              : 'БЕЗ формата <answer>…</answer>'
-        controller.enqueue(sse({
-          type: 'notice',
-          text: `⚠️ Модель ответила ${why} — автоматически повторяю запрос (попытка ${formatRetries + 1}/${MAX_FORMAT_RETRIES + 1})…`,
-        }))
-        if (attemptRaw.trim()) messages.push({ role: 'assistant', content: attemptRaw.slice(0, 1500) })
-        messages.push({ role: 'user', content: formatRetryNote(verdict.reason) })
-        answerFilter = createAnswerStreamFilter()
       }
       if (!failed) {
         // ---- terminal dispatch: fenced run-agent blocks -> resident agent,
