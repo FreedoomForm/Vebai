@@ -1244,6 +1244,16 @@ export async function POST(req: NextRequest) {
   await db.message.create({
     data: { conversationId: convId, role: 'user', kind: 'text', content: (text + attachNote).slice(0, 4000) },
   })
+  // T52b (owner field report 2026-10-23): the agent answered "у меня нет доступа
+  // к вашей переписке" instead of reading the chat with its own Telegram app.
+  // For OWNER tasks the hint travels WITH the task: the context of any chat is
+  // fetched by the agent itself (node "$TG" read), asking the owner to paste
+  // the dialog is forbidden. Guest tasks stay hint-free (the $TG app on the
+  // runner acts as the OWNER's account - guests must not be pointed at it).
+  const taskText = `#!agent\n${text.slice(0, 8000)}${
+    isOwner
+      ? '\n\nПОДСКАЗКА: если для задачи нужен контекст переписки с человеком — прочитай чат САМ приложением Telegram на своём компьютере (node "$TG" read "+998…" 50; найти чат — node "$TG" dialogs). Отвечать «у меня нет доступа к переписке» и просить владельца прислать диалог ЗАПРЕЩЕНО.'
+      : ''}`
   await db.agentTask.create({
     data: {
       conversationId: convId,
@@ -1252,7 +1262,7 @@ export async function POST(req: NextRequest) {
       status: 'queued',
       progress: 'Агент на GitHub Actions возьмёт задачу в течение минуты…',
       payload: JSON.stringify({
-        command: `#!agent\n${text.slice(0, 8000)}`,
+        command: taskText,
         terminalId: convId,
         timeoutS: 3600,
       }),

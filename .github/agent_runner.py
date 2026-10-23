@@ -108,6 +108,22 @@ RE_ACTION = re.compile(
     r"|<memory>([\s\S]*?)</memory>"
     r"|(<end\s*/>)|<end>([\s\S]*?)</end>", re.I)
 
+# T52b: the fake-refusal pattern the owner caught in the field (2026-10-23):
+# asked "+998… ответ ей исходя из контекста того, что мы обсуждали", the agent
+# answered "у меня нет доступа к содержанию вашей предыдущей переписки" instead
+# of READING the chat with its own Telegram app. CORE = the refusal claim,
+# TG = the subject the tools obviously cover.
+RE_REFUSAL_CORE = re.compile(
+    r"не имею доступа|нет доступа|у меня нет доступа|не могу получить доступ|"
+    r"нет доступа к|не могу (прочитать|видеть|увидеть|узнать)|не имею возможности (прочитать|видеть)|"
+    r"я не (видел|вижу|знаю) (вашей |этой )?(переписки|диалога|истории)",
+    re.I)
+RE_REFUSAL_TG = re.compile(
+    r"переписк|диалог|контекст|обсужда|истори[ию] сообщений|ваших сообщений", re.I)
+RE_PERSON_TASK = re.compile(
+    r"\+\d{7,}|@[A-Za-z][A-Za-z0-9_]{3,}|ответ (ей|ему|им)|напиши (ей|ему|им)|"
+    r"переписк|обсужда|диалог", re.I)
+
 
 def dedup_final_files(final_text: str, delivered: set) -> str:
     """T48: remove <file> tags for files the user ALREADY received mid-task
@@ -174,6 +190,11 @@ RE_EXT_FILE = re.compile(
     re.I)
 RE_SEND_CLAIM = re.compile(
     r"отправ(?:лен|ил|лю|ка)|доставл|прикрепл|выслал|вложени", re.I)
+# T52b: the DM flow delivers via the Telegram APP on the computer
+# (node "$TG" send/sendfile inside <cmd>) - a successful such command is
+# honest evidence behind "отправил" claims in the final (tg.js prints exactly
+# one JSON line; ok:true = delivered).
+RE_TG_SEND_OK = re.compile(r'"ok"\s*:\s*true')
 
 MAX_SEND_BYTES = 3_400_000   # per request: Vercel body limit ~4.5MB base64-encoded
 
@@ -387,13 +408,14 @@ def ws_files_basenames() -> set:
     return out
 
 
-def analyze_final(final_text: str, real: set, send_files_ok: int):
+def analyze_final(final_text: str, real: set, send_files_ok: int, tg_ok: int = 0):
     """returns (answer, missing, claimed):
     answer  — the visible <answer> text ('' if the final is not tagged);
     missing — file names the final promises (via <file> tags or mentions in
               the answer) that do NOT exist in the workspace;
     claimed — the answer says the file was sent/attached, but no <send> of a
-              file ever succeeded and none of the promised files exists."""
+              file and no successful "$TG send/sendfile" ever happened and
+              none of the promised files exists."""
     answers = [m.group(1).strip() for m in RE_ANSWER.finditer(final_text) if m.group(1).strip()]
     answer = "\n\n".join(answers)
     promised = []
@@ -418,7 +440,7 @@ def analyze_final(final_text: str, real: set, send_files_ok: int):
     claim_scope = answer if answers else final_text
     claimed = bool(
         claim_scope and RE_SEND_CLAIM.search(claim_scope)
-        and send_files_ok == 0
+        and send_files_ok == 0 and tg_ok == 0
         and not any(n.lower() in real for n in promised))
     return answer, missing, claimed
 
@@ -444,14 +466,16 @@ def append_honest_note(final_text: str, missing: list, claimed: bool) -> str:
     return final_text + "\n\n" + note
 
 
-def truth_guard(final_text: str, system: str, history: list, send_files_ok: int) -> str:
+def truth_guard(final_text: str, system: str, history: list, send_files_ok: int,
+                tg_ok: int = 0) -> str:
     """verify the final against reality: ONE corrective round-trip (create
     the missing files / re-send / rewrite the final honestly), then an
     honest note if the agent still fails to deliver."""
     final_text = (final_text or "").strip()
     if not final_text:
         return final_text
-    _, missing, claimed = analyze_final(final_text, ws_files_basenames(), send_files_ok)
+    _, missing, claimed = analyze_final(final_text, ws_files_basenames(),
+                                        send_files_ok, tg_ok)
     if not missing and not claimed:
         return final_text
     problems = []
@@ -494,7 +518,8 @@ def truth_guard(final_text: str, system: str, history: list, send_files_ok: int)
             pass
     if not final2:
         final2 = reply[:3000]
-    _, missing2, claimed2 = analyze_final(final2, ws_files_basenames(), send_files_ok)
+    _, missing2, claimed2 = analyze_final(final2, ws_files_basenames(),
+                                          send_files_ok, tg_ok)
     if missing2 or claimed2:
         final2 = append_honest_note(final2, missing2, claimed2)
     return final2
@@ -503,6 +528,94 @@ def truth_guard(final_text: str, system: str, history: list, send_files_ok: int)
 # T35 format guard REMOVED (T52, owner request 2026-10-23): tags are optional
 # now - a plain-text final IS the answer, no mechanical auto-repeat anywhere.
 # The truth guard below still guarantees file-claims honesty.
+
+
+def refusal_guard(final_text: str, tg_available: bool, task_text: str,
+                  system: str, history: list) -> tuple:
+    """T52b (owner field report 2026-10-23): the agent must EXPLORE its tools
+    instead of faking inability. A final that claims "no access to the
+    correspondence/context" while the Telegram app sits on the computer gets
+    ONE corrective round (same shape as truth_guard - NOT the removed T35
+    format retry): read the chat yourself (node "$TG" read), do the job with
+    the real transcript, give a new final. A refusal is acceptable only AFTER
+    a real attempt (then the tool error makes it honest).
+    Returns (final_text, tg_sends) - tg_sends counts successful "$TG
+    send/sendfile" deliveries done inside this corrective round."""
+    final_text = (final_text or "").strip()
+    if not tg_available or not final_text:
+        return final_text, 0
+    if not RE_REFUSAL_CORE.search(final_text):
+        return final_text, 0
+    if not (RE_REFUSAL_TG.search(final_text) or RE_PERSON_TASK.search(task_text or "")):
+        return final_text, 0
+    # the plain-final path breaks out of the loop BEFORE the assistant reply
+    # lands in history - make sure the model sees its own refusal when asked
+    # to redo the job (in the <end> path it is already there - no duplicate).
+    last_ass = next((m for m in reversed(history) if m.get("role") == "assistant"), None)
+    if not (last_ass and final_text[:100] in (last_ass.get("content") or "")):
+        history.append({"role": "assistant", "content": final_text})
+    history.append({"role": "user", "content":
+        ("[СИСТЕМА] ПРОВЕРКА ОТКАЗА: ты ответил отказом в духе «у меня нет доступа к переписке/контексту» — "
+         "это неправда. На твоём компьютере стоит приложение Telegram от имени личного аккаунта владельца "
+         "(node \"$TG\"), и оно читает ЛЮБОЕ количество сообщений из любых его чатов. Контекст переписки "
+         "достаётся САМ, а не запросом у пользователя: node \"$TG\" dialogs (найти чат по номеру/имени) → "
+         "node \"$TG\" read \"<чат>\" 50 (--search слово). Действуй: прочитай нужный чат, выполни задание "
+         "по РЕАЛЬНОЙ переписке и дай новый <final>. Отказ допустим только после реальной попытки — "
+         "если инструмент вернул ошибку, честно процитируй её.")})
+    try:
+        reply, _ = zai_client.chat(
+            [{"role": "system", "content": system}] + history,
+            temperature=0.2, max_tokens=4000)
+    except Exception:
+        history.pop()
+        return final_text, 0
+    final2, actions = parse_actions(reply)
+    tg_sends = 0
+    outs = []
+    for kind, arg, tmo in actions[:6]:
+        if kind == "cmd":
+            rc, dt, outp = run_bash(arg, min(tmo, 600))
+            outs.append(f"$ {arg[:400]}\n(exit {rc}, {dt} c)\n{outp or '(пустой вывод)'}")
+            if re.search(r'(\$TG|tg\.js)', arg) and re.search(r'\bsend(file)?\b', arg) \
+                    and RE_TG_SEND_OK.search(outp or ""):
+                tg_sends += 1
+        elif kind == "search":
+            try:
+                outs.append(f"[поиск: {arg}]\n{zai_client.web_search(arg)}")
+            except Exception as e:
+                outs.append(f"[поиск: {arg}] ошибка: {str(e)[:120]}")
+        elif kind == "read":
+            try:
+                outs.append(f"[страница: {arg}]\n{zai_client.read_page(arg)}")
+            except Exception as e:
+                outs.append(f"[страница: {arg}] ошибка: {str(e)[:120]}")
+        elif kind == "send":
+            report, _ok, _n = do_send(*arg)
+            outs.append(report)
+        elif kind == "answer":
+            report, _ok, _n = do_send("owner", "", arg, mirror=True)
+            outs.append("[ответ → пользователь] " + report)
+    if outs:
+        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "user", "content":
+            "=== вывод проверки отказа ===\n" + "\n\n".join(outs) +
+            "\n\n[СИСТЕМА] Теперь дай новый <final> — выполни задание по прочитанной переписке "
+            "или честно процитируй ошибку инструмента, если она реально была."})
+        try:
+            reply2, _ = zai_client.chat(
+                [{"role": "system", "content": system}] + history,
+                temperature=0.2, max_tokens=3000)
+            final3, actions3 = parse_actions(reply2)
+            # a bare <end>recap</end> close: the recap BODY is the visible line
+            end_body = next((arg for kind, arg, _t in actions3 if kind == "end"), None)
+            final2 = final3 or final2 or (end_body or "").strip() \
+                or strip_protocol_tags(reply2) or reply2[:3000]
+        except Exception:
+            pass
+    if not final2:
+        end_body = next((arg for kind, arg, _t in actions if kind == "end"), None)
+        final2 = (end_body or "").strip() or strip_protocol_tags(reply) or reply[:3000]
+    return final2, tg_sends
 
 def list_new_files(since_ts: float) -> list:
     """files created/modified in WS since the task started (for the final note)."""
@@ -601,6 +714,7 @@ def run_agent(task, budget_min=None) -> str:
     last_cmd_sig = ""
     same_cmd_runs = 0
     send_files_ok = 0   # T21a: files actually delivered by successful <send>s
+    tg_ok = 0           # T52b: successful "$TG send/sendfile" deliveries in <cmd>s
 
     # T48: internal apps state — <answer>/<file> deliveries
     delivered_files = set()     # basenames already handed to the user mid-task
@@ -673,6 +787,11 @@ def run_agent(task, budget_min=None) -> str:
                 last_cmd_sig = sig
                 rc, dt, outp = run_bash(arg, tmo)
                 outputs.append(f"$ {arg[:400]}\n(exit {rc}, {dt} c)\n{outp or '(пустой вывод)'}")
+                # T52b: the Telegram app delivering a message/file IS an honest
+                # delivery - count it so the truth guard never nags a real DM reply
+                if re.search(r'(\$TG|tg\.js)', arg) and re.search(r'\bsend(file)?\b', arg) \
+                        and RE_TG_SEND_OK.search(outp or ""):
+                    tg_ok += 1
                 heartbeat()
                 if same_cmd_runs >= 3:
                     outputs.append("[СИСТЕМА] эта команда уже повторяется 3-й раз без успеха — смени подход.")
@@ -788,7 +907,12 @@ def run_agent(task, budget_min=None) -> str:
                                        else "✅ Готово — работа завершена.") + "</answer>"
     if delivered_files:
         final_text = dedup_final_files(final_text, delivered_files)
-    final_text = truth_guard(final_text, system, history, send_files_ok)
+    # T52b: a fake "no access to the correspondence" refusal gets ONE chance to
+    # actually use the tools (read the chat via $TG) before it ships; the new
+    # final then goes through the file-claims truth guard as usual.
+    final_text, guard_tg = refusal_guard(final_text, bool(tg_path), task, system, history)
+    tg_ok += guard_tg
+    final_text = truth_guard(final_text, system, history, send_files_ok, tg_ok)
     if ended and end_note and end_note.strip():
         memory_append(end_note, "end")
     save_memory(task, final_text)
