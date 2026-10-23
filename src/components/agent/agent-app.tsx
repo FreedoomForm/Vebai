@@ -204,23 +204,91 @@ export function AgentApp() {
 
   /* ------------------------------------------------------------ fetching */
 
+  // T53 (owner report: «сайт очень медленно загружает чаты»): every chat-open
+  // paid a ~1s serverless+Neon roundtrip before ANYTHING painted. These tiny
+  // stale-while-revalidate caches paint the last known state instantly and
+  // let the fresh fetch land in the background. sessionStorage for chat
+  // content (dies with the tab — no long-lived private data), localStorage
+  // only for the lightweight conversation titles + the last-open chat id.
+  const CONV_CACHE_KEY = 'vebai_conv_cache_v1'
+  const STATE_CACHE_PREFIX = 'vebai_state_cache_v1:'
+  const LAST_CONV_KEY = 'vebai_last_conv'
+  const CACHE_TTL_MS = 5 * 60 * 1000
+  const STATE_CACHE_MAX_BYTES = 400_000
+
+  function readCache<T>(key: string, storage: Storage | null): { at: number } & T | null {
+    try {
+      const raw = storage?.getItem(key)
+      if (!raw) return null
+      const parsed = JSON.parse(raw) as { at: number } & T
+      if (!parsed || typeof parsed.at !== 'number' || Date.now() - parsed.at > CACHE_TTL_MS) return null
+      return parsed
+    } catch {
+      return null
+    }
+  }
+
+  function writeCache(key: string, value: Record<string, unknown>, storage: Storage | null) {
+    try {
+      storage?.setItem(key, JSON.stringify({ at: Date.now(), ...value }))
+    } catch {
+      /* quota / private mode — cache is best-effort */
+    }
+  }
+
+  const safeStorage = (kind: 'local' | 'session'): Storage | null => {
+    try {
+      return kind === 'local' ? window.localStorage : window.sessionStorage
+    } catch {
+      return null
+    }
+  }
+
   const loadConversations = useCallback(async () => {
+    // instant paint from cache while the real list is in flight (first mount only)
+    setConversations((prev) => {
+      if (prev.length > 0) return prev
+      const cached = readCache<{ conversations: ConvSummary[] }>(CONV_CACHE_KEY, safeStorage('local'))
+      return cached?.conversations?.length ? cached.conversations : prev
+    })
     try {
       const res = await fetch('/api/conversations', { cache: 'no-store' })
       const data = await res.json()
-      setConversations(data.conversations || [])
-    } catch { /* offline */ }
+      const list: ConvSummary[] = data.conversations || []
+      setConversations(list)
+      if (list.length) writeCache(CONV_CACHE_KEY, { conversations: list }, safeStorage('local'))
+    } catch {
+      /* offline */
+    }
   }, [])
 
   const fetchState = useCallback(async (id: string) => {
+    // stale-while-revalidate: paint the cached snapshot for THIS chat right
+    // away (only into an empty pane — never clobber a live conversation),
+    // then let the fresh response below replace it
+    const cached = readCache<{ messages: MessageDTO[]; tasks: AgentTaskDTO[] }>(
+      STATE_CACHE_PREFIX + id,
+      safeStorage('session'),
+    )
+    if (cached?.messages?.length && activeIdRef.current === id) {
+      setMessages((prev) => (prev.length === 0 ? cached.messages : prev))
+      setTasks((prev) => (prev.length === 0 ? cached.tasks || [] : prev))
+    }
     try {
       const res = await fetch(`/api/conversations/${id}`, { cache: 'no-store' })
       if (!res.ok) return
       const data = await res.json()
+      // guard: the user may have switched chats while this fetch was in flight
+      if (activeIdRef.current !== id) return
       setMessages(data.messages || [])
       setTasks(data.tasks || [])
       setStream(null)
-    } catch { /* offline */ }
+      const payload = { messages: data.messages || [], tasks: data.tasks || [] }
+      if (JSON.stringify(payload).length < STATE_CACHE_MAX_BYTES)
+        writeCache(STATE_CACHE_PREFIX + id, payload, safeStorage('session'))
+    } catch {
+      /* offline */
+    }
   }, [])
 
   // entering agent mode: open (create if missing) the agent conversation and
@@ -385,7 +453,14 @@ export function AgentApp() {
   useEffect(() => {
     const prev = activeIdRef.current
     if (prev && prev !== activeId) unsubscribe(prev)
-    if (activeId) subscribe(activeId)
+    if (activeId) {
+      subscribe(activeId)
+      try {
+        localStorage.setItem(LAST_CONV_KEY, activeId)
+      } catch {
+        /* private mode */
+      }
+    }
   }, [activeId, subscribe, unsubscribe])
 
   /* --------------------------------------------------------- auth check */
@@ -414,6 +489,15 @@ export function AgentApp() {
   /* --------------------------------------------------------- initial load */
 
   const loadInitial = useCallback(async () => {
+    // T53: remember the last-open chat and fetch its state IN PARALLEL with
+    // the conversations list — the old code waited for the list (one full
+    // serverless+DB roundtrip) before even STARTING the state fetch
+    const lastId = safeStorage('local')?.getItem(LAST_CONV_KEY) || null
+    if (lastId) {
+      setActiveId(lastId)
+      activeIdRef.current = lastId
+      void fetchState(lastId)
+    }
     try {
       const res = await fetch('/api/conversations', { cache: 'no-store' })
       if (res.status === 401) {
@@ -423,12 +507,18 @@ export function AgentApp() {
       const data = await res.json()
       const list: ConvSummary[] = data.conversations || []
       setConversations(list)
+      if (list.length) writeCache(CONV_CACHE_KEY, { conversations: list }, safeStorage('local'))
       if (list.length > 0) {
-        setActiveId(list[0].id)
-        activeIdRef.current = list[0].id
-        await fetchState(list[0].id)
+        const first = lastId && list.some((c) => c.id === lastId) ? lastId : list[0].id
+        if (first !== activeIdRef.current) {
+          setActiveId(first)
+          activeIdRef.current = first
+          await fetchState(first)
+        }
       }
-    } catch { /* offline */ }
+    } catch {
+      /* offline */
+    }
   }, [fetchState])
 
   useEffect(() => {

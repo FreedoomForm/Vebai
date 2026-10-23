@@ -5,6 +5,14 @@ import { messageToDTO, taskToDTO } from '@/lib/agent/tools'
 
 export const dynamic = 'force-dynamic'
 
+// T53: bound the chat-open payload. The old shape pulled EVERY message and
+// EVERY task with ALL columns — including AgentTask.imageData (binary PNG,
+// served separately via /api/image) and payload/jobIds blobs the DTO never
+// exposes — so opening a chat with generated images transferred megabytes
+// from Postgres on every click. Now: slim columns only + last-N window.
+const MESSAGES_TAKE = 400
+const TASKS_TAKE = 200
+
 /** GET /api/conversations/[id] — full chat state (messages + tasks) */
 export async function GET(
   req: NextRequest,
@@ -21,8 +29,39 @@ export async function GET(
     return NextResponse.json({ error: 'conversation not found' }, { status: 404 })
 
   const [messages, tasks] = await Promise.all([
-    db.message.findMany({ where: { conversationId: id }, orderBy: { createdAt: 'asc' } }),
-    db.agentTask.findMany({ where: { conversationId: id }, orderBy: { createdAt: 'asc' } }),
+    db.message
+      .findMany({
+        where: { conversationId: id },
+        orderBy: { createdAt: 'desc' },
+        take: MESSAGES_TAKE,
+        select: {
+          id: true,
+          role: true,
+          kind: true,
+          content: true,
+          meta: true,
+          createdAt: true,
+        },
+      })
+      .then((rows) => rows.reverse()),
+    db.agentTask
+      .findMany({
+        where: { conversationId: id },
+        orderBy: { createdAt: 'desc' },
+        take: TASKS_TAKE,
+        select: {
+          id: true,
+          conversationId: true,
+          type: true,
+          title: true,
+          status: true,
+          progress: true,
+          result: true,
+          error: true,
+          createdAt: true,
+        },
+      })
+      .then((rows) => rows.reverse()),
   ])
 
   return NextResponse.json({
