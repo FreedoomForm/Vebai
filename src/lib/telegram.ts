@@ -10,6 +10,7 @@
  */
 
 import { db } from '@/lib/db'
+import { menuIfUserChat } from '@/lib/tgmenu'
 
 const TG_CACHE_KEY = 'telegram'
 
@@ -85,6 +86,7 @@ export interface TgFile {
 
 async function sendOne(
   token: string, chatId: string, file: TgFile, caption: string,
+  replyMarkup?: Record<string, unknown> | null,
 ): Promise<boolean> {
   const isVideo = (file.mime || '').startsWith('video/') || file.name.toLowerCase().endsWith('.mp4')
   const method = isVideo ? 'sendVideo' : 'sendDocument'
@@ -92,6 +94,10 @@ async function sendOne(
   const form = new FormData()
   form.append('chat_id', chatId)
   form.append('caption', caption.slice(0, 900))
+  // T50: bot-user chats get the full inline menu under every delivery (owner
+  // request «верни все кнопки в телеграм боте»); the archive channel gets none
+  if (replyMarkup && Object.keys(replyMarkup).length)
+    form.append('reply_markup', JSON.stringify(replyMarkup))
   form.append(field, new Blob([new Uint8Array(file.data)], { type: file.mime || 'application/octet-stream' }), file.name)
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -157,30 +163,51 @@ export async function uploadToTelegram(
   if (!token || files.length === 0) return 0
   const chatId = chatIdOverride || (await resolveChatId())
   if (!chatId) return 0 // bot not admin yet (or invite-only) — skip silently
+  // T50: the menu rides along when the target is a user's private bot chat
+  const kb = await menuIfUserChat(chatId).catch(() => null)
   let n = 0
   for (const f of files.slice(0, 10)) {
     if (f.data.byteLength === 0 || f.data.byteLength > 49 * 1024 * 1024) continue
-    if (await sendOne(token, chatId, f, caption)) n++
+    if (await sendOne(token, chatId, f, caption, kb)) n++
   }
   return n
 }
 
-/** one plain text message (used for terminal command logs) */
-export async function sendTelegramText(text: string, chatIdOverride?: string): Promise<boolean> {
+/** one plain text message (used for terminal command logs, task results and
+ *  agent mirrors) */
+export async function sendTelegramText(
+  text: string,
+  chatIdOverride?: string,
+  replyMarkup?: Record<string, unknown>,
+): Promise<boolean> {
   const token = botToken()
   if (!token) return false
   const chatId = chatIdOverride || (await resolveChatId())
   if (!chatId) return false
   try {
+    const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(0, 3800) }
+    // T50: every bot delivery carries the full menu again (explicit keyboards
+    // still win); the gate keeps the archive channel button-free
+    let kb = replyMarkup
+    if (!kb) {
+      try {
+        kb = (await menuIfUserChat(chatId)) ?? undefined
+      } catch {
+        /* send without buttons rather than not send at all */
+      }
+    }
+    if (kb && Object.keys(kb).length) body.reply_markup = kb
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3800) }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(20_000),
     })
     const json = (await res.json()) as { ok?: boolean }
     return !!json.ok
-  } catch { return false }
+  } catch {
+    return false
+  }
 }
 
 /**

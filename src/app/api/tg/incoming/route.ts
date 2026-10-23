@@ -65,10 +65,20 @@ async function notifyOwner(text: string): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN || ''
   if (!chatId || !token) return
   try {
+    const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(0, 3800) }
+    // T50: escalations also carry the full menu (owner request: «верни все
+    // кнопки в телеграм боте») — best-effort, never blocks the send
+    try {
+      const { menuIfUserChat } = await import('@/lib/tgmenu')
+      const kb = await menuIfUserChat(chatId)
+      if (kb) body.reply_markup = kb
+    } catch {
+      /* send without buttons rather than not send at all */
+    }
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 3800) }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(20_000),
     })
   } catch { /* best-effort */ }

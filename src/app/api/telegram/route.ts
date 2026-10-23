@@ -4,6 +4,7 @@ import { zai, type ChatMessage } from '@/lib/zai'
 import { systemPrompt } from '@/lib/agent/prompt'
 import { parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
 import { downloadTgFile, uploadToTelegram } from '@/lib/telegram'
+import { botMenuKb } from '@/lib/tgmenu'
 import { formatBytes } from '@/lib/utils'
 import {
   readAgentMemory,
@@ -191,7 +192,21 @@ async function tgSend(
   if (!token) return
   try {
     const body: Record<string, unknown> = { chat_id: chatId, text: text.slice(0, 3800) }
-    if (replyMarkup) body.reply_markup = replyMarkup
+    // T50 (owner request 2026-10-23: «верни все кнопки в телеграм боте»):
+    // every message the bot sends carries the full menu again — over the
+    // t27..t42 refactors most paths (task accepts, results, ?answers, hints)
+    // drifted to bare messages and the bot felt button-less. Explicit
+    // keyboards (chat list, connect panel) still win. The menu must never
+    // break a delivery, hence its own catch.
+    let kb = replyMarkup
+    if (!kb) {
+      try {
+        kb = await botMenuKb(String(chatId))
+      } catch {
+        /* send without buttons rather than not send at all */
+      }
+    }
+    if (kb && Object.keys(kb).length) body.reply_markup = kb
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -200,10 +215,6 @@ async function tgSend(
     })
   } catch { /* best-effort */ }
 }
-
-const appButtonRow = (): { text: string; web_app: { url: string } }[] => [
-  { text: '🌐 Открыть Vebai (аккаунт)', web_app: { url: MINI_APP_URL } },
-]
 
 // ---- "/" command menu (setMyCommands) ---------------------------------------
 // Telegram renders these in the blue menu button (and in the commands list);
@@ -238,25 +249,13 @@ async function registerCommands(): Promise<void> {
 /** menu keyboard (T27): the «📱 Подключить Telegram аккаунт» button exists
  *  ONLY while the user's account is not connected — once connected it
  *  disappears here AND on the site (one shared TgAccount row), and the agent
- *  toggle + rules link take its place. */
+ *  toggle + rules link take its place.
+ *  T50: the rows moved to lib/tgmenu.ts (botMenuKb) so that EVERY sender —
+ *  this webhook, task results, agent mirrors, file deliveries — attaches the
+ *  exact same menu (owner request: «верни все кнопки в телеграм боте»). */
 async function menuKb(chatId: string, userId: string): Promise<Record<string, unknown>> {
-  const rows: Record<string, unknown>[][] = [
-    [
-      { text: '🆕 Создать чат', callback_data: 'newchat' },
-      { text: '📂 Чаты', callback_data: 'chatlist' },
-    ],
-    appButtonRow(),
-  ]
-  const acc = await resolveConnected(chatId, userId)
-  if (!acc) {
-    rows.push([{ text: '📱 Подключить Telegram аккаунт', callback_data: 'tgconnect' }])
-  } else {
-    rows.push([
-      { text: acc.active ? '🤖 Агент: ВКЛ — выключить' : '🤖 Агент: ВЫКЛ — включить', callback_data: 'tgagent' },
-      { text: '💬 Научить агента (чат)', url: `${SITE_BASE}/?agent=1` },
-    ])
-  }
-  return { inline_keyboard: rows }
+  void userId // resolution is chatId-canonical in the shared builder
+  return botMenuKb(chatId)
 }
 
 async function patchUserEntry(chatId: string, patch: Partial<TgUserEntry>): Promise<void> {
@@ -625,7 +624,13 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     const stamp = new Date().toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
     const conv = await db.conversation.create({ data: { userId: entry.userId, title: `Чат ${stamp}` } })
     await patchUserEntry(chatId, { convId: conv.id, chatPicked: true })
-    await editPanel(chatId, carrierMsgId, `🆕 «${conv.title}» создан — пиши задачу прямо сюда, результат придёт в этот чат.\n(кнопки: /menu)`)
+    // T50: the fresh panel keeps the full menu (no more button-less dead end)
+    await editPanel(
+      chatId,
+      carrierMsgId,
+      `🆕 «${conv.title}» создан — пиши задачу прямо сюда, результат придёт в этот чат.`,
+      await menuKb(chatId, entry.userId),
+    )
     return
   }
   if (data === 'chatlist') {
@@ -652,9 +657,15 @@ async function handleCallback(cb: { id?: string; data?: string; from?: { id?: nu
     if (!conv.userId) await db.conversation.update({ where: { id: convId }, data: { userId: entry.userId } })
     await patchUserEntry(chatId, { convId, chatPicked: true })
     await answerCallback(cb.id, `Открыт: ${(conv.title || 'чат').slice(0, 60)}`)
-    // buttons disappear; the history shows as ONE message; typing continues
-    // in THIS conversation
-    await editPanel(chatId, carrierMsgId, await chatDigest(conv.id, conv.title || undefined))
+    // the history shows as ONE message; typing continues in THIS conversation.
+    // T50: the menu stays under it — switch chats / create a new one without
+    // typing /menu
+    await editPanel(
+      chatId,
+      carrierMsgId,
+      await chatDigest(conv.id, conv.title || undefined),
+      await menuKb(chatId, entry.userId),
+    )
     return
   }
 
