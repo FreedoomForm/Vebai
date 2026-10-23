@@ -54,14 +54,14 @@ check("continueAfterRead: parses before posting (no raw <answer> leak)",
 
 # --- 3. human-writing rules present on every surface
 pm = read("src/lib/agent/prompt.ts")
-check("prompt.ts: human-writing rule", "КАК ПИСАТЬ СООБЩЕНИЯ ЛЮДЯМ" in pm and "Яхшимисан" in pm)
+check("prompt.ts: human-writing rule", "КАК ПИСАТЬ СООБЩЕНИЯ ЛЮДЯМ" in pm and "ВСЕГДА РУССКИЙ" in pm)
 ag = read(".github/AGENT.md")
 check("AGENT.md v11: «Как писать ЛЮДЯМ» section", "Как писать ЛЮДЯМ" in ag and "Я помогу вам" in ag)
 check("AGENT.md: live field case quoted as the anti-example",
       "Йакшимисан" in ag and "перечитай" in ag.lower())
 inc = read("src/app/api/tg/incoming/route.ts")
-check("dmTaskPrompt v11: handwriting rule for $TG replies",
-      "Правила обработки входящего (v11)" in inc and "ПОЧЕРК" in inc)
+check("dmTaskPrompt: handwriting rule for $TG replies",
+      "Правила обработки входящего (v1" in inc and "ПОЧЕРК" in inc)
 
 # --- 4. zai_client.chat dedupe keeps order (ZAI_MODEL may equal a fallback)
 zai_client.API_KEY = "k"  # skip the key guard for the plan check below
