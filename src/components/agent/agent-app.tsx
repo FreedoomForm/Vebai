@@ -205,7 +205,7 @@ export function AgentApp() {
   /* ------------------------------------------------------------ fetching */
 
   // T53 (owner report: «сайт очень медленно загружает чаты»): every chat-open
-  // paid a ~1s serverless+Neon roundtrip before ANYTHING painted. These tiny
+  // paid a ~1s serverless+DB roundtrip before ANYTHING painted. These tiny
   // stale-while-revalidate caches paint the last known state instantly and
   // let the fresh fetch land in the background. sessionStorage for chat
   // content (dies with the tab — no long-lived private data), localStorage

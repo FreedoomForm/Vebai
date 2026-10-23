@@ -3,7 +3,7 @@
  *
  * Boots a real Alpine Linux in the browser tab via v86 (BSD-2-Clause),
  * talks to it over the serial console rendered into xterm.js, executes
- * the queued TerminalCommands from Neon and snapshots the whole VM to
+ * the queued TerminalCommands from the database and snapshots the whole VM to
  * IndexedDB so the workspace survives reloads.
  *
  * Everything runs client-side; the server only stores state (sessions,
