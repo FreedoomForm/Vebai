@@ -30,6 +30,12 @@ files (they complement the shell/terminal and the Telegram app):
      status. In silent mode the runner nudges the model to check in when
      the declared timer expires (or after 30+ min of silence) - the agent
      owns the decision, the runner enforces the honesty of it.
+T49 (owner request 2026-10-23): the FOURTH app - <end></end> (or
+  <end>комментарий</end>). After every delivered <answer>/<file> the model
+  gets a delivery receipt and decides ITSELF: keep working OR finish the
+  task with <end>. <end> gracefully stops the loop: a <final> in the same
+  reply is honoured, otherwise the (optional) <end> body becomes the short
+  closing answer.
 
 Protocol (see AGENT.md): the model answers with <cmd to="900">...</cmd>,
 <search>...</search>, <read>...</read>, <send to="owner" file="...">...</send>
@@ -83,7 +89,7 @@ RE_FTAG = re.compile(r"<file>([\s\S]*?)</file>", re.I)
 RE_WORK = re.compile(r"<work>([\s\S]*?)</work>", re.I)
 
 # T48: one combined scanner so actions execute in the order the model wrote
-# them (cmd -> search -> read -> send -> answer -> file -> work are all
+# them (cmd -> search -> read -> send -> answer -> file -> work -> end are all
 # matched by a single pass, ordered by position in the reply).
 RE_ACTION = re.compile(
     r"<cmd(?:\s+to\s*=\s*[\"']?(\d+)[\"']?)?\s*>([\s\S]*?)</cmd>"
@@ -92,7 +98,8 @@ RE_ACTION = re.compile(
     r"|<send\b([^>]*?)/?>([\s\S]*?)</send>"
     r"|<answer>([\s\S]*?)</answer>"
     r"|<file>([\s\S]*?)</file>"
-    r"|<work>([\s\S]*?)</work>", re.I)
+    r"|<work>([\s\S]*?)</work>"
+    r"|(<end\s*/>)|<end>([\s\S]*?)</end>", re.I)
 
 SILENT_SOFT_NAG_S = 30 * 60   # durationless silent phase: check-in nudge every 30 min
 MAX_SILENT_NAGS = 2
@@ -278,7 +285,10 @@ def parse_actions(reply: str):
     T48: everything OUTSIDE <final> is scanned in reply order; <answer> and
     <file> there are IMMEDIATE user-contact actions ('answer'/'mfile'),
     <work> declares the work mode; inside <final> they stay the final
-    protocol (delivered by the result route as before)."""
+    protocol (delivered by the result route as before).
+    T49: <end> (any form: <end/>, <end></end>, <end>note</end>) is the
+    agent's own STOP command - the loop finishes gracefully after the
+    remaining actions of this reply are executed."""
     reply = RE_THINK.sub("", reply)
     final = None
     rest = reply
@@ -324,6 +334,8 @@ def parse_actions(reply: str):
                     actions.append(("mfile", p, 60))
         elif g[8] is not None:  # T48 <work> -> mode declaration
             actions.append(("work", parse_work(g[8]), 0))
+        elif g[9] is not None or g[10] is not None:  # T49 <end> -> stop
+            actions.append(("end", (g[10] or "").strip(), 0))
     return final, actions
 
 
@@ -655,6 +667,9 @@ def run_agent(task, budget_min=None) -> str:
     work_started = time.time()  # when the current silent phase began
     work_secs = 0               # last declared timer (for the nag text)
     work_nags = 0               # durationless-silence soft nags issued
+    # T49: the agent's own STOP command state
+    ended = False               # <end> seen — finish after this reply's actions
+    end_note = ""               # optional closing line inside <end>…</end>
 
     heartbeat()  # initial silent beat (T16: no user-visible "took the task" line)
 
@@ -706,7 +721,7 @@ def run_agent(task, budget_min=None) -> str:
                             f"{p} ({s // 1024} КБ)" for p, s in files_note)
                     save_memory(task, "ОШИБКА СВЯЗИ на шаге %d" % step)
                     return (final_text or "") + note
-                time.sleep(15)
+                time.sleep(8)  # T49: quicker retry - the loop must not stall
         final, actions = parse_actions(reply)
 
         if not actions:
@@ -774,13 +789,23 @@ def run_agent(task, budget_min=None) -> str:
                 if status:
                     bits.append("статус: %s" % status)
                 outputs.append("[режим работы] " + "; ".join(bits))
+            elif kind == "end":
+                # T49 app #4: FINISH the task on the agent's own decision
+                # (it already delivered its answers/files and considers the
+                # job done). Remaining actions of THIS reply still execute.
+                ended = True
+                end_note = str(arg or "").strip()
+                outputs.append("[режим] команда <end>: завершаю работу" +
+                               (" — " + end_note[:200] if end_note else ""))
 
-        if work_mode == "report" and not final and not answered_now:
+        if work_mode == "report" and not final and not ended and not answered_now:
             outputs.append("[СИСТЕМА] включён режим <work>report</work>: пользователь ждёт короткий <answer> — "
                            "следующим ходом свяжись с ним (1-2 предложения о прогрессе).")
         if answered_only := (answered_now and all(k == "answer" for k, _a, _t in actions[:6]) and not final):
-            outputs.append("[СИСТЕМА] ответ доставлен. Задача ЗАВЕРШЕНА — дай <final> (можно коротким); "
-                           "продолжаешь работать — действуй дальше, пользователя больше не дёргай.")
+            outputs.append("[СИСТЕМА] ответ доставлен ✅ — пользователь его получил. Дальше решаешь ты: "
+                           "продолжай работу действиями (<cmd>/<search>/<read>/<file>…), дай <final> с итоговым "
+                           "отчётом, ИЛИ заверши задачу командой <end></end> (можно с коротким комментарием "
+                           "внутри), если всё сделано и сказано.")
 
         history.append({"role": "assistant", "content": reply})
         compact(history)
@@ -788,6 +813,8 @@ def run_agent(task, budget_min=None) -> str:
             "role": "user",
             "content": ("=== вывод шага %d ===\n" % step) + "\n\n".join(outputs)})
         compact(history)
+        if ended:
+            break  # T49: the agent decided the task is done — stop gracefully
     else:
         # step cap reached (only possible when AGENT_MAX_STEPS > 0): force a final
         try:
@@ -812,6 +839,14 @@ def run_agent(task, budget_min=None) -> str:
     # a corrective note before the honesty check runs.
     # T48: files already delivered mid-task (<file>/<send>) are dropped from
     # the final batch so the user never receives the same file twice.
+    # T49: an <end> without a co-present <final> still leaves the user a
+    # short honest closing line (the <end> body, or a default one).
+    if ended and not (final_text or ""):
+        if final and final.strip():
+            final_text = final.strip()  # <final> + <end> in the same reply
+        else:
+            close = end_note if end_note else "✅ Готово — работа завершена."
+            final_text = "<answer>" + close[:2000] + "</answer>"
     if delivered_files:
         final_text = dedup_final_files(final_text, delivered_files)
     final_text, send_files_ok = format_guard(final_text, system, history, started_ts, send_files_ok, delivered_files)

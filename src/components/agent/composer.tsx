@@ -1,13 +1,14 @@
 'use client'
 
 import { useRef, useState } from 'react'
-import { ArrowUp, Clapperboard, Globe, Paperclip, ChevronDown, X } from 'lucide-react'
+import { ArrowUp, Paperclip, X } from 'lucide-react'
 import { cn, formatBytes } from '@/lib/utils'
 
 export interface SendOptions {
   resume?: boolean
-  /** 🎬 toggle: also queue the Wan 2.1 video pipeline for this prompt */
-  videoRequest?: boolean
+  /** T49: the 🎬 video toggle is gone — the model queues the video pipeline
+   *  itself with a ```video-request``` block (server-side, prompt.ts);
+   *  the composer carries no video/web/effort flags any more */
   /** T40: files attached in the composer — the app uploads them to the
    *  Telegram channel before the turn starts */
   files?: File[]
@@ -16,21 +17,21 @@ export interface SendOptions {
 /** T40: the «TG-агент» toggle is gone from the composer (owner request:
  *  "убери кнопку телеграм мод рядом с панелью ввода") — the agent chat is
  *  still reachable via the sidebar button and the ?agent=1 deep link.
- *  The paperclip is REAL now: attached files go to the Telegram channel. */
-
-export type Effort = 'high' | 'max'
-
-const EFFORT_LABEL: Record<Effort, string> = {
-  max: 'Глубокий · Max',
-  high: 'Быстрый · High',
-}
+ *  The paperclip is REAL now: attached files go to the Telegram channel.
+ *
+ * T49 (owner request 2026-10-23): the web-search toggle, the video toggle and
+ *  the effort (Max/High) selector are GONE from the input field too — the
+ *  AGENT decides by itself: fresh web context is fetched automatically
+ *  (server-side default ON) and the model queues the video pipeline itself
+ *  with a ```video-request``` block when the user asks for video. The
+ *  composer keeps only the paperclip and the send button. */
 
 /**
  * Composer in two variants, mirroring z.ai's chat UX with our own design:
  *  - hero: the big centered first-screen box (a new chat IS the landing page)
  *  - dock: the compact bottom box of an ongoing conversation
- * The 🌐 web-search toggle, the effort (Deep-Think) selector and the 🎬
- * video toggle are real switches wired into the chat/video pipeline.
+ * T49: the toggles (web search / video / effort) are gone — capabilities are
+ * always on and the model decides itself (see the T49 note above).
  * T40: the paperclip is real — picked files ride along in SendOptions.files
  * and land in the owner's Telegram channel (see /api/chat/attach).
  */
@@ -41,12 +42,6 @@ export function Composer({
   variant,
   draft,
   onDraftChange,
-  webSearch,
-  onWebSearchToggle,
-  effort,
-  onEffortChange,
-  video,
-  onVideoToggle,
   tgAgent,
 }: {
   onSend: (content: string, opts?: SendOptions) => void
@@ -55,15 +50,8 @@ export function Composer({
   variant: 'hero' | 'dock'
   draft: string
   onDraftChange: (v: string) => void
-  webSearch: boolean
-  onWebSearchToggle: () => void
-  effort: Effort
-  onEffortChange: (e: Effort) => void
-  video: boolean
-  onVideoToggle: () => void
   tgAgent: boolean
 }) {
-  const [effortOpen, setEffortOpen] = useState(false)
   const [files, setFiles] = useState<File[]>([])
   const [fileNote, setFileNote] = useState('')
   const taRef = useRef<HTMLTextAreaElement | null>(null)
@@ -94,7 +82,7 @@ export function Composer({
     if ((!text && files.length === 0) || disabled) return
     onDraftChange('')
     if (taRef.current) taRef.current.style.height = 'auto'
-    onSend(text, { videoRequest: video, files: [...files], ...opts })
+    onSend(text, { files: [...files], ...opts })
     setFiles([])
     setFileNote('')
   }
@@ -191,90 +179,7 @@ export function Composer({
             }}
           />
 
-          {/* web-search toggle — real switch into the upstream payload */}
-          <button
-            type="button"
-            aria-label="Веб-поиск"
-            aria-pressed={webSearch}
-            onClick={onWebSearchToggle}
-            title={webSearch ? 'Веб-поиск включён' : 'Включить веб-поиск'}
-            className={cn(
-              'flex h-9 items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors',
-              webSearch
-                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                : 'text-stone-500 hover:bg-stone-100',
-            )}
-          >
-            <Globe className="h-[17px] w-[17px]" />
-            {webSearch && <span className="hidden sm:inline">Поиск</span>}
-          </button>
-
-          {/* 🎬 video toggle — queues the Wan 2.1 pipeline (Kaggle, 2x T4) */}
-          <button
-            type="button"
-            aria-label="Сделать видео"
-            aria-pressed={video}
-            onClick={onVideoToggle}
-            title={video ? 'Видео будет создано по запросу (Kaggle GPU)' : 'Создать видео по запросу'}
-            className={cn(
-              'flex h-9 items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors',
-              video
-                ? 'bg-violet-50 text-violet-700 border border-violet-200'
-                : 'text-stone-500 hover:bg-stone-100',
-            )}
-          >
-            <Clapperboard className="h-[17px] w-[17px]" />
-            {video && <span className="hidden sm:inline">Видео</span>}
-          </button>
-
           <div className="ml-auto flex items-center gap-2">
-            {/* effort selector (z.ai's Deep Think Max analogue) */}
-            <div className="relative">
-              <button
-                type="button"
-                aria-label="Уровень размышлений"
-                onClick={() => setEffortOpen((v) => !v)}
-                className="flex h-9 items-center gap-1 rounded-full px-2.5 text-[13px] text-stone-500 hover:bg-stone-100"
-              >
-                <span className="hidden sm:inline">{EFFORT_LABEL[effort]}</span>
-                <span className="sm:hidden">{effort === 'max' ? 'Max' : 'High'}</span>
-                <ChevronDown className="h-3.5 w-3.5" />
-              </button>
-              {effortOpen && (
-                <>
-                  <button
-                    type="button"
-                    aria-label="Закрыть"
-                    className="fixed inset-0 z-10 cursor-default"
-                    onClick={() => setEffortOpen(false)}
-                  />
-                  <div className="absolute bottom-11 right-0 z-20 w-52 overflow-hidden rounded-xl border border-stone-200 bg-white p-1 shadow-xl shadow-stone-900/10">
-                    {(Object.keys(EFFORT_LABEL) as Effort[]).map((e) => (
-                      <button
-                        key={e}
-                        type="button"
-                        onClick={() => {
-                          onEffortChange(e)
-                          setEffortOpen(false)
-                        }}
-                        className={cn(
-                          'flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[13px] transition-colors',
-                          e === effort
-                            ? 'bg-stone-100 text-stone-900'
-                            : 'text-stone-600 hover:bg-stone-50',
-                        )}
-                      >
-                        <span>{EFFORT_LABEL[e]}</span>
-                        <span className="text-[11px] text-stone-400">
-                          {e === 'max' ? 'агент думает дольше' : 'быстрее ответ'}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-
             {/* send */}
             <button
               type="button"

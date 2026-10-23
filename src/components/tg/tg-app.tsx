@@ -188,13 +188,17 @@ export function TgConnectApp() {
               Открыть чат с агентом →
             </a>
             <p className="text-xs leading-relaxed text-white/40">
-              Правила агенту задаются в чате «TG-агент» на сайте — кнопка «Telegram-агент» в боковом
-              меню (или «💬 Научить агента» в меню бота).
+              Правила агенту задаются в чате агента на сайте (он называется по первому сообщению).
               Всё, что ты ему расскажешь, он учтёт при ответах людям.
             </p>
-            <button className={btnGhost} onClick={disconnect} disabled={!!busy}>
-              {busy === 'disc' ? 'отключаю…' : 'Отключить аккаунт'}
-            </button>
+            <div className="grid grid-cols-2 gap-2">
+              <button className={btnGhost} onClick={disconnect} disabled={!!busy}>
+                {busy === 'disc' ? 'отключаю…' : 'Сменить аккаунт'}
+              </button>
+              <button className={btnGhost} onClick={disconnect} disabled={!!busy}>
+                {busy === 'disc' ? 'отключаю…' : 'Выйти из аккаунта'}
+              </button>
+            </div>
           </section>
         ) : (
           <section className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.03] p-5 sm:p-6">

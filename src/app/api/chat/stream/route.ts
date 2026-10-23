@@ -7,6 +7,7 @@ import { systemPrompt } from '@/lib/agent/prompt'
 import { createAnswerStreamFilter, parseAiAnswer, checkAnswerProtocol, formatRetryNote } from '@/lib/agent/answer'
 import { compileAgentChatPrompt, readAgentConversationId } from '@/lib/tguser'
 import { createOutboxTasks, createTgReadTasks } from '@/lib/agent/outbox'
+import { createVideoTask } from '@/lib/agent/video'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 300
@@ -110,6 +111,29 @@ async function launchVtermBlocks(text: string, conversationId: string, userId: s
   return n
 }
 
+/** T49 (owner request: "сделай так чтобы наш ии агент всё ещё был в состоянии
+ * создать видео и поискать интернет по дефоулту несмотря на то что мы удалили
+ * эти кнопки"): the model queues the video pipeline ITSELF with a fenced
+ * ```video-request\n<описание видео>``` block (after </answer>). The shot
+ * list is structured server-side exactly like the legacy /api/video-request
+ * (shared createVideoTask), so video creation works BY DEFAULT — no button
+ * needed. */
+async function launchVideoBlocks(text: string, conversationId: string): Promise<number> {
+  const re = /```video-request\s*\n([\s\S]*?)```/g
+  let n = 0
+  for (let m = re.exec(text); m && n < 2; m = re.exec(text)) {
+    const prompt = m[1].trim().slice(0, 2000)
+    if (!prompt) continue
+    try {
+      await createVideoTask(conversationId, prompt)
+      n++
+    } catch {
+      // best-effort: a failed structuring must not break the chat stream
+    }
+  }
+  return n
+}
+
 /* ---- free web search (shared with the worker's tools) -------------------- */
 
 interface SearchItem {
@@ -138,7 +162,8 @@ async function bingSearch(query: string, num: number): Promise<SearchItem[]> {
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&format=rss&count=${Math.max(num, 10)}&setlang=${encodeURIComponent(String(process.env.SEARCH_LANG || 'en'))}&cc=US`
   const res = await fetch(url, {
     headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8' },
-    signal: AbortSignal.timeout(20_000),
+    // T49: 8s cap — a hung search must never stall the chat (default search ON)
+    signal: AbortSignal.timeout(8_000),
   })
   if (!res.ok) throw new Error(`bing rss ${res.status}`)
   const xml = await res.text()
@@ -171,7 +196,7 @@ async function ddgSearch(query: string, num: number): Promise<SearchItem[]> {
     try {
       const res = await fetch(ep, {
         headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'en-US,en;q=0.9' },
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(8_000),
       })
       if (!res.ok) continue
       const html = await res.text()
@@ -237,7 +262,11 @@ export async function POST(req: NextRequest) {
   if (!user) return new Response(JSON.stringify({ error: 'нет сессии' }), { status: 401 })
 
   let rawMessages: { role?: string; content?: string }[] = []
-  let webSearch = false
+  // T49: web search is ON BY DEFAULT (owner request: the toggle button was
+  // removed from the input field — "сделай так чтобы наш ии агент всё ещё был
+  // в состоянии … поискать интернет по дефоулту"). An explicit body flag can
+  // still force it off (API compatibility).
+  let webSearch = true
   let model = ''
   let effort: 'high' | 'max' = 'max'
   let conversationId = ''
@@ -250,7 +279,7 @@ export async function POST(req: NextRequest) {
       conversationId?: string
     }
     rawMessages = Array.isArray(body.messages) ? body.messages : []
-    webSearch = Boolean(body.webSearch)
+    webSearch = body.webSearch === undefined ? true : Boolean(body.webSearch)
     // whitelist: only the free chat models are selectable from the UI
     const requested = String(body.model || '').trim()
     if (requested === DEFAULT_CHAT_MODEL || requested === FALLBACK_CHAT_MODEL) model = requested
@@ -295,24 +324,32 @@ export async function POST(req: NextRequest) {
 
   const messages: ChatMessage[] = [{ role: 'system', content: sys }]
 
-  // ---- optional web search: RAG-inject fresh results into the context
+  // ---- optional web search: RAG-inject fresh results into the context.
+  // T49: default ON, with a cheap smalltalk gate so greetings like «привет»
+  // don't pay the search latency (owner asked for BOTH default search AND
+  // maximum conversation speed).
+  const SMALLTALK_RE =
+    /^(привет|здравствуй|здравств|хай|hello|hi|hey|как дела|что нового|спасибо|благодар|ок|окей|ок\b|хорошо|ладно|понял|принял|согласен|до связи|пока|бай|bye|доброе утро|добрый день|добрый вечер|доброй ночи|кто ты|что ты умеешь)\b/i
   if (webSearch) {
     const lastUser = [...clean].reverse().find((m) => m.role === 'user')?.content || ''
-    try {
-      const items = await freeWebSearch(lastUser.slice(0, 300), 6)
-      if (items.length > 0) {
-        const block = items
-          .map((it, i) => `[${i + 1}] ${it.name}\nURL: ${it.url}\n${it.snippet}`)
-          .join('\n\n')
-        messages.push({
-          role: 'system',
-          content:
-            `Свежие результаты веб-поиска по запросу «${lastUser.slice(0, 200)}» (источник: Bing/DuckDuckGo, только что):\n\n${block}\n\n` +
-            'Используй эти данные как актуальный контекст. Ссылайся на источники в виде markdown-ссылок, когда опираешься на них.',
-        })
+    const trimmedUser = lastUser.trim()
+    if (trimmedUser.length >= 3 && !SMALLTALK_RE.test(trimmedUser)) {
+      try {
+        const items = await freeWebSearch(trimmedUser.slice(0, 300), 6)
+        if (items.length > 0) {
+          const block = items
+            .map((it, i) => `[${i + 1}] ${it.name}\nURL: ${it.url}\n${it.snippet}`)
+            .join('\n\n')
+          messages.push({
+            role: 'system',
+            content:
+              `Свежие результаты веб-поиска по запросу «${trimmedUser.slice(0, 200)}» (источник: Bing/DuckDuckGo, только что):\n\n${block}\n\n` +
+              'Используй эти данные как актуальный контекст. Ссылайся на источники в виде markdown-ссылок, когда опираешься на них.',
+          })
+        }
+      } catch {
+        // search is best-effort — the chat continues without it
       }
-    } catch {
-      // search is best-effort — the chat continues without it
     }
   }
   messages.push(...clean)
@@ -500,6 +537,15 @@ export async function POST(req: NextRequest) {
                 controller.enqueue(sse({
                   type: 'notice',
                   text: `🖥 ${nv} команда(ы) в очереди браузерного терминала (/terminal) — вывод придёт, как только вкладка терминала их выполнит`,
+                }))
+              }
+              // T49: ```video-request``` blocks -> the Wan 2.1 pipeline, queued
+              // BY THE MODEL itself (the composer toggle is gone)
+              const nvid = await launchVideoBlocks(fullAnswer, conversationId)
+              if (nvid > 0) {
+                controller.enqueue(sse({
+                  type: 'notice',
+                  text: `🎬 ${nvid} видео в очереди генерации (Wan 2.1, Kaggle GPU) — кадры появятся в чате по мере готовности`,
                 }))
               }
               // T31: ```run-tg``` blocks -> send from the OWNER'S Telegram

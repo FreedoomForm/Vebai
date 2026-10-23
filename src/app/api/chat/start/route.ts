@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth'
 import { messageToDTO } from '@/lib/agent/tools'
+import { AGENT_CONV_TITLE } from '@/lib/tguser'
 import type { ChatMessage } from '@/lib/zai'
 
 export const dynamic = 'force-dynamic'
@@ -81,11 +82,15 @@ export async function POST(req: NextRequest) {
     data: { conversationId: convId, role: 'user', kind: 'text', content },
   })
 
-  // ---- auto-title from the first user message
+  // ---- auto-title from the first user message.
+  // T49 (owner request: "перестань в списке чатов именовать чат телеграм
+  // агентом — пусть имя чата будет первое сообщение чата"): the agent
+  // conversation (created with the AGENT_CONV_TITLE placeholder) is retitled
+  // by its first message exactly like empty new chats.
   let titleEmitted: string | null = null
   const conv = await db.conversation.findUnique({ where: { id: convId } })
-  if (conv && conv.title === 'Новый диалог') {
-    titleEmitted = content.replace(/\s+/g, ' ').trim().slice(0, 48) || 'Новый диалог'
+  if (conv && (conv.title === 'Новый диалог' || conv.title === AGENT_CONV_TITLE)) {
+    titleEmitted = content.replace(/\s+/g, ' ').trim().slice(0, 48) || conv.title
     await db.conversation.update({ where: { id: convId }, data: { title: titleEmitted } })
   }
   await db.conversation.update({ where: { id: convId }, data: { updatedAt: new Date() } })

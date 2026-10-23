@@ -31,7 +31,11 @@ TMO = int(TMO_RAW) if TMO_RAW.isdigit() else 15
 TMO = min(TMO, 30)
 
 SHIFT_SECONDS = 340 * 60   # 5h40m shift, safely under the 6h GitHub job cap
-IDLE_POLL = 10             # seconds between claim polls when queue is empty
+# T49 (owner request: "максимально ускорить скорость общения ии агента и его
+# компьютера"): 10s -> 4s idle claim poll — a queued command is picked up up
+# to 2.5x faster; on Supabase (no hourly limits) the extra polling is free
+# and keeps the DB active against the 7-day pause.
+IDLE_POLL = 4              # seconds between claim polls when queue is empty
 WS = "/tmp/ws"             # persistent workspace for the whole shift
 
 # Agent mode (owner request 2026-10-18): commands prefixed with '#!agent' are

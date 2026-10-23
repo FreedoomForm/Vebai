@@ -1,9 +1,10 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import {
   Menu, MessageSquarePlus, Trash2, Sparkles, Activity,
-  Loader2, ChevronDown, Check, Globe, AlertCircle, RotateCcw, X, SquareTerminal, Send,
+  Loader2, ChevronDown, Check, AlertCircle, RotateCcw, X, SquareTerminal, Send,
 } from 'lucide-react'
 import { cn, formatBytes } from '@/lib/utils'
 import { plural } from '@/lib/plural'
@@ -13,7 +14,7 @@ import { useAgentSocket, type AgentStatePayload } from '@/hooks/use-agent-socket
 import { useKeyboardSafeHeight } from '@/hooks/use-keyboard-safe-height'
 import { MessageItem } from './message-item'
 import { ActivityPanel } from './activity-panel'
-import { Composer, type Effort, type SendOptions } from './composer'
+import { Composer, type SendOptions } from './composer'
 import { AuthScreen } from './auth-screen'
 import { WarningBanner } from './warning-banner'
 import type { AgentEvent, AgentTaskDTO, ConversationDTO, MessageDTO, ToolCallDTO } from '@/lib/agent/types'
@@ -76,6 +77,7 @@ const GALLERY = [
 ]
 
 export function AgentApp() {
+  const router = useRouter()
   const [session, setSession] = useState<{ user: SessionUser | null; checked: boolean }>({ user: null, checked: false })
   const [conversations, setConversations] = useState<ConvSummary[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -116,9 +118,11 @@ export function AgentApp() {
 
   // composer / selector state (persisted)
   const [model, setModel] = useState<string>('glm-4.7-flash')
-  const [effort, setEffort] = useState<Effort>('max')
-  const [webSearch, setWebSearch] = useState(false)
-  const [video, setVideo] = useState(false)
+  // T49: web-search/video/effort toggles are GONE from the UI (owner request:
+  // "удали кнопки max high и video web search из поле ввода") — the agent
+  // decides by itself: web context is fetched server-side by default and the
+  // model queues videos with ```video-request``` blocks. Effort stays 'max'
+  // server-side; the model selector above is kept.
   const [draft, setDraft] = useState('')
   const [modelOpen, setModelOpen] = useState(false)
 
@@ -158,10 +162,6 @@ export function AgentApp() {
     try {
       const m = localStorage.getItem('vebai_model')
       if (m && MODEL_OPTIONS.some((o) => o.id === m)) setModel(m)
-      const e = localStorage.getItem('vebai_effort')
-      if (e === 'high' || e === 'max') setEffort(e)
-      const w = localStorage.getItem('vebai_websearch')
-      if (w === '1') setWebSearch(true)
     } catch { /* private mode */ }
   }, [])
 
@@ -187,30 +187,19 @@ export function AgentApp() {
     })()
   }, [session.user])
 
-  const toggleTgAgent = useCallback(() => {
-    setTgAgent((v) => !v)
-  }, [])
+  // T49 (owner request): the sidebar «Telegram-агент» button NO LONGER
+  // toggles the agent chat — it opens /tgagent, which shows the phone-entry
+  // form when disconnected and the manage view (logout / change account)
+  // when connected. The agent chat itself stays reachable via the sidebar
+  // chat list and the /?agent=1 deep link.
+  const openTgAgentPage = useCallback(() => {
+    router.push('/tgagent')
+  }, [router])
 
   const selectModel = useCallback((id: string) => {
     setModel(id)
     setModelOpen(false)
     try { localStorage.setItem('vebai_model', id) } catch { /* noop */ }
-  }, [])
-
-  const toggleWebSearch = useCallback(() => {
-    setWebSearch((v) => {
-      try { localStorage.setItem('vebai_websearch', v ? '0' : '1') } catch { /* noop */ }
-      return !v
-    })
-  }, [])
-
-  const toggleVideo = useCallback(() => {
-    setVideo((v) => !v)
-  }, [])
-
-  const changeEffort = useCallback((e: Effort) => {
-    setEffort(e)
-    try { localStorage.setItem('vebai_effort', e) } catch { /* noop */ }
   }, [])
 
   /* ------------------------------------------------------------ fetching */
@@ -508,7 +497,9 @@ export function AgentApp() {
         const res = await fetch('/api/chat/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: history, webSearch, effort, model, conversationId: convId }),
+          // T49: webSearch/effort flags are gone — the server enables fresh
+          // web context by default and runs the deep model
+          body: JSON.stringify({ messages: history, model, conversationId: convId }),
           signal: ac.signal,
         })
         if (!res.ok || !res.body) {
@@ -595,7 +586,7 @@ export function AgentApp() {
       }
       onEvent({ type: 'done' })
     },
-    [model, webSearch, effort, onEvent, loadConversations],
+    [model, onEvent, loadConversations],
   )
 
   const handleSend = useCallback(
@@ -608,7 +599,7 @@ export function AgentApp() {
       setErrorMsg(null)
       if (!opts?.resume) lastSentRef.current = { content }
 
-      const launch = (finalContent: string, videoPrompt: string) => {
+      const launch = (finalContent: string) => {
         if (!opts?.resume) {
           setMessages((prev) => [
             ...prev,
@@ -622,30 +613,8 @@ export function AgentApp() {
           ])
         }
 
-        if (opts?.videoRequest) {
-          // 🎬 composer toggle: also queue the Kaggle H3 video pipeline
-          void (async () => {
-            try {
-              const res = await fetch('/api/video-request', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ conversationId: tgAgentRef.current ? agentConvRef.current : activeIdRef.current, prompt: videoPrompt }),
-              })
-              const data = (await res.json().catch(() => ({}))) as {
-                task?: AgentTaskDTO
-                error?: string
-                code?: string
-              }
-              if (!res.ok || !data.task) {
-                onEvent({ type: 'error', message: data.error || `video ${res.status}`, code: data.code })
-              } else {
-                onEvent({ type: 'task', task: data.task })
-              }
-            } catch {
-              onEvent({ type: 'error', message: 'не удалось поставить видео в очередь' })
-            }
-          })()
-        }
+        // T49: the client-side video-request path is gone — the model queues
+        // the video pipeline itself with ```video-request``` blocks
 
         // T28: with the Telegram-agent connector on, the turn MUST land in the
         // agent conversation (even if the user navigated elsewhere) — the
@@ -674,7 +643,7 @@ export function AgentApp() {
               throw new Error(data.error || `сервер ответил ${res.status}`)
             const list = data.files.map((f) => `• ${f.name} (${formatBytes(f.size)})`).join('\n')
             const ann = `📎 Вложения (сохранены в Telegram-канал):\n${list}`
-            launch(content.trim() ? `${content.trim()}\n\n${ann}` : ann, content)
+            launch(content.trim() ? `${content.trim()}\n\n${ann}` : ann)
           } catch (e) {
             sendingRef.current = false
             setSending(false)
@@ -688,7 +657,7 @@ export function AgentApp() {
         return
       }
 
-      launch(content, content)
+      launch(content)
     },
     [runTurn, onEvent],
   )
@@ -893,7 +862,7 @@ export function AgentApp() {
         </a>
         <button
           type="button"
-          onClick={toggleTgAgent}
+          onClick={openTgAgentPage}
           className={cn(
             'mt-2 flex w-full items-center justify-start gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors',
             tgAgent
@@ -1024,12 +993,6 @@ export function AgentApp() {
         connected={connected}
         draft={draft}
         onDraftChange={setDraft}
-        webSearch={webSearch}
-        onWebSearchToggle={toggleWebSearch}
-        effort={effort}
-        onEffortChange={changeEffort}
-        video={video}
-        onVideoToggle={toggleVideo}
         tgAgent={tgAgent}
       />
 
@@ -1099,11 +1062,6 @@ export function AgentApp() {
             <Menu className="h-4 w-4" />
           </Button>
           {modelSelector}
-          {webSearch && (
-            <span className="hidden sm:inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
-              <Globe className="h-3 w-3" /> поиск включён
-            </span>
-          )}
           <div className="ml-auto flex items-center gap-2">
             {worker.activeTasks > 0 && (
               <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">
@@ -1254,12 +1212,6 @@ export function AgentApp() {
               connected={connected}
               draft={draft}
               onDraftChange={setDraft}
-              webSearch={webSearch}
-              onWebSearchToggle={toggleWebSearch}
-              effort={effort}
-              onEffortChange={changeEffort}
-              video={video}
-              onVideoToggle={toggleVideo}
               tgAgent={tgAgent}
             />
             <p className="mt-2 hidden text-center text-[11px] text-stone-400 sm:block">
